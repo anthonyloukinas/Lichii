@@ -157,6 +157,32 @@ TEST_CASE("Ampere gathers without per-tap offsets keep their previous lowering",
     }
 }
 
+TEST_CASE("Ampere depth gathers preserve coordinates reference and result pairs",
+          "[video_core][ampere][gather]") {
+    for (const u32 guard : {1U, 7U, 9U}) {
+        for (const u32 nodep : {0U, 1U}) {
+            Instruction gather{{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}};
+            gather.words[0] = (gather.words[0] & ~0xf000U) | (guard << 12);
+            gather.words[2] |= nodep << 26;
+            const auto lowered = LowerToMaxwell(std::array{gather, Exit});
+            INFO(lowered.error);
+            REQUIRE(lowered);
+            REQUIRE(lowered.required_texture_buffer == 2);
+            const u64 pred = u64{guard} << 16;
+            const std::array<u64, 8> expected{
+                Copy(pred, 250, 24), Copy(pred, 251, 25), Copy(pred, 246, 28),
+                0xc800000000000000ULL | pred | 250 | (250ULL << 8) | (246ULL << 20) |
+                    (2ULL << 28) | (15ULL << 31) | (14ULL << 36) | (u64{nodep} << 49) |
+                    (1ULL << 50) | (7ULL << 51),
+                Copy(pred, 12, 250), Copy(pred, 13, 251),
+                Copy(pred, 14, 252), Copy(pred, 15, 253),
+            };
+            REQUIRE(std::equal(expected.begin(), expected.end(), lowered.instructions.begin()));
+            REQUIRE(lowered.instructions.size() == expected.size() + 1);
+        }
+    }
+}
+
 TEST_CASE("Ampere half texture results keep the first component in the low lane",
           "[video_core][ampere][half_texture]") {
     const Instruction sample{{0x06007b60, 0x33c0440f, 0x059e8702, 0x101fc200}};
