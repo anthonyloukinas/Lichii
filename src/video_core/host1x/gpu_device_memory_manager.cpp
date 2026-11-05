@@ -3,6 +3,8 @@
 
 #include "core/device_memory_manager.inc"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2_hot_pages.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -10,6 +12,18 @@ namespace Tegra {
 struct MaxwellDeviceMethods {
     static inline void MarkRegionCaching(Core::Memory::Memory* interface, VAddr address,
                                          size_t size, bool caching) {
+        auto& counters = VideoCommon::Nx2HotPages::g_counters;
+        const u64 pages = (size + Core::Memory::YUZU_PAGESIZE - 1) >> Core::Memory::YUZU_PAGEBITS;
+        if (caching) {
+            VideoCommon::Nx2HotPages::Count(counters.protect_calls, 1);
+            VideoCommon::Nx2HotPages::Count(counters.protect_pages, pages);
+            if (VideoCommon::GpuSplit::OnBackThread()) {
+                VideoCommon::Nx2HotPages::Count(counters.back_protect_calls, 1);
+            }
+        } else {
+            VideoCommon::Nx2HotPages::Count(counters.unprotect_calls, 1);
+            VideoCommon::Nx2HotPages::Count(counters.unprotect_pages, pages);
+        }
         interface->RasterizerMarkRegionCached(address, size, caching);
     }
 

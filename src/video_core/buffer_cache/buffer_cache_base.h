@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <functional>
 #include <memory>
@@ -40,6 +41,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/nx2_hot_pages.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -240,6 +242,19 @@ public:
     ~BufferCache();
 
     void TickFrame();
+
+    /// EDEN_NX2_HOT_PAGES: whether hot pages must be marked written before buffers are used
+    [[nodiscard]] bool HotEpochPending() const noexcept {
+        return memory_tracker.HasHotPages() &&
+               Nx2HotPages::g_epoch.load(std::memory_order_acquire) != hot_applied_epoch;
+    }
+    /// EDEN_NX2_HOT_PAGES: marks hot pages written if the guest passed a submission or an
+    /// acquire since they last were (the guest may have written them for what follows)
+    void ApplyHotEpoch();
+    /// EDEN_NX2_HOT_PAGES: how many times ApplyHotEpoch marked pages written
+    [[nodiscard]] u64 HotApplies() const noexcept {
+        return hot_applies.load(std::memory_order_relaxed);
+    }
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool,
@@ -662,6 +677,25 @@ private:
                                                  u32 cbuf_index, bool is_written,
                                                  bool native_pointer) const;
 
+    /// What StorageBufferBindingAt looks up in the GPU page table for a pointer: it changes only
+    /// when the page table does (MemoryManager::MapSerial).
+    struct SsboTranslation {
+        size_t owner{}; ///< MemoryManager::GetID() + 1 (0: empty)
+        GPUVAddr gpu_addr{};
+        u64 serial{};
+        std::optional<DAddr> aligned_device_addr; ///< Of gpu_addr aligned down
+        std::optional<DAddr> device_addr;
+        u32 layout_size{};       ///< GetMemoryLayoutSize
+        u32 native_size{};       ///< MaxContinuousRange over min(layout_size, 8 MiB)
+        bool has_native_size{};  ///< native_size is computed on first use
+    };
+    /// EDEN_NX2_SSBO_BIND_CACHE (default 1; 0 off, 2 checks each hit against fresh lookups)
+    [[nodiscard]] const SsboTranslation& TranslateSsbo(GPUVAddr gpu_addr, bool native_pointer) const;
+    [[nodiscard]] SsboTranslation LookUpSsbo(GPUVAddr gpu_addr, bool native_pointer) const;
+    [[nodiscard]] Binding SsboBinding(const SsboTranslation& translation, GPUVAddr ssbo_addr,
+                                      u32 cbuf_index, bool is_written, bool native_pointer) const;
+    void ReportSsboCache();
+
     /// The 64-bit pointers at addrs (0 for a null or unmapped address), from the buffers' host
     /// copies where GPU work wrote them (graphics: counted as a draw's)
     void ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs, std::span<u64> out,
@@ -714,6 +748,14 @@ private:
     /// Words a read back found changed: always read back with a wait
     boost::container::small_vector<DAddr, 16> native_indirect_volatile;
     bool native_indirect_speculation_off{};
+    u64 hot_applied_epoch{};      ///< EDEN_NX2_HOT_PAGES
+    std::atomic<u64> hot_applies{};
+    u64 protection_report_start{};
+    mutable std::atomic<u64> ssbo_cache_hits{};   ///< EDEN_NX2_SSBO_BIND_CACHE
+    mutable std::atomic<u64> ssbo_cache_misses{};
+    mutable std::atomic<u64> ssbo_cache_mismatches{};
+    u64 ssbo_report_start{};
+    void ReportPageProtection();
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
