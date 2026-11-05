@@ -61,6 +61,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_draw_runs.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "common/nx2_sample_profile.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
@@ -787,6 +788,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
+        if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+            mesh_count_hashes = pipeline->ShaderHashes();
+        }
         draw_func();
     }
     if (probe) {
@@ -1102,6 +1106,20 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             ++trace_zero_direct;
         }
 
+        if (mesh_draw && VideoCommon::Nx2MeshCountTrace::g_enabled &&
+            VideoCommon::Nx2MeshCountTrace::NoteMeshDraw(draw_params.num_vertices)) {
+            const auto& regs = maxwell3d->regs;
+            const auto program = [&regs](size_t slot) {
+                return (u64{regs.pipelines[slot].reserved[0] & 0xff} << 32) |
+                       regs.pipelines[slot].reserved[1];
+            };
+            LOG_INFO(Render_Vulkan,
+                     "NX2 mesh count draw frame={} groups=0 indexed={} instances={} "
+                     "last_zero_seq={} task={:#x} mesh={:#x} shaders={:016x}",
+                     render_trace_frame, is_indexed, num_instances,
+                     VideoCommon::Nx2MeshCountTrace::LastZeroSeq(), program(1), program(3),
+                     fmt::join(mesh_count_hashes, ","));
+        }
         if (mesh_draw) {
             scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
@@ -1843,6 +1861,25 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
     gpu.InvalidateGPUCache();
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2FlushListPages(pages);
+}
+
+void RasterizerVulkan::ProbeMeshCountSource(u64 seq, DAddr addr, u32 size) {
+    std::array<u32, 8> host{};
+    std::array<u32, 8> guest{};
+    const u32 bytes = std::min<u32>(size, sizeof(host));
+    const u32 words = bytes / sizeof(u32);
+    bool gpu_modified{};
+    bool found{};
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        gpu_modified = buffer_cache.IsRegionGpuModified(addr, bytes);
+        found = buffer_cache.Nx2ReadHostBytes(
+            addr, std::span{reinterpret_cast<u8*>(host.data()), bytes});
+    }
+    device_memory.ReadBlockUnsafe(addr, guest.data(), bytes);
+    VideoCommon::Nx2MeshCountTrace::LogProbe(seq, addr, bytes, gpu_modified, found,
+                                             std::span{host.data(), words},
+                                             std::span{guest.data(), words});
 }
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {

@@ -371,6 +371,11 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
+    /// EDEN_NX2_MESH_COUNT_TRACE: fills `out` with the host bytes of the cached buffer holding
+    /// [device_addr, device_addr + out.size()), waiting for the host GPU. False when no buffer
+    /// holds the range (none is created).
+    [[nodiscard]] bool Nx2ReadHostBytes(DAddr device_addr, std::span<u8> out);
+
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
     /// host buffer holding each range, if one does, for EDEN_NX2_FRAME_DUMP_SAMPLED. Nothing is
     /// created or synchronized. Stage 5 is compute.

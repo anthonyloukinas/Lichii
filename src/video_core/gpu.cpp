@@ -30,6 +30,7 @@
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
@@ -111,6 +112,9 @@ struct GPU::Impl {
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
             if (g_nx2_deferred_write_log) [[unlikely]] {
                 Nx2NoteAppliedWrite(address, size);
+            }
+            if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+                VideoCommon::Nx2MeshCountTrace::NoteApplied(address, size);
             }
             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
         });

@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3233,6 +3234,9 @@ public:
 
     DrawManager draw_manager;
 
+    /// EDEN_NX2_MESH_COUNT_TRACE: the last macro DMA read and the running macro.
+    VideoCommon::Nx2MeshCountTrace::EngineState mesh_count_trace;
+
     GPUVAddr GetMacroAddress(size_t index) const {
         size_t base = 0;
         for (const auto& [addr, count] : macro_segments) {
@@ -3403,6 +3407,10 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// EDEN_NX2_MESH_COUNT_TRACE: `value` is written to vertex_buffer.count with `reg_array`
+    /// holding the registers; `split` is set on the split's front.
+    void TraceMeshCount(VideoCommon::GpuSplit* split, const u32* reg_array, u32 value,
+                        bool from_macro);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

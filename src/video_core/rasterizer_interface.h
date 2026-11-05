@@ -125,6 +125,11 @@ public:
         }
     }
 
+    /// EDEN_NX2_MESH_COUNT_TRACE, on the GPU thread's back: logs whether [addr, addr + size)
+    /// is GPU-modified and the host buffer's words there (waits for the host GPU).
+    virtual void ProbeMeshCountSource([[maybe_unused]] u64 seq, [[maybe_unused]] DAddr addr,
+                                      [[maybe_unused]] u32 size) {}
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

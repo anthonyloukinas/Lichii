@@ -1091,6 +1091,38 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
+bool BufferCache<P>::Nx2ReadHostBytes(DAddr device_addr, std::span<u8> out) {
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    if (device_addr == 0 || out.empty() || page >= page_table.size()) {
+        return false;
+    }
+    const BufferId buffer_id = page_table[page];
+    if (!buffer_id) {
+        return false;
+    }
+    Buffer& buffer = slot_buffers[buffer_id];
+    if (!buffer.IsInBounds(device_addr, out.size())) {
+        return false;
+    }
+    const u64 offset = device_addr - buffer.CpuAddr();
+    if constexpr (USE_MEMORY_MAPS) {
+        auto staging = runtime.DownloadStagingBuffer(out.size());
+        const std::array copies{BufferCopy{
+            .src_offset = offset,
+            .dst_offset = staging.offset,
+            .size = out.size(),
+        }};
+        buffer.MarkUsage(offset, out.size());
+        runtime.CopyBuffer(staging.buffer, buffer, copies, true);
+        runtime.Finish();
+        std::memcpy(out.data(), staging.mapped_span.data(), out.size());
+    } else {
+        buffer.ImmediateDownload(offset, out);
+    }
+    return true;
+}
+
+template <class P>
 bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
     const DAddr end_addr = addr + size;
     const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);

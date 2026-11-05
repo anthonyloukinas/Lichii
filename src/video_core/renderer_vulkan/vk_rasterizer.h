@@ -109,6 +109,7 @@ public:
                                              bool past_sync) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
+    void ProbeMeshCountSource(u64 seq, DAddr addr, u32 size) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -398,6 +399,7 @@ private:
     u64 trace_zero_direct{};
     /// Vertex and fragment hashes of the draw being recorded, for GPU timing.
     std::pair<u64, u64> trace_draw_hashes{};
+    std::array<u64, 6> mesh_count_hashes{}; ///< EDEN_NX2_MESH_COUNT_TRACE: the draw's shaders
     u32 trace_captures{};
     u32 trace_capture_dropped{};
     u32 trace_failure_details{};

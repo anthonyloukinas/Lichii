@@ -580,7 +580,16 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
 
     // Execute the current macro.
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+        mesh_count_trace.macro_method = method;
+        mesh_count_trace.macro_start = GetNativeMacroPositions()[entry];
+        mesh_count_trace.in_macro = true;
+        ++mesh_count_trace.calls;
+    }
     GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+        mesh_count_trace.in_macro = false;
+    }
     draw_manager.DrawDeferred(*this);
 }
 
@@ -628,6 +637,10 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
             method_argument, static_cast<u32>(shadow_state.shadow_ram_control), is_last_call ? 1U : 0U};
     }
     const u32 argument = ProcessShadowRam(method, method_argument);
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled &&
+        method == MAXWELL3D_REG_INDEX(vertex_buffer.count) && !front_macros) {
+        TraceMeshCount(nullptr, regs.reg_array.data(), argument, mesh_count_trace.in_macro);
+    }
     // A state register written with the value it holds changes nothing: no dirty flags (they
     // would make the next draw re-check that state), no method processing. Title 1 makes ~6
     // million 3D register writes a second, ~60% of them same-value, most from macro replays.
@@ -1123,6 +1136,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else if (fs.control == Regs::ShadowRamControl::Replay) {
         value = fs.shadow[method];
     }
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled &&
+        method == MAXWELL3D_REG_INDEX(vertex_buffer.count)) {
+        TraceMeshCount(&split, fs.regs.data(), value, from_macro);
+    }
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
     }
@@ -1252,6 +1269,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 value = fs.shadow[method];
             }
             fs.regs[method] = value;
+            if (VideoCommon::Nx2MeshCountTrace::g_enabled &&
+                method == MAXWELL3D_REG_INDEX(vertex_buffer.count)) {
+                TraceMeshCount(&split, fs.regs.data(), value, false);
+            }
             if (!execution_mask[method]) {
                 continue;
             }
@@ -1296,6 +1317,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+        mesh_count_trace.macro_method = method;
+        mesh_count_trace.macro_start = start;
+        mesh_count_trace.in_macro = true;
+        ++mesh_count_trace.calls;
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1332,6 +1359,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
     }
     fs.parameters.clear();
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+        mesh_count_trace.in_macro = false;
+    }
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
@@ -1355,19 +1385,33 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
     static const bool full_drain = std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr;
+    std::optional<VideoCommon::Nx2MeshCountTrace::DmaReadScope> trace;
+    if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+        const auto device = memory_manager.GpuToCpuAddress(source);
+        trace.emplace(mesh_count_trace, source, device.value_or(0), words, method == 0x158,
+                      device && Tegra::Nx2IsGpuWritten(*device));
+    }
     const auto flush_if_dirty = [&] {
-        if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+        const bool dirty =
+            memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        if (dirty) {
             split.Run(
                 [memory = &memory_manager, source, read_bytes] {
                     memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                 },
                 VideoCommon::DrainSite::MacroDmaFlush);
         }
+        if (trace) {
+            trace->Checked(dirty);
+        }
     };
     if (full_drain) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     } else {
         split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead);
+    }
+    if (trace) {
+        trace->Waited();
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
@@ -1381,6 +1425,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         flush_if_dirty();
     }
     u32 changed{};
+    std::array<u32, 8> first_words{};
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
         if (method == 0x158) {
@@ -1391,6 +1436,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (!diag_before.empty() && diag_before[i] != word) {
             ++changed;
         }
+        if (i < first_words.size()) {
+            first_words[i] = word;
+        }
+    }
+    if (trace) {
+        trace->Words(std::span{first_words.data(), std::min<size_t>(words, first_words.size())});
     }
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         bool gpu_written = false;
@@ -1399,6 +1450,36 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             gpu_written |= device && Tegra::Nx2IsGpuWritten(*device);
         }
         Tegra::Nx2CmdPageDiag::RecordDmaRead(source, words, changed, gpu_written);
+    }
+}
+
+void Maxwell3D::TraceMeshCount(VideoCommon::GpuSplit* split, const u32* reg_array, u32 value,
+                               bool from_macro) {
+    namespace Trace = VideoCommon::Nx2MeshCountTrace;
+    if (value != 0 || (reg_array[Regs::MeshControl] & 1) == 0) {
+        return;
+    }
+    // Native program address of a shader slot (reserved[0] low byte, reserved[1]).
+    const auto program = [reg_array](size_t slot) {
+        const size_t index = MAXWELL3D_REG_INDEX(pipelines) +
+                             (slot * sizeof(Regs::Pipeline) + offsetof(Regs::Pipeline, reserved)) /
+                                 sizeof(u32);
+        return (u64{reg_array[index] & 0xff} << 32) | reg_array[index + 1];
+    };
+    const u64 seq = Trace::NoteZeroCount(mesh_count_trace, from_macro, split != nullptr,
+                                         program(1), program(3));
+    const Trace::DmaRead& dma = mesh_count_trace.dma;
+    const u32 bytes = std::min<u32>(dma.words, 8) * sizeof(u32);
+    if (seq == 0 || dma.serial == 0 || dma.device == 0 || bytes == 0 || rasterizer == nullptr) {
+        return;
+    }
+    // On the back at this point of the command stream: the host buffer's words at the source.
+    if (split != nullptr) {
+        split->Defer([raster = rasterizer, seq, device = dma.device, bytes] {
+            raster->ProbeMeshCountSource(seq, device, bytes);
+        });
+    } else {
+        rasterizer->ProbeMeshCountSource(seq, dma.device, bytes);
     }
 }
 
