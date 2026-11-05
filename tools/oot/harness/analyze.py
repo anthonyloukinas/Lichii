@@ -175,7 +175,8 @@ def analyze(rundir):
     summary = {"stamp": run.get("stamp"), "binary": run.get("binary"), "env": run.get("env", {}),
                "result": run.get("result"), "failed_step": run.get("failed_step"),
                "shutdown": run.get("shutdown"), "steps": run.get("steps", []),
-               "phases": {}, "headings": [], "heading_visits": []}
+               "phases": {}, "headings": [], "heading_visits": [],
+               "gdb": run.get("gdb"), "svc_trace": run.get("svc_trace")}
     groups = {}
     for ph in run.get("phases", []):
         if ph.get("kind") == "heading":
@@ -244,6 +245,15 @@ def render_md(s):
     if s.get("steps"):
         L += ["## Steps", ""] + [f"- {st['t']:7.1f}s {st['step']}: {st['status']}" + (f" — {st['note']}" if st.get("note") else "")
                                   for st in s["steps"]]
+    if s.get("gdb"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))  # -I drops the script dir
+        import gdbkit
+        L += gdbkit.render_md(s["gdb"], s["phases"])
+    if s.get("svc_trace"):
+        t = s["svc_trace"]
+        L += ["", "## SVC trace (`--svc-trace`)", "",
+              f"- window presents {t.get('window')}; `svc-trace.md` (parser exit {t.get('parse_exit')}"
+              + (", thread names from the stub)" if t.get("threads") else ", no thread names: add --gdb)")]
     return "\n".join(L) + "\n"
 
 

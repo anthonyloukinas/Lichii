@@ -3422,7 +3422,8 @@ private:
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     /// EDEN_NX2_TARGET_TRACE: a split-front macro writes `value` to vertex_buffer.count.
     void TargetTraceFrontCount(const FrontState& state, u32 start, u32 value);
-    void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                      u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     /// EDEN_NX2_MESH_COUNT_TRACE: `value` is written to vertex_buffer.count with `reg_array`

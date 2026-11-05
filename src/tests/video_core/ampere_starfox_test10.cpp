@@ -337,6 +337,9 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
     INFO(lowered.error);
     REQUIRE(lowered);
     CHECK(lowered.instructions.front() == (0xef9200600207ffdcULL & ~(u64{0xff} << 8) | (u64{216} << 8)));
+    // An unknown width stays rejected in the indexed form.
+    SetBits(indexed, 73, 3, 1);
+    CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
 }
 
 TEST_CASE("Star Fox Test10 uniform U16 conversion reaches the real translator",

@@ -483,7 +483,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     break;
                 }
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written);
+                                                       desc.cbuf_offset, desc.is_written,
+                                                       desc.indirect_offset);
                 ++ssbo_index;
             }
             if (num_native_indirect[stage] != 0) [[unlikely]] {
@@ -814,7 +815,8 @@ GraphicsPipeline::DeltaResult GraphicsPipeline::ConfigureDelta() {
                     break;
                 }
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written);
+                                                       desc.cbuf_offset, desc.is_written,
+                                                       desc.indirect_offset);
                 ++ssbo_index;
             }
             if (num_native_indirect[stage] != 0) [[unlikely]] {
@@ -985,6 +987,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.BindDescriptorBuffersEXT(binding_info);
         }
         if (bind_pipeline) {
+            scheduler.SetGraphicsPipelineMissing(!pipeline);
             if (!pipeline) {
                 return;
             }

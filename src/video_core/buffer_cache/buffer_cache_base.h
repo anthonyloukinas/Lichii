@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -310,7 +311,7 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written);
+                                   bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -321,7 +322,7 @@ public:
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written,
+                                  bool is_written, u32 indirect_offset = ~0U,
                                   const Shader::StorageWriteExtent& write_extent = {});
 
     /// Binds a native program's read-only storage buffers for pointers loaded from records
@@ -428,7 +429,7 @@ public:
     [[nodiscard]] bool Nx2ReadHostBytes(DAddr device_addr, std::span<u8> out);
 
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
-    /// host buffer holding each range, if one does, for EDEN_NX2_FRAME_DUMP_SAMPLED. Nothing is
+    /// host buffer holding each range, if one does, for diagnostics. Nothing is
     /// created or synchronized. Stage 5 is compute.
     template <typename Func>
     void ForEachBoundBuffer(bool compute, Func&& func) {
@@ -516,6 +517,8 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    /// Indirectly read banks of native programs already uploaded this frame.
+    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 
 private:
     template <typename Func>
@@ -649,13 +652,19 @@ private:
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
-    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written, bool native_pointer = false) const;
+    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
+                                               bool native_pointer = false,
+                                               bool table_pointer = false) const;
+
+    void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
+                           u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
+                           const Binding& binding);
 
     /// StorageBufferBinding for the pointer gpu_addr read from ssbo_addr
     [[nodiscard]] Binding StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_addr,
                                                  u32 cbuf_index, bool is_written,
-                                                 bool native_pointer) const;
+                                                 bool native_pointer,
+                                                 bool table_pointer = false) const;
 
     /// The 64-bit pointers at addrs (0 for a null or unmapped address), from the buffers' host
     /// copies where GPU work wrote them (graphics: counted as a draw's)
@@ -917,6 +926,8 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+    /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
+    std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
     u64 minimum_memory = 0;
