@@ -498,7 +498,8 @@ public:
      * Whether the next guest read of a page given to RasterizerArmReadTraps reaches the GPU's
      * reactive flush: through its read trap, through reactive flushing's protection of every
      * cached page, or because without fastmem every cached page read takes the slow path.
-     * False under NCE, with EDEN_NX2_READ_TRAPS=0 and with EDEN_NX2_NO_REACTIVE=1.
+     * False under NCE, and with fastmem: with EDEN_NX2_READ_TRAPS=0 when reactive flushing is
+     * off, with EDEN_NX2_NO_REACTIVE=1 (Switch 2 programs) when it is on.
      */
     static bool RasterizerReadTrapsActive();
 

@@ -1931,15 +1931,13 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     }
     if (buffer_cache.FlushesOnCpuRead()) {
         // The core skips the flush of later reads inside the returned area, so the buffer cache
-        // answers for all of it (marks its GPU-written pages there Preflushable or ends their
-        // traps), and the area is preemptive only if both caches say so.
+        // answers for all of it (marks the read's GPU-written pages Preflushable, ends the traps
+        // of the rest), and the area is preemptive only if both caches say so.
         const DAddr start = texture_area ? texture_area->start_address : addr;
         const DAddr end = texture_area ? texture_area->end_address : addr + size;
         std::scoped_lock lock{buffer_cache.mutex};
-        auto area = buffer_cache.GetFlushArea(start, end - start);
+        auto area = buffer_cache.GetFlushArea(addr, size, start, end);
         if (area && texture_area) {
-            area->start_address = (std::min)(area->start_address, texture_area->start_address);
-            area->end_address = (std::max)(area->end_address, texture_area->end_address);
             area->preemtive &= texture_area->preemtive;
         }
         if (area) {

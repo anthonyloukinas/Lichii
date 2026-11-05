@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -38,6 +39,7 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
     // A new runtime has a new scheduler (its ticks restart) and a new stream buffer: whatever the
     // stream uniform reuse remembers refers to the old ones. Before the early return below.
     VideoCommon::ResetUniformStreamReuse<Runtime>();
+    UpdateExactPreflush();
     // Ensure the first slot is used for the null buffer
     void(slot_buffers.insert(runtime, NullBufferParams{}));
     gpu_modified_ranges.Clear();
@@ -106,6 +108,9 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 
 template <class P>
 void BufferCache<P>::TickFrame() {
+    UpdateExactPreflush();
+    // Pages the core could not arm may be cached by now.
+    unarmed_read_trap_ranges.Clear();
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
@@ -197,15 +202,15 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     Nx2NoteListHostWrite(device_addr, size);
-    // EDEN_NX2_FAST_DRAW=2: delta draws don't bind vertex buffers again. Checked first so the
-    // inline page-write path below, which returns early, ends delta reuse too.
-    if (Nx2FastDraw::g_delta_enabled && channel_state != nullptr) {
-        for (const Binding& binding : channel_state->vertex_buffers) {
-            if (device_addr < binding.device_addr + binding.size &&
-                binding.device_addr < device_addr + size) {
-                Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
-                break;
-            }
+    // EDEN_NX2_FAST_DRAW: a reused draw doesn't synchronize its buffers again, so a write to one
+    // of them ends reuse. On the split's back, mode 2 takes the pre-draw invalidation as a light
+    // change (delta draws resolve uniform, storage and texture buffers again), but not vertex
+    // buffers. Writes from other threads (CPU write traps, TryCacheInvalidation) leave no delta.
+    // Checked first so the inline page-write path below, which returns early, ends reuse too.
+    if (Nx2FastDraw::g_enabled && channel_state != nullptr) {
+        const bool vertex_only = Nx2FastDraw::g_delta_enabled && GpuSplit::OnBackThread();
+        if (OverlapsGraphicsBindings(device_addr, size, vertex_only)) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
         }
     }
     if (IsRegionGpuModified(device_addr, size)) {
@@ -276,41 +281,57 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
 
 template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DAddr device_addr,
-                                                                              u64 size) {
+                                                                              u64 size,
+                                                                              DAddr area_begin,
+                                                                              DAddr area_end) {
     std::optional<VideoCore::RasterizerDownloadArea> area{};
     area.emplace();
-    DAddr device_addr_start_aligned = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-    DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-    area->start_address = device_addr_start_aligned;
-    area->end_address = device_addr_end_aligned;
+    const DAddr read_begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+    const DAddr read_end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+    const DAddr begin =
+        (std::min)(read_begin, Common::AlignDown(area_begin, Core::DEVICE_PAGESIZE));
+    const DAddr end = (std::max)(read_end, Common::AlignUp(area_end, Core::DEVICE_PAGESIZE));
+    area->start_address = begin;
+    area->end_address = end;
+    // The rest of the area (the texture cache's, around the read) is flushed when any of it is
+    // GPU-modified, but not marked Preflushable: a mark stays for the session and sends every
+    // later GPU write there to a download at each fence, for pages the CPU never read. Its
+    // traps end instead, so the next GPU write there arms them again and ends the core's area.
+    bool rest_gpu_modified = false;
+    const auto end_rest_traps = [&](DAddr lower, DAddr upper) {
+        if (lower < upper) {
+            rest_gpu_modified |= IsRegionGpuModified(lower, upper - lower);
+            read_trapped_ranges.Subtract(lower, upper - lower);
+        }
+    };
+    end_rest_traps(begin, read_begin);
+    end_rest_traps(read_end, end);
     // With exact preflush only Preflushable pages are downloaded at fences: a read that also
     // covers a trapped page must flush it, so the shortcut needs every page Preflushable.
     bool preflushable = false;
     if (!AsyncBufferDownloads() && ExactPreflush()) {
         u64 preflushable_bytes = 0;
         memory_tracker.ForEachPreflushableRange(
-            device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
+            read_begin, read_end - read_begin,
             [&](DAddr, u64 range_size) { preflushable_bytes += range_size; });
-        preflushable = preflushable_bytes == device_addr_end_aligned - device_addr_start_aligned;
+        preflushable = preflushable_bytes == read_end - read_begin;
     } else {
         preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
     }
     if (preflushable) {
-        area->preemtive = true;
+        area->preemtive = !rest_gpu_modified;
         return area;
     };
-    area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
-                                           device_addr_end_aligned - device_addr_start_aligned);
+    const bool read_gpu_modified = IsRegionGpuModified(read_begin, read_end - read_begin);
+    area->preemtive = !read_gpu_modified && !rest_gpu_modified;
     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
     // in the range to a download at each fence.
-    if (!area->preemtive) {
-        memory_tracker.MarkRegionAsPreflushable(device_addr_start_aligned,
-                                                device_addr_end_aligned - device_addr_start_aligned);
+    if (read_gpu_modified) {
+        memory_tracker.MarkRegionAsPreflushable(read_begin, read_end - read_begin);
     } else {
         // The core keeps this area and has no mark. The next GPU write here must arm the range
         // again, which ends the area and sets the trap.
-        read_trapped_ranges.Subtract(device_addr_start_aligned,
-                                     device_addr_end_aligned - device_addr_start_aligned);
+        read_trapped_ranges.Subtract(read_begin, read_end - read_begin);
     }
     return area;
 }
@@ -2149,7 +2170,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
 }
 
 template <class P>
-bool BufferCache<P>::ExactPreflush() const {
+void BufferCache<P>::UpdateExactPreflush() {
     static const bool wanted = [] {
         const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
         return value == nullptr || value[0] != '0';
@@ -2158,16 +2179,52 @@ bool BufferCache<P>::ExactPreflush() const {
     // GetFlushArea. Without that (NCE, EDEN_NX2_READ_TRAPS=0, EDEN_NX2_NO_REACTIVE=1) they
     // would stay stale, so whole writes are queued then.
     const bool traps = device_memory.ReadTrapsActive();
-    const bool enabled = wanted && traps;
+    exact_preflush = wanted && traps;
     static std::atomic<u32> logged{};
     const u32 decision = 1U << ((wanted ? 2 : 0) + (traps ? 1 : 0));
-    if ((logged.fetch_or(decision, std::memory_order_relaxed) & decision) == 0) {
+    if ((logged.load(std::memory_order_relaxed) & decision) == 0 &&
+        (logged.fetch_or(decision, std::memory_order_relaxed) & decision) == 0) {
         LOG_INFO(HW_GPU, "Fence downloads of GPU writes: {} ({}{})",
-                 enabled ? "Preflushable pages only" : "whole writes",
+                 exact_preflush ? "Preflushable pages only" : "whole writes",
                  wanted ? "exact preflush" : "EDEN_NX2_EXACT_PREFLUSH=0",
                  wanted && !traps ? ", but CPU reads of GPU writes are not trapped" : "");
     }
-    return enabled;
+}
+
+template <class P>
+bool BufferCache<P>::OverlapsGraphicsBindings(DAddr device_addr, u64 size,
+                                              bool vertex_only) const {
+    const auto overlaps = [&](const Binding& binding) {
+        return device_addr < binding.device_addr + binding.size &&
+               binding.device_addr < device_addr + size;
+    };
+    for (const Binding& binding : channel_state->vertex_buffers) {
+        if (overlaps(binding)) {
+            return true;
+        }
+    }
+    if (vertex_only) {
+        return false;
+    }
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const auto any_enabled = [&](u32 mask, const auto& bindings) {
+            for (; mask != 0; mask &= mask - 1) {
+                if (overlaps(bindings[std::countr_zero(mask)])) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (any_enabled(channel_state->enabled_uniform_buffer_masks[stage],
+                        channel_state->uniform_buffers[stage]) ||
+            any_enabled(channel_state->enabled_storage_buffers[stage],
+                        channel_state->storage_buffers[stage]) ||
+            any_enabled(channel_state->enabled_texture_buffers[stage],
+                        channel_state->texture_buffers[stage])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <class P>

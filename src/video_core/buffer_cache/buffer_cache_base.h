@@ -262,7 +262,18 @@ public:
     /// DownloadMemory for each range, waiting for the GPU once.
     void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
 
-    std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+    /// The area a guest CPU read of [device_addr, device_addr + size) flushes and the core then
+    /// skips later reads in.
+    std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size) {
+        return GetFlushArea(device_addr, size, device_addr, device_addr + size);
+    }
+
+    /// GetFlushArea for a read whose flush covers [area_begin, area_end) as well (the texture
+    /// cache's area). Only the read's pages are marked Preflushable; the rest of the area ends
+    /// its read traps, and the area is preemptive only if none of it is GPU-modified.
+    std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size,
+                                                                  DAddr area_begin,
+                                                                  DAddr area_end);
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -620,6 +631,11 @@ private:
     /// rebuilt.
     void MarkVertexBuffersStale(DAddr device_addr, u64 size);
 
+    /// Whether the range overlaps a bound vertex buffer or, unless `vertex_only`, a uniform,
+    /// storage or texture buffer the bound graphics pipeline uses.
+    [[nodiscard]] bool OverlapsGraphicsBindings(DAddr device_addr, u64 size,
+                                                bool vertex_only) const;
+
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
 
@@ -701,7 +717,15 @@ private:
 
     /// Whether QueueFenceDownload queues only the Preflushable pages of a write
     /// (EDEN_NX2_EXACT_PREFLUSH). Needs active read traps for the rest of the write.
-    bool ExactPreflush() const;
+    bool ExactPreflush() const {
+        return exact_preflush;
+    }
+
+    /// Decides ExactPreflush again: at construction and each frame, as the settings it reads can
+    /// change from the GUI.
+    void UpdateExactPreflush();
+
+    bool exact_preflush = false;
 
     /// Queues a GPU write for download at the next fence where DownloadsAtFence holds. With only
     /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
@@ -712,10 +736,9 @@ private:
             return;
         }
         if (!ExactPreflush()) {
-            if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+            if (memory_tracker.IsRegionPreflushable(device_addr, size) ||
+                !ArmReadTraps(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
-            } else {
-                ArmReadTraps(device_addr, size);
             }
             return;
         }
@@ -729,14 +752,17 @@ private:
                 queued += upper - lower;
             }
         });
-        if (queued < size) {
-            ArmReadTraps(device_addr, size);
+        // A page that could not be trapped is downloaded at the fence with the rest of the write.
+        if (queued < size && !ArmReadTraps(device_addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
         }
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
     /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
-    void ArmReadTraps(DAddr device_addr, u64 size) {
+    /// Returns false when a page could not be trapped: the caller downloads the write at the
+    /// fence instead.
+    bool ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
         u64 armed_bytes = 0;
@@ -744,16 +770,26 @@ private:
             armed_bytes += upper - lower;
         });
         if (armed_bytes == end - begin) {
-            return;
+            return true;
+        }
+        // Each call into the core takes its trap lock and ends every core's cached read area:
+        // a range it could not arm is not asked about again before the next frame.
+        if (unarmed_read_trap_ranges.Intersects(begin, end - begin)) {
+            return false;
         }
         // A page the core could not arm (not rasterizer cached yet) must not be skipped by the
         // early return above, so a range is only recorded when all of it was armed.
-        if (device_memory.ArmReadTraps(begin, end - begin)) {
-            read_trapped_ranges.Add(begin, end - begin);
+        if (!device_memory.ArmReadTraps(begin, end - begin)) {
+            unarmed_read_trap_ranges.Add(begin, end - begin);
+            return false;
         }
+        read_trapped_ranges.Add(begin, end - begin);
+        return true;
     }
 
     Common::RangeSet<DAddr> read_trapped_ranges;
+    /// Ranges ArmReadTraps could not arm all of this frame (cleared by TickFrame).
+    Common::RangeSet<DAddr> unarmed_read_trap_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
