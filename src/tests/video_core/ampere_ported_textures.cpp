@@ -47,8 +47,8 @@ TEST_CASE("Ampere per-tap gathers pass proven constant offsets to Maxwell TLD4.P
                 REQUIRE(lowered.required_texture_buffer == 14);
                 const u64 pred = u64{guard} << 16;
                 const std::array<u64, 9> expected{
-                    MoveImmediate(pred, 248, packed),
-                    MoveImmediate(pred, 249, 0x01000001),
+                    MoveImmediate(7ULL << 16, 248, packed),
+                    MoveImmediate(7ULL << 16, 249, 0x01000001),
                     Copy(pred, 250, 4),
                     Copy(pred, 251, 5),
                     0xc800000000000000ULL | pred | 250 | (250ULL << 8) | (248ULL << 20) |
@@ -206,6 +206,54 @@ TEST_CASE("Ampere half gathers prove literal IMAD offsets across outgoing branch
     CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
     invalid = code;
     invalid[2].words = {0x00007805, 0, 0x0001ff00, 0};
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+}
+
+TEST_CASE("Ampere guarded IMAD offsets remain constant across unrelated predicates",
+          "[video_core][ampere][gather]") {
+    const std::array code{
+        Instruction{{0xff109424, 0xfffeffff, 0x078e00ff, 0}},
+        Instruction{{0xff119424, 0xfffcfffd, 0x078e00ff, 0}},
+        Instruction{{0x1c1a7212, 0xff, 0x0784a003, 0}},
+        Instruction{{0x0000281c, 0, 0x03f0f070, 0}},
+        Instruction{{0x00002947, 16, 0x03800000, 0}},
+        Instruction{{0x06189b63, 0x30007c10, 0x001e2f0e, 0}},
+        Exit,
+    };
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto start = lowered.source_instruction_offsets[5];
+    CHECK(lowered.instructions[start] == MoveImmediate(7ULL << 16, 248, 0xfffeffff));
+    CHECK(lowered.instructions[start + 1] == MoveImmediate(7ULL << 16, 249, 0xfffcfffd));
+    CHECK(((lowered.instructions[start + 4] >> 54) & 3) == 2);
+    for (const u32 definition : {0U, 1U}) {
+        for (const u32 guard : {1U, 2U, 7U}) {
+            auto changed = code;
+            changed[definition].words[0] = (changed[definition].words[0] & ~0xf000U) | (guard << 12);
+            if (guard == 7) {
+                CHECK(LowerToMaxwell(changed));
+            } else {
+                CHECK(LowerToMaxwell(changed).error == "native per-tap gather nonconstant offsets");
+            }
+        }
+    }
+    for (const u32 instruction : {2U, 3U}) {
+        auto invalid = code;
+        invalid[instruction].words[2] = (invalid[instruction].words[2] & ~(7U << 17)) | (1U << 17);
+        CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    }
+    auto invalid = code;
+    invalid[3].words[2] = (invalid[3].words[2] & ~(7U << 20)) | (1U << 20);
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    invalid = code;
+    invalid[2].words = {0x041c7810, 4, 0x07f3e0ff, 0};
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    invalid = code;
+    invalid[4].words[1] = 0;
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather control-flow proof");
+    invalid = code;
+    invalid[2].words = {0x00107805, 0, 0x0001ff00, 0};
     CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
 }
 
