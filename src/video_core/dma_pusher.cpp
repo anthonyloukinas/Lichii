@@ -190,6 +190,7 @@ bool DmaPusher::Step() {
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            !SkipWriterWait(dma_state.dma_get, size_t{header.size} * sizeof(u32)) &&
             VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
@@ -604,6 +605,51 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
                                        entry.size * sizeof(u32));
     }
     list.deferred_entries.clear();
+}
+
+// EDEN_NX2_STEP_WRITER_SKIP=1 (experiment, off by default): an entry on pages no GPU work wrote
+// yet is read without waiting for the queued compute and copy work. That work can write the
+// pages for the first time (the crash command_fetch_order.h describes), so the back checks the
+// pages once it has run it: if they were written by then, the entry was read too early, which is
+// logged and turns the skip off for the rest of the session.
+namespace {
+std::atomic<bool> g_writer_skip_off{};
+std::atomic<u32> g_writer_skip_misses{};
+} // namespace
+
+bool DmaPusher::SkipWriterWait(GPUVAddr address, size_t size) {
+    static const bool enabled = VideoCommon::Nx2EnvSwitch("EDEN_NX2_STEP_WRITER_SKIP", false);
+    if (!enabled || g_writer_skip_off.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.WritersPending()) {
+        return false;
+    }
+    namespace Profile = VideoCommon::Nx2Profile;
+    Profile::Add(Profile::Counter::StepWriterSkips, 1);
+    split.Defer(
+        [memory = &memory_manager, address, size] {
+            for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size;
+                 page += 0x1000) {
+                const auto device = memory->GpuToCpuAddress(page);
+                if (!device || !Tegra::Nx2IsGpuWritten(*device)) {
+                    continue;
+                }
+                Profile::Add(Profile::Counter::StepWriterMisses, 1);
+                g_writer_skip_off.store(true, std::memory_order_relaxed);
+                if (g_writer_skip_misses.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(HW_GPU,
+                                "EDEN_NX2_STEP_WRITER_SKIP: commands at {:#x} ({} bytes, page "
+                                "{:#x}) were read before queued GPU work wrote them; the skip "
+                                "is off from now on",
+                                address, size, page);
+                }
+                return;
+            }
+        },
+        VideoCommon::GpuSplit::FastDrawNeutral);
+    return true;
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {

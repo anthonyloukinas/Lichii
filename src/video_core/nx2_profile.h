@@ -115,6 +115,9 @@ enum class Counter : u32 {
     AcquireDrained,        ///< Not met yet: drained as before
     AcquireVerifyChecks,   ///< EDEN_NX2_WAIT_VERIFY: met acquires checked again after a drain
     AcquireVerifyDiffs,    ///< ... not met any more
+    // EDEN_NX2_STEP_WRITER_SKIP (DmaPusher::SkipWriterWait).
+    StepWriterSkips,  ///< Entries read without waiting for queued compute and copy work
+    StepWriterMisses, ///< ... that the work wrote after all (back thread)
     Count,
 };
 
@@ -262,6 +265,13 @@ inline void Report(const char* thread_name = "GPU thread") {
             per_second(Counter::AcquireMetNoDrain), per_second(Counter::AcquireResumedNoDrain),
             per_second(Counter::AcquireMetAfterWait), per_second(Counter::AcquireDrained),
             per_second(Counter::AcquireVerifyChecks), per_second(Counter::AcquireVerifyDiffs));
+    }
+    if (data.counters[static_cast<size_t>(Counter::StepWriterSkips)] +
+            data.counters[static_cast<size_t>(Counter::StepWriterMisses)] !=
+        0) {
+        line += fmt::format(" | entries read without the writer wait {:.0f} ({:.0f} too early)",
+                            per_second(Counter::StepWriterSkips),
+                            per_second(Counter::StepWriterMisses));
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
