@@ -1132,16 +1132,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 width = insn.Bits(73, 3);
             // U8 and U16, direct or indexed (Ocarina's culling programs read per-object bytes
             // with ULDC.U8 UR, c[bank][UR+imm]); Maxwell LDC.U8/U16 takes the same register-plus-
-            // offset address, and its offset is signed, hence the bound.
+            // offset address. An indexed offset is signed as LDC's (0x1149d8c600: c[4][UR15-1]);
+            // a direct one is not, and Maxwell's is, hence the bound. Only the sum of an indexed
+            // address need be aligned (the same program: ULDC.32 c[4][UR15+0x1d] next to the U8
+            // loads at UR15+0xe and UR15-1); Maxwell LDC adds before it aligns too.
             const bool subword_load = width == 0 || width == 2;
             const u32 offset = insn.Bits(38, 16);
             const u32 alignment = width == 0 ? 1U : width == 2 ? 2U : 4U;
             const u32 target = uniform_register(uniform_dest);
             const u32 index_target = opcode == 0xabb ? uniform_register(index_reg) : 255U;
             if (target == ~0U || target == 255 || (!subword_load && width != 4 && width != 5) ||
-                (subword_load && offset >= 0x8000) ||
+                (subword_load && index_target == 255 && offset >= 0x8000) ||
                 (width == 5 && ((uniform_dest & 1) || uniform_register(uniform_dest + 1) != target + 1)) ||
-                bank() >= 18 || offset % alignment || insn.Bits(62, 2) ||
+                bank() >= 18 || ((index_target == 255 || width == 5) && offset % alignment) ||
+                insn.Bits(62, 2) ||
                 (insn.words[2] & ~0xe00U) != (opcode == 0xab9 ? 0U : 0x08000000U) ||
                 index_target == ~0U)
                 return fail(index, "native uniform constant load mode");
@@ -3241,9 +3245,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(60, 2) * 2} << 41));
                 break;
             }
-            // I2F.{U,S}8 Rd, Rs.B0-B3: the byte selector (bits 60-61) as Maxwell's (41-42).
+            // I2F.{U,S}8 Rd, Rs.B0-B3: the byte selector (bits 60-61) as Maxwell's (41-42), for a
+            // uniform source too (0x1149d8c600: I2F.F32.U8 R9, UR17.B3).
             if ((insn.words[2] & ~0x400U) != (opcode == 0xd06 ? 0x08001000U : 0x1000U) ||
-                (insn.words[1] & (opcode == 0xd06 ? 0xffffff00U : 0xcfffff00U)) || source == ~0U)
+                (insn.words[1] & 0xcfffff00U) || source == ~0U)
                 return fail(index, "native byte-to-float conversion mode");
             emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (is_signed << 13) | (u64{source} << 20) |
                  (u64{insn.Bits(60, 2)} << 41));

@@ -177,9 +177,11 @@ struct LoggedMachine {
                 write(0, Constant(bits(20, 14) * 4, 4));
             } else if ((word & 0xfff0000000000000ULL) == 0xef90000000000000ULL) {
                 REQUIRE(bits(36, 5) == 0);
-                REQUIRE(bits(48, 3) == 0);
+                REQUIRE((bits(48, 3) == 0 || bits(48, 3) == 4));
                 const s32 offset = static_cast<s32>(bits(20, 16) << 16) >> 16;
-                write(0, Constant(Read(0, a) + offset, 1));
+                const u32 address = Read(0, a) + offset;
+                if (bits(48, 3) == 4) REQUIRE(address % 4 == 0);
+                write(0, Constant(address, bits(48, 3) == 4 ? 4 : 1));
             } else if ((word >> 56) == 1) {
                 write(0, bits(20, 32));
             } else if ((word >> 48) == 0x38e8) {
@@ -876,19 +878,104 @@ TEST_CASE("Ocarina indexed ULDC.U8 loads one byte at the uniform index plus offs
                       (reg == map(c.dest) ? u32{machine.constants[base + c.offset]} : before[reg]));
         }
     }
-    // Signed widths, unrepresentable offsets and URZ/odd destinations stay rejected.
+    // Signed widths and URZ destinations stay rejected; so do direct (URZ index) loads past
+    // Maxwell's signed offset or unaligned. An indexed offset is signed and only the sum aligns.
     auto load = Instruction{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}};
     for (const auto change : std::array{std::array{73U, 3U, 1U}, std::array{73U, 3U, 3U},
-                                        std::array{38U, 16U, 0x8000U}, std::array{16U, 8U, 63U}}) {
+                                        std::array{16U, 8U, 63U}}) {
         auto changed = load;
         SetBits(changed, change[0], change[1], change[2]);
         CHECK_FALSE(LowerToMaxwell(std::array{changed, Exit}));
     }
+    auto direct = load;
+    SetBits(direct, 24, 8, 63);
+    CHECK(LowerToMaxwell(std::array{direct, Exit}));
+    SetBits(direct, 38, 16, 0x8000);
+    CHECK_FALSE(LowerToMaxwell(std::array{direct, Exit}));
+    SetBits(direct, 38, 16, 3);
+    SetBits(direct, 73, 3, 2);
+    CHECK_FALSE(LowerToMaxwell(std::array{direct, Exit})); // offset 3 is not halfword aligned
     auto halfword = load;
     SetBits(halfword, 73, 3, 2);
-    CHECK_FALSE(LowerToMaxwell(std::array{halfword, Exit})); // offset 3 is not halfword aligned
-    SetBits(halfword, 38, 16, 2);
     CHECK(LowerToMaxwell(std::array{halfword, Exit}));
+}
+
+TEST_CASE("Ocarina indexed ULDC takes a signed offset and an unaligned one when the sum aligns",
+          "[video_core][ampere][fast_fusion_logged]") {
+    // 0x1149d8c600: @UP0 ULDC.U8 UR7, c[4][UR15-1] (+0x1050) and ULDC.32 UR7, c[4][UR15+0x29]
+    // (+0xa0c0; also +0x1d, +0x21, +0x25), UR15 a byte index (UR15+0xe is read as U8 too).
+    const auto SetBits = [](Instruction& instruction, u32 bit, u32 width, u32 value) {
+        const u32 mask = ((1U << width) - 1) << (bit % 32);
+        instruction.words[bit / 32] =
+            (instruction.words[bit / 32] & ~mask) | ((value << (bit % 32)) & mask);
+    };
+    const Instruction byte{{0x0f070abb, 0x013fffc0, 0x08000000, 0x000fe400}};
+    const Instruction word{{0x0f077abb, 0x01000a40, 0x08000800, 0x000fc600}};
+    for (const auto& instruction : {byte, word}) {
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+    }
+    auto byte0 = byte, word0 = word;
+    SetBits(byte0, 54, 5, 0);
+    SetBits(word0, 54, 5, 0);
+    const auto byte_run = LowerToMaxwell(std::array{byte0, Exit});
+    const auto word_run = LowerToMaxwell(std::array{word0, Exit});
+    REQUIRE(byte_run);
+    REQUIRE(word_run);
+    for (const u32 base : {1U, 3U, 0x103U, 0x7fffU}) {
+        for (const bool up0 : {false, true}) {
+            LoggedMachine machine;
+            machine.registers[0][231] = base;
+            machine.registers[0][239] = up0 ? 0x40U : 0x3fU;
+            const auto before = machine.registers[0];
+            const auto predicates = machine.predicates;
+            machine.Run(byte_run.instructions);
+            CAPTURE(base, up0);
+            for (u32 reg = 0; reg < 246; ++reg)
+                CHECK(machine.registers[0][reg] ==
+                      (reg == 223 && up0 ? u32{machine.constants[base - 1]} : before[reg]));
+            CHECK(machine.predicates == predicates);
+        }
+        if ((base + 0x29) % 4) continue;
+        LoggedMachine machine;
+        machine.registers[0][231] = base;
+        machine.Run(word_run.instructions);
+        CHECK(machine.registers[0][223] == machine.Constant(base + 0x29, 4));
+    }
+    // Direct loads keep the bounds and alignment checks; so do indexed 64-bit loads.
+    auto direct = byte;
+    SetBits(direct, 24, 8, 63);
+    CHECK_FALSE(LowerToMaxwell(std::array{direct, Exit}));
+    auto direct_word = word;
+    SetBits(direct_word, 24, 8, 63);
+    CHECK_FALSE(LowerToMaxwell(std::array{direct_word, Exit}));
+    auto pair = word;
+    SetBits(pair, 73, 3, 5);
+    SetBits(pair, 16, 8, 6);
+    CHECK_FALSE(LowerToMaxwell(std::array{pair, Exit}));
+    SetBits(pair, 38, 16, 0x28);
+    CHECK(LowerToMaxwell(std::array{pair, Exit}));
+}
+
+TEST_CASE("Ocarina uniform I2F.U8 converts the selected byte like the register form",
+          "[video_core][ampere][fast_fusion_logged]") {
+    // 0x1149d8c600: I2F.F32.U8 R9, UR17.B3 (+0x1160), R31, UR4.B2 (+0x82d0).
+    for (const auto& instruction : {Instruction{{0x00097d06, 0x30000011, 0x08001000, 0x000fe200}},
+                                    Instruction{{0x001f7d06, 0x20000004, 0x08001000, 0x000e2200}},
+                                    Instruction{{0x00227d06, 0x00000004, 0x08001000, 0x000e6200}}}) {
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        // The register form with UR(n) as R(216 + n).
+        Instruction reg{{(instruction.words[0] & ~0xfffU) | 0x306,
+                         (instruction.words[1] & ~0xffU) | (216 + (instruction.words[1] & 0xff)),
+                         0x00001000, instruction.words[3]}};
+        const auto expected = LowerToMaxwell(std::array{reg, Exit});
+        REQUIRE(expected);
+        CHECK(lowered.instructions == expected.instructions);
+        CHECK(((lowered.instructions.front() >> 41) & 3) == instruction.Bits(60, 2));
+    }
 }
 
 TEST_CASE("Fast Fusion captured register shadows distinguish pairs uniform inputs and constants",

@@ -241,6 +241,25 @@ class CliTests(unittest.TestCase):
                              "--output", self.output)
                 self.validate()
 
+    def test_oot_signed_unaligned_uldc_and_uniform_byte_convert(self):
+        # 0x1149d8c600: @UP0 ULDC.U8 UR7, c[4][UR15-1]; ULDC.32 UR7, c[4][UR15+0x29];
+        # I2F.F32.U8 R9, UR17.B3. A MOV to R0 keeps each result live.
+        move = lambda dest: struct.pack("<4I", 0x00007c02, dest, 0x08000f00, 0)
+        cases = (
+            ((0x0f070abb, 0x013fffc0, 0x08000000, 0x000fe400), move(7)),
+            ((0x0f077abb, 0x01000a40, 0x08000800, 0x000fc600), move(7)),
+            ((0x00097d06, 0x30000011, 0x08001000, 0x000fe200),
+             struct.pack("<4I", 0x00007202, 9, 0x00000f00, 0)),
+        )
+        for first, keep in cases:
+            with self.subTest(first=hex(first[0])):
+                source = self.write("oot-uldc.bin", struct.pack("<4I", *first) + keep + NATIVE_EXIT)
+                self.run_cli(source, "--lower-only", self.output)
+                capture = self.write("shader.env", environment(50, 4))
+                self.run_cli(source, "--environment", capture, "--cache-version", 50,
+                             "--output", self.output)
+                self.validate()
+
     def test_oot_call_link_set_before_a_p2r(self):
         # 0x1149820600 +0x1f90: MOV R18, ret; P2R R16, PR, RZ, 0x40; CALL.REL.NOINC to a callee
         # that ends MOV R19, 0; RET.REL.NODEC R18.
