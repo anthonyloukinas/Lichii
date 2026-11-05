@@ -267,6 +267,9 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         VideoCommon::GpuSplit::Get().NoteSync();
+        // EDEN_NX2_HOT_PAGES: a syncpoint wait orders the CPU's writes before its increment
+        // (not waited on here, so not a guarantee; as close as the trap path gets).
+        VideoCommon::Nx2HotPages::BumpEpoch();
         break;
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
