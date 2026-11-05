@@ -1815,6 +1815,64 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        // EDEN_NX2_DEFERRED_WRITE_LOG (docs/oot-white-petals.md): totals since the previous line.
+        auto& c = Tegra::g_nx2_deferred_writes;
+        const auto take = [](std::atomic<u64>& counter) {
+            return counter.exchange(0, std::memory_order_relaxed);
+        };
+        const u64 writes = take(c.collected_writes);
+        const u64 bytes = take(c.collected_bytes);
+        const u64 pool_writes = take(c.pool_writes);
+        const u64 pool_bytes = take(c.pool_bytes);
+        const u64 invalidations = take(c.applied_calls);
+        const u64 applied_ranges = take(c.applied_ranges);
+        const u64 applied_bytes = take(c.applied_bytes);
+        const u64 applied_pool_bytes = take(c.applied_pool_bytes);
+        const u64 sync_calls = take(c.sync_download_calls);
+        const auto down = [&](size_t sync) {
+            return fmt::format("{}/{}/{}", take(c.download_ranges[sync]),
+                               take(c.download_bytes[sync]), take(c.download_pool_bytes[sync]));
+        };
+        const std::string fence_downloads = down(0);
+        const std::string sync_downloads = down(1);
+        const auto staging = [&](size_t kind) {
+            return fmt::format("{}/{}", take(c.staging_requests[kind]), take(c.staging_bytes[kind]));
+        };
+        const std::string staging_upload = staging(0);
+        const std::string staging_download = staging(1);
+        const std::string staging_device = staging(2);
+        const u64 buffer_upload_bytes = take(c.buffer_upload_bytes);
+        const u64 native_upload_bytes = take(c.native_storage_upload_bytes);
+        const u64 native_dispatches = take(c.native_dispatches);
+        const u64 native_bindings = take(c.native_storage_bindings);
+        const u64 native_bound_bytes = take(c.native_storage_bytes);
+        const u64 native_marked_bytes = take(c.native_marked_bytes);
+        const u64 fence_copies = take(c.fence_copies);
+        const u64 fence_copy_bytes = take(c.fence_copy_bytes);
+        const u64 fence_copy_pool_bytes = take(c.fence_copy_pool_bytes);
+        const u64 mapped_read_bytes = take(c.mapped_read_bytes);
+        LOG_INFO(Render_Vulkan,
+                 "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
+                 "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
+                 "applied_ranges={} applied_bytes={} applied_pool_bytes={} "
+                 "fence_downloads(ranges/bytes/pool_bytes)={} sync_downloads={} "
+                 "sync_download_calls={} staging(requests/bytes) upload={} download={} "
+                 "device_local={} buffer_upload_bytes={} native_storage_upload_bytes={} "
+                 "native_dispatches={} native_storage_bindings={} native_bound_bytes={} "
+                 "native_marked_bytes={} fence_copies={} fence_copy_bytes={} "
+                 "fence_copy_pool_bytes={} mapped_read_bytes={} write_mark={}",
+                 render_trace_frame, writes, bytes, pool_writes, pool_bytes,
+                 Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
+                 applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
+                 sync_downloads, sync_calls, staging_upload, staging_download, staging_device,
+                 buffer_upload_bytes, native_upload_bytes, native_dispatches, native_bindings,
+                 native_bound_bytes, native_marked_bytes, fence_copies, fence_copy_bytes,
+                 fence_copy_pool_bytes, mapped_read_bytes,
+                 Tegra::g_nx2_compute_write_mark == ~u64{0}
+                     ? std::string{"full"}
+                     : std::to_string(Tegra::g_nx2_compute_write_mark));
+    }
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;

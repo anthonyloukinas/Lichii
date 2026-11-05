@@ -501,6 +501,9 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::BindHostComputeBuffers() {
+    if (Tegra::g_nx2_deferred_write_log && kepler_compute->IsNativeMode()) [[unlikely]] {
+        Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_dispatches, 1);
+    }
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -623,6 +626,7 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     }
     channel_state->enabled_compute_storage_buffers = 0;
     channel_state->written_compute_storage_buffers = 0;
+    channel_state->native_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
 
@@ -664,8 +668,12 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
 
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
+    const bool native_pointer = kepler_compute->IsNativeMode();
+    channel_state->native_compute_storage_buffers =
+        (channel_state->native_compute_storage_buffers & ~(1U << ssbo_index)) |
+        ((native_pointer ? 1U : 0U) << ssbo_index);
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode());
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer);
 }
 
 template <class P>
@@ -809,6 +817,13 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
             Nx2Profile::Add(Nx2Profile::Counter::DownloadBytesOnDmaPages, on_dma_pages);
         }
         download_ranges.Add(orig_device_addr, copy.size);
+        if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+            auto& c = Tegra::g_nx2_deferred_writes;
+            Tegra::Nx2Count(c.fence_copies, 1);
+            Tegra::Nx2Count(c.fence_copy_bytes, copy.size);
+            Tegra::Nx2Count(c.fence_copy_pool_bytes,
+                            Tegra::Nx2PoolOverlap(orig_device_addr, copy.size));
+        }
         buffer.MarkUsage(copy.src_offset, copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, copies, false);
         normalized_copies.push_back(second_copy);
@@ -850,6 +865,9 @@ void BufferCache<P>::PopAsyncBuffers() {
         // Only what no write replaced since the copy was taken: the rest is older than guest
         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+            if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+                Tegra::Nx2NoteDownload(false, start, end - start);
+            }
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
             gpu_modified_ranges.Subtract(start, end - start);
@@ -1298,7 +1316,8 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
 
 template <class P>
 bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_written,
-                                           std::span<const MultiRangeSegment> pool) {
+                                           std::span<const MultiRangeSegment> pool,
+                                           u64 write_mark_limit) {
     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
         if (binding.segment_count < 2) {
             return false;
@@ -1321,8 +1340,13 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             SynchronizeBuffer(buffer, segment.device_addr, segment.size);
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
-            if (is_written) {
-                MarkWrittenBuffer(segment.buffer_id, segment.device_addr, segment.size);
+            if (is_written && write_mark_limit != 0) {
+                // write_mark_limit: EDEN_NX2_COMPUTE_WRITE_MARK, spread over the segments in order.
+                const u32 mark = static_cast<u32>(std::min<u64>(segment.size, write_mark_limit));
+                MarkWrittenBuffer(segment.buffer_id, segment.device_addr, mark);
+                if (write_mark_limit != ~u64{0}) {
+                    write_mark_limit -= mark;
+                }
             }
             runtime.PushMultiRangeSource(buffer, offset, segment.size);
         }
@@ -1485,19 +1509,36 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const Binding& binding = channel_state->compute_storage_buffers[index];
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-        if (BindMultiRangeStorage(binding, is_written, compute_segments)) {
+        // EDEN_NX2_COMPUTE_WRITE_MARK (experiment, docs/oot-white-petals.md): a native program's
+        // binding is min(layout, 8 MiB) because its pointer has no size, and marking all of it
+        // GPU-written defers the CPU's later writes to those pages. Clamp only what is claimed
+        // written; the binding keeps its size so the shader can still read all of it.
+        const bool native =
+            ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+        const u64 write_mark_limit = native ? Tegra::g_nx2_compute_write_mark : ~u64{0};
+        if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
+        nx2_native_storage_sync = native;
         SynchronizeBuffer(buffer, binding.device_addr, size);
+        nx2_native_storage_sync = false;
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
-        if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
+        const u32 mark =
+            is_written ? static_cast<u32>(std::min<u64>(size, write_mark_limit)) : 0;
+        if (mark != 0) {
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, true);
+        }
+        if (Tegra::g_nx2_deferred_write_log && native) [[unlikely]] {
+            auto& c = Tegra::g_nx2_deferred_writes;
+            Tegra::Nx2Count(c.native_storage_bindings, 1);
+            Tegra::Nx2Count(c.native_storage_bytes, size);
+            Tegra::Nx2Count(c.native_marked_bytes, mark);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -2302,6 +2343,13 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        auto& c = Tegra::g_nx2_deferred_writes;
+        Tegra::Nx2Count(c.buffer_upload_bytes, total_size_bytes);
+        if (nx2_native_storage_sync) {
+            Tegra::Nx2Count(c.native_storage_upload_bytes, total_size_bytes);
+        }
+    }
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
@@ -2449,6 +2497,9 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     const u8* const mapped_memory = download_staging.mapped_span.data();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+        if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+            Tegra::Nx2NoteDownload(true, device_addr, download.copy.size);
+        }
         device_memory.WriteBlockUnsafe(
             device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
@@ -2485,10 +2536,21 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if (total_size_bytes == 0) {
         return;
     }
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        Tegra::g_nx2_deferred_writes.sync_download_calls.fetch_add(1, std::memory_order_relaxed);
+        for (const BufferCopy& copy : copies) {
+            Tegra::Nx2NoteDownload(true, buffer.CpuAddr() + copy.src_offset, copy.size);
+        }
+    }
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
             runtime.Wait(buffer.LastUsageTick());
+            if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+                for (const BufferCopy& copy : copies) {
+                    Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.mapped_read_bytes, copy.size);
+                }
+            }
             for (const BufferCopy& copy : copies) {
                 device_memory.WriteBlockUnsafe(buffer.CpuAddr() + copy.src_offset,
                                                mapped.data() + copy.src_offset, copy.size);

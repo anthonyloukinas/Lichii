@@ -15,6 +15,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -115,6 +116,14 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        const size_t kind = usage == MemoryUsage::Upload     ? 0
+                            : usage == MemoryUsage::Download ? 1
+                                                             : 2;
+        auto& c = Tegra::g_nx2_deferred_writes;
+        Tegra::Nx2Count(c.staging_requests[kind], 1);
+        Tegra::Nx2Count(c.staging_bytes[kind], size);
+    }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }

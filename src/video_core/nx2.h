@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -19,6 +20,122 @@ namespace Tegra {
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
+
+// EDEN_NX2_DEFERRED_WRITE_LOG=1 (experiment, docs/oot-white-petals.md): count guest CPU writes to
+// GPU-cached memory that are only collected (core/memory.cpp), and how many of the collected ones
+// are applied by InvalidateGPUCache, then log the totals once per frame. Off: one branch on a
+// constant bool per collected write.
+inline const bool g_nx2_deferred_write_log = [] {
+    const char* value = std::getenv("EDEN_NX2_DEFERRED_WRITE_LOG");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}();
+// The device range the log buckets separately. Default: Ocarina of Time's skinning pool in the
+// white-petals frame dump. EDEN_NX2_DEFERRED_WRITE_RANGE=<begin>-<end> (hex or decimal) picks
+// another, for example a draw's light-matrix uniform buffer taken from a frame dump.
+inline const std::pair<u64, u64> g_nx2_deferred_pool = [] {
+    std::pair<u64, u64> range{0x2b300000, 0x2b900000};
+    const char* value = std::getenv("EDEN_NX2_DEFERRED_WRITE_RANGE");
+    if (value == nullptr) {
+        return range;
+    }
+    char* end = nullptr;
+    const u64 begin = std::strtoull(value, &end, 0);
+    if (end == value || *end != '-') {
+        return range;
+    }
+    const char* second = end + 1;
+    const u64 last = std::strtoull(second, &end, 0);
+    if (end == second || last <= begin) {
+        return range;
+    }
+    return std::pair<u64, u64>{begin, last};
+}();
+struct Nx2DeferredWriteCounters {
+    std::atomic<u64> collected_writes{0};
+    std::atomic<u64> collected_bytes{0};
+    std::atomic<u64> pool_writes{0};
+    std::atomic<u64> pool_bytes{0};
+    std::atomic<u64> applied_calls{0};
+    std::atomic<u64> applied_ranges{0};
+    std::atomic<u64> applied_bytes{0};
+    std::atomic<u64> applied_pool_bytes{0};
+    // GPU -> guest buffer-cache downloads: [0] at a fence (async), [1] synchronous (a CPU read,
+    // a CPU write over GPU bytes, a DMA/flush request), which stall on the host GPU.
+    std::array<std::atomic<u64>, 2> download_ranges{};
+    std::array<std::atomic<u64>, 2> download_bytes{};
+    std::array<std::atomic<u64>, 2> download_pool_bytes{};
+    std::atomic<u64> sync_download_calls{0};
+    // StagingBufferPool::Request, every buffer- and texture-cache staging allocation:
+    // [0] Upload (host -> GPU), [1] Download (GPU -> host), [2] DeviceLocal (GPU-side scratch).
+    std::array<std::atomic<u64>, 3> staging_requests{};
+    std::array<std::atomic<u64>, 3> staging_bytes{};
+    // Buffer-cache uploads of CPU-modified pages (SynchronizeBuffer), and the part done while
+    // binding native compute storage buffers.
+    std::atomic<u64> buffer_upload_bytes{0};
+    std::atomic<u64> native_storage_upload_bytes{0};
+    // Native (Switch 2) compute dispatches, their storage bindings, the bytes those bindings
+    // cover and the bytes marked GPU-written for them (after EDEN_NX2_COMPUTE_WRITE_MARK).
+    std::atomic<u64> native_dispatches{0};
+    std::atomic<u64> native_storage_bindings{0};
+    std::atomic<u64> native_storage_bytes{0};
+    std::atomic<u64> native_marked_bytes{0};
+    // Fence downloads as copied by the GPU into host staging (CommitAsyncFlushesHigh), before
+    // PopAsyncBuffers drops what later GPU or CPU writes superseded; and the pool's share.
+    std::atomic<u64> fence_copies{0};
+    std::atomic<u64> fence_copy_bytes{0};
+    std::atomic<u64> fence_copy_pool_bytes{0};
+    // DownloadBufferMemory's mapped branch: the CPU reads host-visible device-local memory
+    // (ReBAR) directly, over PCIe.
+    std::atomic<u64> mapped_read_bytes{0};
+};
+inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
+
+inline u64 Nx2PoolOverlap(u64 address, u64 size) {
+    const u64 begin = std::max<u64>(address, g_nx2_deferred_pool.first);
+    const u64 end = std::min<u64>(address + size, g_nx2_deferred_pool.second);
+    return end > begin ? end - begin : 0;
+}
+
+inline void Nx2NoteCollectedWrite(u64 address, u64 size) {
+    auto& c = g_nx2_deferred_writes;
+    c.collected_writes.fetch_add(1, std::memory_order_relaxed);
+    c.collected_bytes.fetch_add(size, std::memory_order_relaxed);
+    if (const u64 overlap = Nx2PoolOverlap(address, size); overlap != 0) {
+        c.pool_writes.fetch_add(1, std::memory_order_relaxed);
+        c.pool_bytes.fetch_add(overlap, std::memory_order_relaxed);
+    }
+}
+
+inline void Nx2NoteAppliedWrite(u64 address, u64 size) {
+    auto& c = g_nx2_deferred_writes;
+    c.applied_ranges.fetch_add(1, std::memory_order_relaxed);
+    c.applied_bytes.fetch_add(size, std::memory_order_relaxed);
+    c.applied_pool_bytes.fetch_add(Nx2PoolOverlap(address, size), std::memory_order_relaxed);
+}
+
+inline void Nx2Count(std::atomic<u64>& counter, u64 value) {
+    counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+inline void Nx2NoteDownload(bool sync, u64 address, u64 size) {
+    auto& c = g_nx2_deferred_writes;
+    c.download_ranges[sync].fetch_add(1, std::memory_order_relaxed);
+    c.download_bytes[sync].fetch_add(size, std::memory_order_relaxed);
+    c.download_pool_bytes[sync].fetch_add(Nx2PoolOverlap(address, size),
+                                          std::memory_order_relaxed);
+}
+
+// EDEN_NX2_COMPUTE_WRITE_MARK=<bytes> (experiment, docs/oot-white-petals.md): the most a native
+// compute storage binding claims to have written. Unset: the whole binding (up to 8 MiB). 0: none.
+inline const u64 g_nx2_compute_write_mark = [] {
+    const char* value = std::getenv("EDEN_NX2_COMPUTE_WRITE_MARK");
+    if (value == nullptr || value[0] == '\0') {
+        return ~u64{0};
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 0);
+    return end == value ? ~u64{0} : static_cast<u64>(parsed);
+}();
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
