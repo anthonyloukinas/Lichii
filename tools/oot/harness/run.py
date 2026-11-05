@@ -81,7 +81,18 @@ SHOT_BACKENDS = {"gamescope": GamescopeShots}
 # ------------------------------------------------------------------ helpers
 def emu_pids():
     out = subprocess.run(["pgrep", "-f", EMU_PATTERN], capture_output=True, text=True).stdout.split()
-    return [int(p) for p in out if int(p) != os.getpid()]
+    # The harness's own ancestors (a `bash -c ... --binary .../bin/lichii` wrapper) match the
+    # pattern too; exclude the whole ancestor chain, not just this pid.
+    mine = set()
+    pid = os.getpid()
+    while pid > 1:
+        mine.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return [int(p) for p in out if int(p) not in mine]
 
 
 def descendants(pid):
