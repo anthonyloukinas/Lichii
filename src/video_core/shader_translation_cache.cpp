@@ -78,7 +78,8 @@ consteval size_t CountFields() {
     POD(uses_atomic_f16x2_max) POD(uses_atomic_f32x2_add) POD(uses_atomic_f32x2_min)              \
     POD(uses_atomic_f32x2_max) POD(uses_atomic_s32_min) POD(uses_atomic_s32_max)                   \
     POD(uses_int64_bit_atomics) POD(uses_global_memory) POD(requires_coherent_global_memory)      \
-    POD(requires_coherent_image_memory) POD(native_global_bounds) POD(uses_atomic_image_u32)      \
+    POD(requires_coherent_image_memory) POD(native_global_bounds) POD(native_global_stats)        \
+    POD(uses_atomic_image_u32)                                                                     \
     POD(uses_shadow_lod) POD(uses_rescaling_uniform) POD(uses_cbuf_indirect)                       \
     POD(uses_render_area) POD(used_constant_buffer_types) POD(used_storage_buffer_types)          \
     POD(used_indirect_cbuf_types) POD(constant_buffer_mask) POD(constant_buffer_used_sizes)       \
@@ -87,7 +88,7 @@ consteval size_t CountFields() {
     VEC(storage_buffers_descriptors) VEC(texture_buffer_descriptors)                               \
     VEC(image_buffer_descriptors) VEC(texture_descriptors) VECVEC(handle_programs)                 \
     VEC(image_descriptors)
-constexpr size_t InfoFields = 86;
+constexpr size_t InfoFields = 87;
 
 #define TRANSLATION_CACHE_PROFILE_FIELDS(X) \
     X(supported_spirv) X(unified_descriptor_binding) X(support_descriptor_aliasing) \

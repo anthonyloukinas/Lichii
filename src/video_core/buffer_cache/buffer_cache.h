@@ -852,12 +852,13 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     channel_state->enabled_compute_storage_buffers = 0;
     channel_state->written_compute_storage_buffers = 0;
     channel_state->native_compute_storage_buffers = 0;
+    channel_state->dynamic_slot_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
 
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                              bool is_written) {
+                                              bool is_written, bool native_dynamic_slot) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -897,8 +898,12 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     channel_state->native_compute_storage_buffers =
         (channel_state->native_compute_storage_buffers & ~(1U << ssbo_index)) |
         ((native_pointer ? 1U : 0U) << ssbo_index);
+    const bool dynamic_slot = native_pointer && native_dynamic_slot;
+    channel_state->dynamic_slot_compute_storage_buffers =
+        (channel_state->dynamic_slot_compute_storage_buffers & ~(1U << ssbo_index)) |
+        ((dynamic_slot ? 1U : 0U) << ssbo_index);
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer);
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer, dynamic_slot);
 }
 
 template <class P>
@@ -1790,7 +1795,12 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         // written; the binding keeps its size so the shader can still read all of it.
         const bool native =
             ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
-        const u64 write_mark_limit = native ? Tegra::g_nx2_compute_write_mark : ~u64{0};
+        // A dynamic pointer slot's writes can land anywhere in its binding, far past the
+        // pointer, so it is marked whole.
+        const bool dynamic_slot =
+            ((channel_state->dynamic_slot_compute_storage_buffers >> index) & 1) != 0;
+        const u64 write_mark_limit =
+            native && !dynamic_slot ? Tegra::g_nx2_compute_write_mark : ~u64{0};
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
@@ -3064,7 +3074,8 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                             bool is_written, bool native_pointer) const {
+                                             bool is_written, bool native_pointer,
+                                             bool native_dynamic_slot) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
@@ -3078,7 +3089,14 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
         if (native_pointer) {
-            return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+            // A slot of a pointer table read at a dynamic offset: the program can reach past the
+            // pointer's own mapping, so take at least 4 MiB of what is mapped from it. Only one
+            // device range: a written binding is bound as one, and writes past it would land in
+            // other allocations.
+            const u32 floor = native_dynamic_slot
+                                  ? static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, 4_MiB))
+                                  : 0U;
+            return (std::min)((std::max)(memory_layout_size, floor), static_cast<u32>(8_MiB));
         }
         const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);

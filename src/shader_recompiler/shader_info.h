@@ -175,6 +175,9 @@ struct StorageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     bool is_written;
+    /// Native: a pointer slot bound only because a pointer table is read at a dynamic offset. Its
+    /// accesses can sit far past the pointer, so the binding is not cut at the memory layout.
+    bool native_dynamic_slot{};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
@@ -268,6 +271,30 @@ struct MeshInfo {
     boost::container::static_vector<u32, 136> primitive_lines;
 };
 
+/// Native global accesses GlobalMemoryToStorageBufferPass could not rebase on one storage buffer,
+/// by reason (EDEN_NX2_UNTRACKED_GLOBAL_LOG).
+struct NativeGlobalStats {
+    /// Left untracked: no bound buffer covers them and the fallback drops writes (loads read 0).
+    u16 dyn_cbuf_writes;   ///< base pointer read from a constant buffer at a dynamic offset
+    u16 dyn_cbuf_loads;
+    u16 loaded_ptr_writes; ///< base pointer loaded from memory
+    u16 loaded_ptr_loads;
+    u16 other_writes;
+    u16 other_loads;
+    /// Kept global with every pointer of the dynamically indexed constant buffer bound.
+    u16 dyn_bound_writes;
+    u16 dyn_bound_loads;
+    u16 dyn_slots;         ///< constant buffer slots bound for dynamic pointer reads
+    u16 dyn_slots_dropped; ///< slots left out by the storage buffer limit
+    u32 dyn_cbuf_mask;     ///< constant buffers read for pointers at a dynamic offset
+
+    [[nodiscard]] bool Any() const noexcept {
+        return dyn_cbuf_writes | dyn_cbuf_loads | loaded_ptr_writes | loaded_ptr_loads |
+               other_writes | other_loads | dyn_bound_writes | dyn_bound_loads | dyn_slots_dropped;
+    }
+    bool operator==(const NativeGlobalStats&) const = default;
+};
+
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
@@ -347,6 +374,7 @@ struct Info {
     /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
     /// is a candidate and its bound length (not an NVN size word) limits the range.
     bool native_global_bounds{};
+    NativeGlobalStats native_global_stats{};
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};

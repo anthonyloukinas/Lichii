@@ -724,6 +724,18 @@ int main(int argc, char** argv) {
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
+        if (const auto& stats = program.info.native_global_stats; stats.Any()) {
+            diagnostic["native_global"] = {
+                {"untracked_dyn_cbuf", {stats.dyn_cbuf_writes, stats.dyn_cbuf_loads}},
+                {"untracked_loaded_ptr", {stats.loaded_ptr_writes, stats.loaded_ptr_loads}},
+                {"untracked_other", {stats.other_writes, stats.other_loads}},
+                {"dyn_bound", {stats.dyn_bound_writes, stats.dyn_bound_loads}},
+                {"dyn_slots", stats.dyn_slots},
+                {"dyn_slots_dropped", stats.dyn_slots_dropped},
+                {"dyn_cbuf_mask", stats.dyn_cbuf_mask},
+                {"storage_buffers", program.info.storage_buffers_descriptors.size()},
+            };
+        }
         diagnostic["phase"] = "spirv";
         Shader::Profile profile{};
         profile.supported_spirv = 0x00010400;

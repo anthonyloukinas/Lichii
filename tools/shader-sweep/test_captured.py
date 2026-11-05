@@ -48,6 +48,11 @@ def main():
             result = json.loads(compiled.stdout)
             if result["status"] != "ok":
                 raise RuntimeError(f"{path.stem}: {result}")
+            native_global = result.get("native_global", {})
+            for field, expected in fixture.get("expect_native_global", {}).items():
+                if native_global.get(field) != expected:
+                    raise RuntimeError(f"{path.stem}: native_global {field} is "
+                                       f"{native_global.get(field)}, expected {expected}")
             validated = subprocess.run([args.spirv_val, "--target-env", "vulkan1.2", str(output)],
                                        capture_output=True, text=True, timeout=30)
             if validated.returncode:
