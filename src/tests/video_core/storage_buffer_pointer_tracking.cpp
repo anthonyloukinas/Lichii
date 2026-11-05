@@ -283,6 +283,41 @@ TEST_CASE("Native atomics with a carry that skips the pointer stay global",
     CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
 }
 
+TEST_CASE("Native atomics on a pointer multiplied by 1 in XMADs bind the pointer",
+          "[shader][storage_buffer][global_atomic]") {
+    // Ocarina of Time's culling programs (516a852404d7c70d) form their count address as
+    // IMAD.WIDE.U32 1 * c0[0x90] + c1[0] and IMAD 1 * c0[0x94]; c1[0] holds 0xc, not a pointer.
+    // Lowered, the products are XMAD halves that hid c0[0x90], and the atomics bound c1[0].
+    KernelProgram fixture;
+    fixture.env.native = true;
+    IR::IREmitter ir{fixture.entry};
+    const auto times_one = [&](const IR::U32& value) {
+        const IR::U32 low{ir.BitFieldExtract(value, ir.Imm32(0), ir.Imm32(16))};
+        const IR::U32 high{ir.BitFieldExtract(value, ir.Imm32(16), ir.Imm32(16))};
+        const IR::U32 cross{ir.IAdd(ir.IMul(ir.Imm32(1), high), ir.IMul(ir.Imm32(0), low))};
+        return ir.IAdd(ir.ShiftLeftLogical(cross, ir.Imm32(16)), ir.IMul(ir.Imm32(1), low));
+    };
+    const IR::Value pointer{ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x90), 64, false)};
+    const IR::Value offset{ir.GetCbuf(ir.Imm32(1), ir.Imm32(0), 64, false)};
+    const IR::U32 offset_low{ir.CompositeExtract(offset, 0)};
+    const IR::U32 low{ir.IAdd(times_one(IR::U32{ir.CompositeExtract(pointer, 0)}), offset_low)};
+    const IR::U1 carry{ir.ILessThan(low, offset_low, false)};
+    const IR::U32 wide_high{ir.IAdd(IR::U32{ir.CompositeExtract(offset, 1)},
+                                    IR::U32{ir.Select(carry, ir.Imm32(1), ir.Imm32(0))})};
+    const IR::U32 high{ir.IAdd(wide_high, times_one(IR::U32{ir.CompositeExtract(pointer, 1)}))};
+    const IR::U64 address{ir.IAdd(Address(ir, low, high), ir.Imm64(u64{0x10}))};
+    static_cast<void>(ir.GlobalAtomicIAdd(address, ir.Imm32(1)));
+
+    Shader::Optimization::ConstantPropagationPass(fixture.env, fixture.program);
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x90});
+    CHECK(fixture.program.info.storage_buffers_descriptors.front().cbuf_index == 0);
+    CHECK(fixture.program.info.storage_buffers_descriptors.front().is_written);
+    CHECK_FALSE(fixture.program.info.native_global_bounds);
+    CHECK(std::ranges::count_if(fixture.entry.Instructions(), [](const IR::Inst& inst) {
+        return inst.GetOpcode() == IR::Opcode::StorageAtomicIAdd32;
+    }) == 1);
+}
+
 TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
           "[shader][storage_buffer]") {
     const bool native = GENERATE(false, true);

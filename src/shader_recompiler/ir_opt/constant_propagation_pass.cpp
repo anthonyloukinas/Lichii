@@ -338,6 +338,52 @@ bool FoldXmadMultiply(IR::Block& block, IR::Inst& inst) {
     return true;
 }
 
+/// Replaces the halves of a value joined back together, (x.hi16 << 16) + x.lo16, with the value.
+/// That is what the XMAD products of a multiplication by 1 leave once their factors fold: Ocarina's
+/// culling programs form a record pointer as IMAD.WIDE.U32 1 * c0[0x90] + c1[0], and with the
+/// pointer behind the products only the 0xc in c1[0] looked like the base.
+bool FoldHalvesJoin(IR::Inst& inst) {
+    const IR::Value zero{0u};
+    const IR::Value sixteen{16u};
+    for (size_t arg = 0; arg < 2; ++arg) {
+        IR::Inst* const shift{inst.Arg(arg).TryInstRecursive()};
+        IR::Inst* const low{inst.Arg(1 - arg).TryInstRecursive()};
+        if (!shift || !low || shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+            shift->Arg(1) != sixteen || low->GetOpcode() != IR::Opcode::BitFieldUExtract ||
+            low->Arg(1) != zero || low->Arg(2) != sixteen) {
+            continue;
+        }
+        IR::Inst* const high{shift->Arg(0).TryInstRecursive()};
+        if (!high || high->GetOpcode() != IR::Opcode::BitFieldUExtract ||
+            high->Arg(1) != sixteen || high->Arg(2) != sixteen) {
+            continue;
+        }
+        const IR::Value value{low->Arg(0).Resolve()};
+        if (value != high->Arg(0).Resolve()) {
+            continue;
+        }
+        inst.ReplaceUsesWith(value);
+        return true;
+    }
+    return false;
+}
+
+/// Folds a multiplication by an immediate 0 or 1
+void FoldIMul32(IR::Inst& inst) {
+    if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; })) {
+        return;
+    }
+    for (size_t arg = 0; arg < 2; ++arg) {
+        const IR::Value factor{inst.Arg(arg)};
+        if (!factor.IsImmediate() || factor.U32() > 1) {
+            continue;
+        }
+        const IR::Value result{factor.U32() == 0 ? IR::Value{u32{0}} : inst.Arg(1 - arg)};
+        inst.ReplaceUsesWith(result);
+        return;
+    }
+}
+
 template <typename T>
 void FoldAdd(IR::Block& block, IR::Inst& inst) {
     if (inst.HasAssociatedPseudoOperation()) {
@@ -358,6 +404,7 @@ void FoldAdd(IR::Block& block, IR::Inst& inst) {
         if (FoldXmadMultiplyAdd(block, inst)) {
             return;
         }
+        FoldHalvesJoin(inst);
     }
 }
 
@@ -998,8 +1045,7 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     case IR::Opcode::SMax32:
         return FoldSMax32(block, inst);
     case IR::Opcode::IMul32:
-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; });
-        return;
+        return FoldIMul32(inst);
     case IR::Opcode::ShiftRightArithmetic32:
         FoldWhenAllImmediates(inst, [](s32 a, s32 b) { return static_cast<u32>(a >> b); });
         return;
