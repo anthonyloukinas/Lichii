@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_translation_cache.h"
 
 namespace Core {
 class System;
@@ -190,6 +191,16 @@ private:
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
+
+    /// Translated shader stages (use_shader_translation_cache), kept across pipeline evictions.
+    VideoCommon::TranslationCache::Store translation_cache;
+    VideoCommon::TranslationCache::Digest translation_config{};
+    bool translation_cache_verify{};
+    std::atomic<u64> translation_cache_verified{};
+    std::atomic<u64> translation_cache_mismatches{};
+    std::chrono::steady_clock::time_point translation_cache_logged{};
+    void OpenTranslationCache(const std::filesystem::path& filename);
+    [[nodiscard]] bool IsTranslationCacheable(const Shader::Environment& env) const;
 
     std::filesystem::path pipeline_cache_filename;
 

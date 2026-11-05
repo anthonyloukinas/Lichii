@@ -598,6 +598,11 @@ struct Values {
     SwitchableSetting<bool> renderer_force_max_clock{linkage, false, "force_max_clock",
                                                      Category::RendererAdvanced};
 
+    // Keeps translated shader modules in memory and in the title's shader cache directory, so a
+    // pipeline built again skips shader translation (video_core/shader_translation_cache.cpp).
+    SwitchableSetting<bool> use_shader_translation_cache{
+        linkage, true, "use_shader_translation_cache", Category::RendererAdvanced};
+
     SwitchableSetting<bool> use_disk_shader_cache{linkage, true, "use_disk_shader_cache",
                                                   Category::RendererAdvanced};
 

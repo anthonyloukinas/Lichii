@@ -181,6 +181,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_disk_shader_cache, tr("Use persistent pipeline cache"),
            tr("Allows saving shaders to storage for faster loading on following game "
               "boots.\nDisabling it is only intended for debugging."));
+    INSERT(Settings, use_shader_translation_cache, tr("Cache translated shaders"),
+           tr("Keeps the translated form of each shader in memory and on disk, so pipelines "
+              "built again (at boot, after\nbeing evicted, or for new render state over known "
+              "shaders) skip shader translation.\nEntries are checked against the game's current "
+              "shader inputs before use and are discarded by a new build."));
     INSERT(
         Settings, use_asynchronous_gpu_emulation, tr("Use asynchronous GPU emulation"),
         tr("Uses an extra CPU thread for rendering.\nThis option should always remain enabled."));

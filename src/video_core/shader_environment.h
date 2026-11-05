@@ -89,6 +89,10 @@ public:
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
+    [[nodiscard]] bool CanCacheTranslation() const override {
+        return CanBeSerialized();
+    }
+
     [[nodiscard]] u64 CalculateHash() const;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;

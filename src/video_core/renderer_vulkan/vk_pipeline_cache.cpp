@@ -540,6 +540,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_byte_addressed_r16 = true,
     };
     host_info.ApplyDescriptorLimitPolicy();
+    OpenTranslationCache({});
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",
@@ -661,7 +662,43 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
+void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) {
+    namespace TC = VideoCommon::TranslationCache;
+    translation_cache.Close();
+    if (!Settings::values.use_shader_translation_cache.GetValue()) {
+        return;
+    }
+    // EDEN_NX2_TRANSLATION_CACHE_VERIFY=1 translates every cached stage again and compares.
+    const char* verify = std::getenv("EDEN_NX2_TRANSLATION_CACHE_VERIFY");
+    translation_cache_verify = verify != nullptr && verify[0] == '1';
+    // Device values the translation and MakeRuntimeInfo read besides the profile and host info.
+    const std::string device_id =
+        fmt::format("{}|{}|{}|{}|{}|{}|{}", CACHE_VERSION, device.GetModelName(),
+                    static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
+                    device.GetMaxComputeSharedMemorySize(), device.IsGeometryShaderSupported(),
+                    device.IsExtMeshShaderSupported());
+    translation_config = TC::MakeConfigDigest(
+        profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
+    translation_cache.Open(filename, translation_config);
+    translation_cache_logged = std::chrono::steady_clock::now();
+}
+
+bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const {
+    const Shader::Stage stage = env.ShaderStage();
+    if (stage == Shader::Stage::VertexA || stage == Shader::Stage::Task ||
+        stage == Shader::Stage::Mesh) {
+        return false;
+    }
+    return env.CanCacheTranslation();
+}
+
 PipelineCache::~PipelineCache() {
+    translation_cache.LogStatistics("run time");
+    if (translation_cache_verify) {
+        LOG_INFO(Render_Vulkan,
+                 "Translation cache: {} cached stages compared with a fresh translation, {} differed",
+                 translation_cache_verified.load(), translation_cache_mismatches.load());
+    }
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -778,6 +815,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
+    OpenTranslationCache(
+        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_translations", CACHE_VERSION));
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
 
@@ -904,6 +943,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+
+    translation_cache.LogStatistics("boot");
+    if (translation_cache_verify) {
+        LOG_INFO(Render_Vulkan,
+                 "Translation cache: {} cached stages compared with a fresh translation, {} differed",
+                 translation_cache_verified.load(), translation_cache_mismatches.load());
+    }
+    translation_cache.stage_hits = 0;
+    translation_cache.stage_misses = 0;
+    translation_cache.hit_ns = 0;
+    translation_cache.miss_ns = 0;
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1104,6 +1154,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
     const bool uses_vertex_b{key.unique_hashes[1] != 0};
 
+    namespace TC = VideoCommon::TranslationCache;
+    using Clock = std::chrono::steady_clock;
+    const bool use_translation_cache = translation_cache.Enabled() && !uses_vertex_a;
+    std::array<std::shared_ptr<const TC::Entry>, Maxwell::MaxShaderProgram> cached_entries{};
+    std::array<bool, Maxwell::MaxShaderProgram> from_cache{};
+    std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
+    std::array<Clock::duration, Maxwell::MaxShaderProgram> stage_time{};
+
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
 
@@ -1141,22 +1199,54 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return nullptr;
         }
 
-        const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-        if (!uses_vertex_a || index != 1) {
-            // Normal path
-            programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+        stage_envs[index] = &env;
+        const auto stage_begin = Clock::now();
+        const bool cacheable = use_translation_cache && IsTranslationCacheable(env);
+        TC::Digest stage_key{};
+        if (cacheable) {
+            stage_key = TC::MakeStageKey(env, key.unique_hashes[index], static_cast<u32>(index),
+                                         translation_config);
+            cached_entries[index] = translation_cache.FindEntry(stage_key, env);
+            from_cache[index] = cached_entries[index] != nullptr;
+        }
+        if (from_cache[index]) {
+            // Only the program's metadata: the IR is translated again if no module fits.
+            programs[index] = cached_entries[index]->meta.ToProgram();
         } else {
-            // VertexB path when VertexA is present.
-            auto& program_va{programs[0]};
-            auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
-        }
+            // The recording environment logs the queries the translation makes, to validate a
+            // later use of its result.
+            std::optional<TC::RecordingEnvironment> recording;
+            if (cacheable) {
+                recording.emplace(env);
+            }
+            Shader::Environment& translate_env =
+                recording ? static_cast<Shader::Environment&>(*recording) : env;
+            const u32 cfg_offset{
+                static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+            Shader::Maxwell::Flow::CFG cfg(translate_env, pools.flow_block, cfg_offset,
+                                           index == 0);
+            if (!uses_vertex_a || index != 1) {
+                // Normal path
+                programs[index] =
+                    TranslateProgram(pools.inst, pools.block, translate_env, cfg, host_info);
+            } else {
+                // VertexB path when VertexA is present.
+                auto& program_va{programs[0]};
+                auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+                programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+            }
 
-        if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
-            LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
-            return nullptr;
+            if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
+                LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
+                return nullptr;
+            }
+            if (recording && !programs[index].info.requires_layer_emulation &&
+                IsTranslationCacheable(env)) {
+                cached_entries[index] = translation_cache.Insert(
+                    stage_key, recording->TakeQueries(), TC::ProgramMeta::From(programs[index]));
+            }
         }
+        stage_time[index] += Clock::now() - stage_begin;
 
         if (Settings::values.dump_guest_shaders) {
             env.Dump(hash, key.unique_hashes[index]);
@@ -1220,9 +1310,67 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
+        const auto stage_begin = Clock::now();
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
-        ConvertLegacyToGeneric(program, runtime_info);
-        const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+        // Modules of a layer-emulating pipeline depend on the generated geometry stage.
+        const std::shared_ptr<const TC::Entry> entry =
+            is_emulated_stage || layer_source_program != nullptr ? nullptr
+                                                                 : cached_entries[index];
+        TC::Digest variant_key{};
+        std::optional<TC::Variant> variant;
+        if (entry) {
+            variant_key =
+                TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime_info), binding);
+            variant = translation_cache.FindVariant(variant_key);
+        }
+        std::vector<u32> code;
+        if (!variant || translation_cache_verify) {
+            if (from_cache[index]) {
+                // The stage's entry matched but no module for this runtime info: translate.
+                Shader::Environment& env{*stage_envs[index]};
+                const u32 cfg_offset{
+                    static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+                program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                from_cache[index] = false;
+            }
+            ConvertLegacyToGeneric(program, runtime_info);
+            code = EmitSPIRV(profile, runtime_info, program, binding);
+            if (variant) {
+                ++translation_cache_verified;
+                const bool info_equal = TC::InfoEqual(variant->info, program.info);
+                if (variant->spirv != code || !info_equal ||
+                    std::memcmp(&variant->binding_out, &binding, sizeof(binding)) != 0) {
+                    ++translation_cache_mismatches;
+                    LOG_ERROR(Render_Vulkan,
+                              "Translation cache: stage {} of shader {:016x} differs from a "
+                              "fresh translation (spirv {}, info {}, bindings {})",
+                              index, key.unique_hashes[index], variant->spirv == code,
+                              info_equal,
+                              std::memcmp(&variant->binding_out, &binding, sizeof(binding)) ==
+                                  0);
+                }
+            } else if (entry) {
+                translation_cache.InsertVariant(*entry, variant_key,
+                                                TC::Variant{binding, program.info, code});
+            }
+        } else {
+            program.info = std::move(variant->info);
+            binding = variant->binding_out;
+            code = std::move(variant->spirv);
+        }
+        stage_time[index] += Clock::now() - stage_begin;
+        if (use_translation_cache && !is_emulated_stage) {
+            const auto ns = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(stage_time[index]).count());
+            if (variant && !translation_cache_verify && from_cache[index]) {
+                ++translation_cache.stage_hits;
+                translation_cache.hit_ns += ns;
+            } else {
+                ++translation_cache.stage_misses;
+                translation_cache.miss_ns += ns;
+            }
+        }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
 
@@ -1322,6 +1470,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         }
         ReportRuntimePipeline("Graphics", begin, shaders);
     };
+    if (translation_cache.Enabled() &&
+        begin - translation_cache_logged > std::chrono::seconds{30}) {
+        translation_cache_logged = begin;
+        translation_cache.LogStatistics("run time so far");
+    }
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
 
@@ -1408,14 +1561,57 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
-    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+    namespace TC = VideoCommon::TranslationCache;
+    const auto stage_begin = std::chrono::steady_clock::now();
+    const bool cacheable = translation_cache.Enabled() && IsTranslationCacheable(env);
+    TC::Digest stage_key{};
+    std::shared_ptr<const TC::Entry> entry;
+    if (cacheable) {
+        stage_key = TC::MakeStageKey(env, key.unique_hash, 5, translation_config);
+        entry = translation_cache.FindEntry(stage_key, env);
+    }
+    const TC::Digest variant_key =
+        entry ? TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{})
+              : TC::Digest{};
+    std::optional<TC::Variant> variant;
+    if (entry && !translation_cache_verify) {
+        variant = translation_cache.FindVariant(variant_key);
+    }
+    if (variant) {
+        if (Settings::values.dump_guest_shaders) {
+            env.Dump(hash, key.unique_hash);
+        }
+        vk::ShaderModule cached_module{BuildShader(device, variant->spirv)};
+        ++translation_cache.stage_hits;
+        translation_cache.hit_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 stage_begin)
+                .count());
+        Common::ThreadWorker* const cached_worker{build_in_parallel ? &workers : nullptr};
+        return {.pipeline = std::make_unique<ComputePipeline>(
+                    device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                    guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
+                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash)};
+    }
+    std::optional<TC::RecordingEnvironment> recording;
+    if (cacheable && !entry) {
+        recording.emplace(env);
+    }
+    Shader::Environment& translate_env =
+        recording ? static_cast<Shader::Environment&>(*recording) : env;
+
+    Shader::Maxwell::Flow::CFG cfg{translate_env, pools.flow_block, env.StartAddress()};
 
     // Dump it before error.
     if (Settings::values.dump_guest_shaders) {
         env.Dump(hash, key.unique_hash);
     }
 
-    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    auto program{TranslateProgram(pools.inst, pools.block, translate_env, cfg, host_info)};
+    if (recording && IsTranslationCacheable(env)) {
+        entry = translation_cache.Insert(stage_key, recording->TakeQueries(),
+                                         TC::ProgramMeta::From(program));
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
@@ -1430,6 +1626,32 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     const std::vector<u32> code{EmitSPIRV(profile, program)};
+    if (entry) {
+        const TC::Digest compute_variant_key =
+            TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{});
+        if (translation_cache_verify) {
+            if (const auto cached = translation_cache.FindVariant(compute_variant_key)) {
+                ++translation_cache_verified;
+                const bool info_equal = TC::InfoEqual(cached->info, program.info);
+                if (cached->spirv != code || !info_equal) {
+                    ++translation_cache_mismatches;
+                    LOG_ERROR(Render_Vulkan,
+                              "Translation cache: compute shader {:016x} differs from a fresh "
+                              "translation (spirv {}, info {})",
+                              key.unique_hash, cached->spirv == code, info_equal);
+                }
+            }
+        }
+        translation_cache.InsertVariant(*entry, compute_variant_key,
+                                        TC::Variant{{}, program.info, code});
+    }
+    if (cacheable) {
+        ++translation_cache.stage_misses;
+        translation_cache.miss_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 stage_begin)
+                .count());
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
