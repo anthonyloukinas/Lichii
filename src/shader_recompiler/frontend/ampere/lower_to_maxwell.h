@@ -2111,11 +2111,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
 
         case 0x243:
             if ((insn.Bits(24, 8) != 255 || insn.Bits(78, 2) != 3) && !(insn.words[1] & ~0xffU) &&
-                (insn.words[2] & ~0xc000U) == 0x000004ffU) {
+                (insn.words[2] == 0x000004ffU || insn.words[2] == 0x0000c4ffU)) {
                 // F2IP.U8.F32 Rd, Ra, Rb, RZ: Rb's byte in bits 0-7 and Ra's in bits 8-15, each
                 // NaN -> 0, clamped to [0, 255], rounded by bits 78-79 (F2I's field; Ocarina
                 // packs colour*255 with 0 = nearest-even). Only the Ra = RZ, truncating form
-                // was known before; Rb in the low byte follows from it.
+                // was known before; Rb in the low byte follows from it. Ocarina uses only
+                // rounding 0 and 3, so 1 and 2 (F2I's floor and ceiling) stay rejected.
                 const u32 rounding = insn.Bits(78, 2);
                 const auto convert = [&](u32 source, u32 target) {
                     emit(0x5800000000000000ULL | predicate | 250 | (u64{source} << 8) |
