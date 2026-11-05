@@ -1899,6 +1899,31 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     frame_dump.TickFrame();
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        // EDEN_NX2_DEFERRED_WRITE_LOG (docs/oot-white-petals.md): totals since the previous line.
+        auto& c = Tegra::g_nx2_deferred_writes;
+        const auto take = [](std::atomic<u64>& counter) {
+            return counter.exchange(0, std::memory_order_relaxed);
+        };
+        const u64 writes = take(c.collected_writes);
+        const u64 bytes = take(c.collected_bytes);
+        const u64 pool_writes = take(c.pool_writes);
+        const u64 pool_bytes = take(c.pool_bytes);
+        const u64 invalidations = take(c.applied_calls);
+        const u64 applied_ranges = take(c.applied_ranges);
+        const u64 applied_bytes = take(c.applied_bytes);
+        const u64 applied_pool_bytes = take(c.applied_pool_bytes);
+        LOG_INFO(Render_Vulkan,
+                 "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
+                 "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
+                 "applied_ranges={} applied_bytes={} applied_pool_bytes={} write_mark={}",
+                 render_trace_frame, writes, bytes, pool_writes, pool_bytes,
+                 Tegra::Nx2DeferredPoolBegin, Tegra::Nx2DeferredPoolEnd, invalidations,
+                 applied_ranges, applied_bytes, applied_pool_bytes,
+                 Tegra::g_nx2_compute_write_mark == ~u64{0}
+                     ? std::string{"full"}
+                     : std::to_string(Tegra::g_nx2_compute_write_mark));
+    }
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;

@@ -37,6 +37,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -959,6 +960,9 @@ struct Memory::Impl {
                 } else {
                     return;
                 }
+            }
+            if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+                Tegra::Nx2NoteCollectedWrite(address, size);
             }
             gpu_dirty_managers[core].Collect(address, size);
         });
