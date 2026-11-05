@@ -155,6 +155,8 @@ public:
     u32 written_compute_storage_buffers = 0;
     // Bound by a native (Switch 2) compute program, whose pointers carry no size.
     u32 native_compute_storage_buffers = 0;
+    // Native pointer slots bound for a pointer table read at a dynamic offset.
+    u32 dynamic_slot_compute_storage_buffers = 0;
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -315,7 +317,7 @@ public:
     void UnbindComputeStorageBuffers();
 
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+                                  bool is_written, bool native_dynamic_slot = false);
 
     void UnbindComputeTextureBuffers();
 
@@ -610,7 +612,8 @@ private:
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written, bool native_pointer = false) const;
+                                               bool is_written, bool native_pointer = false,
+                                               bool native_dynamic_slot = false) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);

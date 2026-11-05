@@ -10,7 +10,9 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <unordered_set>
 #include <thread>
 #include <vector>
 #include <bit>
@@ -337,6 +339,52 @@ size_t GetTotalPipelineWorkers() {
 #else
     return max_core_threads;
 #endif
+}
+
+// EDEN_NX2_UNTRACKED_GLOBAL_LOG=1 (or EDEN_NX2_MESH_COUNT_TRACE=1): one line per native program
+// with global accesses no storage buffer covers, or covered only by binding a dynamically indexed
+// constant buffer's pointers (GlobalMemoryToStorageBufferPass).
+void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info) {
+    static const bool enabled = [] {
+        const auto set = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        };
+        return set("EDEN_NX2_UNTRACKED_GLOBAL_LOG") || set("EDEN_NX2_MESH_COUNT_TRACE");
+    }();
+    const Shader::NativeGlobalStats& stats = info.native_global_stats;
+    if (!enabled || !stats.Any()) [[likely]] {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> logged;
+    {
+        std::scoped_lock lock{mutex};
+        if (!logged.insert(hash ^ (static_cast<u64>(stage) << 56)).second) {
+            return;
+        }
+    }
+    static constexpr std::array stage_names{"vertex", "tess-control", "tess-eval", "geometry",
+                                            "fragment", "compute", "vertex-a", "task", "mesh"};
+    const auto stage_index = static_cast<size_t>(stage);
+    std::string cbufs;
+    for (u32 index = 0; index < Shader::Info::MAX_CBUFS; ++index) {
+        if ((stats.dyn_cbuf_mask >> index) & 1) {
+            cbufs += fmt::format("{}c{}", cbufs.empty() ? "" : ",", index);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "NX2 untracked global: hash={:016x} stage={} writes={} loads={} "
+             "reason=dyn-cbuf(idx={}):w{}/l{},loaded-ptr:w{}/l{},other:w{}/l{} "
+             "dyn-bound:w{}/l{} dyn-slots={} dyn-dropped={} ssbos={} dyn_cbuf_pointers={}",
+             hash, stage_index < stage_names.size() ? stage_names[stage_index] : "?",
+             stats.dyn_cbuf_writes + stats.loaded_ptr_writes + stats.other_writes,
+             stats.dyn_cbuf_loads + stats.loaded_ptr_loads + stats.other_loads,
+             cbufs.empty() ? "-" : cbufs, stats.dyn_cbuf_writes, stats.dyn_cbuf_loads,
+             stats.loaded_ptr_writes, stats.loaded_ptr_loads, stats.other_writes,
+             stats.other_loads, stats.dyn_bound_writes, stats.dyn_bound_loads, stats.dyn_slots,
+             stats.dyn_slots_dropped, info.storage_buffers_descriptors.size(),
+             Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0);
 }
 
 } // Anonymous namespace
@@ -676,10 +724,11 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
     translation_cache_verify = verify != nullptr && verify[0] == '1';
     // Device values the translation and MakeRuntimeInfo read besides the profile and host info.
     const std::string device_id =
-        fmt::format("{}|{}|{}|{}|{}|{}|{}", CACHE_VERSION, device.GetModelName(),
+        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}", CACHE_VERSION, device.GetModelName(),
                     static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
                     device.GetMaxComputeSharedMemorySize(), device.IsGeometryShaderSupported(),
-                    device.IsExtMeshShaderSupported());
+                    device.IsExtMeshShaderSupported(),
+                    Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0);
     translation_config = TC::MakeConfigDigest(
         profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
     translation_cache.Open(filename, translation_config);
@@ -1387,6 +1436,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 translation_cache.miss_ns += ns;
             }
         }
+        LogUntrackedGlobal(key.unique_hashes[index], program.stage, program.info);
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
 
@@ -1603,6 +1653,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                  stage_begin)
                 .count());
+        LogUntrackedGlobal(key.unique_hash, Shader::Stage::Compute, variant->info);
         Common::ThreadWorker* const cached_worker{build_in_parallel ? &workers : nullptr};
         return {.pipeline = std::make_unique<ComputePipeline>(
                     device, scheduler, vulkan_pipeline_cache, descriptor_pool,
@@ -1628,6 +1679,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         entry = translation_cache.Insert(stage_key, recording->TakeQueries(),
                                          TC::ProgramMeta::From(program));
     }
+    LogUntrackedGlobal(key.unique_hash, Shader::Stage::Compute, program.info);
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
