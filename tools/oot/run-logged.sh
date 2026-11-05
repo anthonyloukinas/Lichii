@@ -6,6 +6,12 @@ OOT="$HOME/Downloads/OOT"
 BIN="${BIN:-$HOME/dev/Lichii/build/bin/lichii}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
+# OoT fps: upstream #150's two unswitched commits cost ~10 % here (harness A/B 2026-11-05:
+# 35.6 -> 39.4 fps with both off; vegetation unchanged). Default them off for this game;
+# OOT_UPSTREAM_DEFAULTS=1 restores upstream behaviour for comparison.
+if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
+  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0
+fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
 # OOT_FLUSH=0|1 overrides the flushing half. Unset = leave the config alone.
