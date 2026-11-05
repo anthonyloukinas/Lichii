@@ -197,6 +197,17 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     Nx2NoteListHostWrite(device_addr, size);
+    // EDEN_NX2_FAST_DRAW=2: delta draws don't bind vertex buffers again. Checked first so the
+    // inline page-write path below, which returns early, ends delta reuse too.
+    if (Nx2FastDraw::g_delta_enabled && channel_state != nullptr) {
+        for (const Binding& binding : channel_state->vertex_buffers) {
+            if (device_addr < binding.device_addr + binding.size &&
+                binding.device_addr < device_addr + size) {
+                Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
+                break;
+            }
+        }
+    }
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -228,16 +239,6 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    // EDEN_NX2_FAST_DRAW=2: delta draws don't bind vertex buffers again.
-    if (Nx2FastDraw::g_delta_enabled && channel_state != nullptr) {
-        for (const Binding& binding : channel_state->vertex_buffers) {
-            if (device_addr < binding.device_addr + binding.size &&
-                binding.device_addr < device_addr + size) {
-                Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
-                break;
-            }
-        }
-    }
 }
 
 template <class P>
