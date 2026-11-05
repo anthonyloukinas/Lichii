@@ -97,7 +97,7 @@ void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
 void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
         if ((method & SplitPlainTag) != 0) {
-            // GpuSplit::SinkMethod (EDEN_NX2_MACRO_SINK): as CallMethod's native plain path.
+            // GpuSplit::SinkMethod (EDEN_NX2_COMPUTE_SINK): as CallMethod's native plain path.
             method &= ~SplitPlainTag;
             native_registers[method] = value;
         }
@@ -1149,7 +1149,7 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
-    /// EDEN_NX2_MACRO_SINK: plain registers (native_plain_methods) this front sent a write to.
+    /// EDEN_NX2_COMPUTE_SINK: plain registers (native_plain_methods) this front sent a write to.
     /// The back stored that value in both native_registers and regs, so `registers` holds what
     /// both hold and a later write of the same value can be dropped.
     std::bitset<0xe00> plain_sent;
@@ -1261,11 +1261,11 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
 
 bool KeplerCompute::FrontPlainWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                     u32 argument) {
-    // EDEN_NX2_MACRO_SINK: a write that only stores its value (CallMethod's native_plain_methods
+    // EDEN_NX2_COMPUTE_SINK: a write that only stores its value (CallMethod's native_plain_methods
     // path, which writes native_registers and regs) is dropped when both hold it already, else
     // sunk on the back and applied before the engine's next other write. The segment does not
     // matter: only data_upload reads current_dma_segment, and it is never plain.
-    if (!VideoCommon::GpuSplit::MacroSink() || method >= native_plain_methods.size() ||
+    if (!VideoCommon::GpuSplit::ComputeSink() || method >= native_plain_methods.size() ||
         !native_plain_methods[method]) {
         return false;
     }
@@ -1343,7 +1343,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                   start, result.consumed, result.error);
     }
     fs.parameters.clear();
-    if (VideoCommon::GpuSplit::MacroSink() && ComputeFrontVerifyEnabled() &&
+    if (VideoCommon::GpuSplit::ComputeSink() && ComputeFrontVerifyEnabled() &&
         (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
     }
