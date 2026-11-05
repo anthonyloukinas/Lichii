@@ -1799,7 +1799,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
-    if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
+    // EDEN_NX2_UNIFORM_BANK_REUPLOAD=0: skip it, as before 6053738ae2 (for A/B comparisons).
+    static const bool reupload_uniform_bank = [] {
+        const char* value = std::getenv("EDEN_NX2_UNIFORM_BANK_REUPLOAD");
+        return !(value != nullptr && value[0] == '0');
+    }();
+    if (reupload_uniform_bank && has_host_buffer &&
+        (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
         native_indirect_uniforms_this_frame.insert(device_addr).second) {
