@@ -94,6 +94,11 @@ struct Nx2DeferredWriteCounters {
     std::atomic<u64> native_indirect_gfx_waits{0};
     std::atomic<u64> native_indirect_gfx_draws{0};
     std::atomic<u64> native_indirect_cache_hits{0};
+    // EDEN_NX2_INDIRECT_SPECULATE: words used while GPU work may have written them, read backs
+    // recorded to check them (no wait), and checks that found a word changed.
+    std::atomic<u64> native_indirect_speculated{0};
+    std::atomic<u64> native_indirect_verifies{0};
+    std::atomic<u64> native_indirect_mispredicts{0};
     // Written native bindings whose mark the shader's store extent bounded this dispatch, and the
     // ones that kept the mode's full mark (unknown extent, Full, or the 64 KiB cap).
     std::atomic<u64> native_bounded_bindings{0};
@@ -165,6 +170,16 @@ inline const u64 g_nx2_compute_write_mark = [] {
 inline const bool g_nx2_indirect_guest_reads = [] {
     const char* value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
     return value != nullptr && std::string_view{value}.find("guest") != std::string_view::npos;
+}();
+
+// EDEN_NX2_INDIRECT_SPECULATE=0: a pointer word read back from a GPU-written record is dropped
+// when GPU work writes over its bytes again, and the next read waits for the GPU. Default: the
+// word stays in use and a read back recorded without a wait checks it; a word found changed is
+// replaced and read with a wait from then on. Pays off where GPU work rewrites records with the
+// same pointers; a changed pointer is used stale until its check completes (about a frame).
+inline const bool g_nx2_indirect_speculate = [] {
+    const char* value = std::getenv("EDEN_NX2_INDIRECT_SPECULATE");
+    return value == nullptr || value[0] != '0';
 }();
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1

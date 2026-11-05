@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/container/unordered_map.h"
@@ -659,14 +660,35 @@ private:
     /// Enables a graphics storage buffer slot (driver limit accounting); false when over it
     bool EnableGraphicsStorageBuffer(size_t stage, size_t ssbo_index, bool is_written);
 
+    /// GPU work may be writing over cached pointer words: with EDEN_NX2_INDIRECT_SPECULATE they
+    /// stay in use and are read back again without a wait (NativeIndirectVerify)
+    void MarkNativeIndirectCacheWritten(DAddr device_addr, u64 size);
+    /// Compares the finished read backs with the words they checked
+    void RetireNativeIndirectVerifies();
+
     struct NativeIndirectCachedPointer {
         DAddr device_addr;
         u64 value;
+        bool written{};      ///< GPU work may have written it since `value` was read
+        bool verifying{};    ///< a read back is in flight
+        bool rewritten{};    ///< written again after that read back was recorded
+        u32 verify_serial{}; ///< which read back (the entry may be dropped and read again)
     };
     static constexpr size_t MAX_NATIVE_INDIRECT_CACHE = 64;
     /// Pointer words read back from GPU-written records, valid until their bytes are written
     boost::container::small_vector<NativeIndirectCachedPointer, MAX_NATIVE_INDIRECT_CACHE>
         native_indirect_cache;
+    struct NativeIndirectVerify {
+        decltype(std::declval<typename P::Runtime&>().DownloadStagingBuffer(size_t{}, true))
+            staging;
+        u64 tick;
+        boost::container::small_vector<std::pair<DAddr, u32>, 8> entries; ///< address, serial
+    };
+    u32 native_indirect_verify_serial{};
+    std::vector<NativeIndirectVerify> native_indirect_verifies;
+    /// Words a read back found changed: always read back with a wait
+    boost::container::small_vector<DAddr, 16> native_indirect_volatile;
+    bool native_indirect_speculation_off{};
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
