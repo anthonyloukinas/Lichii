@@ -809,9 +809,15 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         }
         ssbo_addr = holder + indirect_offset;
     }
+    // EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0: size them as before 94c6015fad, i.e. take the word
+    // after a direct pointer as its size even in native programs (for A/B comparisons).
+    static const bool size_like_compute = [] {
+        const char* value = std::getenv("EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE");
+        return !(value != nullptr && value[0] == '0');
+    }();
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             maxwell3d->GetNativeMacroEngine().native_turing ||
+                             (size_like_compute && maxwell3d->GetNativeMacroEngine().native_turing) ||
                                  indirect_offset != ~0U,
                              indirect_offset != ~0U);
     if (indirect_offset != ~0U) {
