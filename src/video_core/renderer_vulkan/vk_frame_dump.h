@@ -32,6 +32,9 @@ class Scheduler;
 /// EDEN_NX2_FRAME_DUMP=<dir> reads back one whole frame: the color targets of every pass, the
 /// images written by every compute dispatch and the presented image. EDEN_NX2_FRAME_DUMP_AT picks
 /// the frame, in seconds after boot ("45") or as a frame number ("2700f").
+/// EDEN_NX2_FRAME_DUMP_COUNT=N (1-8) captures N consecutive frames from the trigger, each into
+/// <dir>/frame-<k>/. With EDEN_NX2_FRAME_DUMP_AT=file, capture.now is removed when a burst starts
+/// and the dump re-arms; later bursts go to <dir>/burst-<b>/.
 /// EDEN_NX2_FRAME_DUMP_SAMPLED=1 also reads back every texture a pass samples (3D and depth
 /// included), once per pass, as the first draw sampling it sees it, and the textures each compute
 /// shader samples, once per shader, before its first dispatch, with each texture's sampler state,
@@ -152,7 +155,8 @@ private:
     };
 
     /// Work for the writer thread: an image readback (`name` set), buffer bytes (`raw`), a
-    /// finished manifest line, or the summary.
+    /// finished manifest line, the summary, or the start of a frame (`begin`: opens
+    /// `name`/manifest.jsonl and writes `tags` first).
     struct Job {
         Target target{};
         std::string name;
@@ -161,6 +165,7 @@ private:
         bool raw{};
         bool summary{};
         bool truncated{};
+        bool begin{};
     };
 
     std::optional<Target> MakeTarget(ImageView& view, u32 slot) const;
@@ -170,6 +175,7 @@ private:
     bool Record(const Target& target, std::string name, std::string tags);
     bool RecordSampled(const Sampled& texture, u32 index, std::string name, std::string tags);
     bool RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags);
+    void BeginFrame(double elapsed);
     void Drain();
     void Enqueue(Job job);
     void WriterLoop();
@@ -192,6 +198,11 @@ private:
     double trigger_seconds{};
     std::chrono::steady_clock::time_point start;
     u64 frame{};
+    u32 burst_count{1};
+    u32 burst_frame{};
+    u32 bursts{};
+    /// Directory of the frame being written; writer thread only.
+    std::filesystem::path frame_directory;
 
     std::ofstream manifest;
     static constexpr u32 MAX_PROBES = 8192;
