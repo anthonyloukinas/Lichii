@@ -79,6 +79,14 @@ struct Nx2DeferredWriteCounters {
     std::atomic<u64> native_storage_bindings{0};
     std::atomic<u64> native_storage_bytes{0};
     std::atomic<u64> native_marked_bytes{0};
+    // Fence downloads as copied by the GPU into host staging (CommitAsyncFlushesHigh), before
+    // PopAsyncBuffers drops what later GPU or CPU writes superseded; and the pool's share.
+    std::atomic<u64> fence_copies{0};
+    std::atomic<u64> fence_copy_bytes{0};
+    std::atomic<u64> fence_copy_pool_bytes{0};
+    // DownloadBufferMemory's mapped branch: the CPU reads host-visible device-local memory
+    // (ReBAR) directly, over PCIe.
+    std::atomic<u64> mapped_read_bytes{0};
 };
 inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
 
