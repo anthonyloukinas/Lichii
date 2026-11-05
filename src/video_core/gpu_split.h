@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -15,6 +16,16 @@
 #include "video_core/engines/engine_interface.h"
 
 namespace VideoCommon {
+
+/// An experiment switch read from the environment: `default_on` unless set, off when it starts
+/// with '0', on otherwise.
+inline bool Nx2EnvSwitch(const char* name, bool default_on) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_on;
+    }
+    return value[0] != '0';
+}
 
 /// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
 enum class DrainSite : u32 {

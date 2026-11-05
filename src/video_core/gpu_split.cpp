@@ -248,6 +248,12 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            // As after a drain: the back has (almost) nothing queued, so hand it the next
+            // methods in small batches. EDEN_NX2_WAIT_PUBLISH_RESET=0: keep the batch size.
+            static const bool reset_publish = Nx2EnvSwitch("EDEN_NX2_WAIT_PUBLISH_RESET", true);
+            if (reset_publish && write_position - consumed_cache < PublishEvery) {
+                publish_every = 8;
+            }
             Nx2Profile::AddDrain(site, start);
             return true;
         }
