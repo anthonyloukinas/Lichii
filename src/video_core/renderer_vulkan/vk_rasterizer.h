@@ -311,6 +311,7 @@ private:
         HandleBind,
         HandleData,
         DeltaBuffers,
+        HandlesChanged,
         Count,
     };
     /// Why a fully resolved draw can't be reused by the next one.
@@ -332,6 +333,7 @@ private:
     struct FastDrawStats {
         u64 reused{};
         u64 delta{};
+        u64 handle_rechecks{}; ///< delta draws that read the handles again (EDEN_NX2_DELTA_HANDLES)
         std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
         std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
         /// PrepareDraw time and draws per path.
@@ -355,6 +357,7 @@ private:
         GraphicsPipeline* pipeline{}; ///< null: resolve the draw in full
         bool delta{};                 ///< light changes since: ConfigureDelta
         bool vertex_buffers{};        ///< a delta draw binds the vertex buffers again
+        bool recheck_handles{};       ///< a handle constant buffer was bound or written
     };
     /// The pipeline the draw can reuse with what the previous draw bound, if any.
     ReusableTake TakeReusableDraw(bool is_indexed, bool is_indirect);

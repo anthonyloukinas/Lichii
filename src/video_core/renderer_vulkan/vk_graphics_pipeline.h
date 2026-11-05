@@ -180,8 +180,9 @@ public:
     }
 
     /// EDEN_NX2_FAST_DRAW=2 (nx2_fast_draw.h): whether draws can keep this pipeline's resolved
-    /// image views and samplers after light changes. Handles computed at draw time are resolved
-    /// on every draw.
+    /// image views and samplers after light changes. Handles computed at draw time are evaluated
+    /// again by each delta draw (EDEN_NX2_DELTA_HANDLES), which falls back to a full draw if one
+    /// differs.
     [[nodiscard]] bool TakesDeltaDraws() const noexcept {
         return delta_blocker == DeltaBlocker::None && delta_views_valid;
     }
@@ -206,11 +207,29 @@ public:
         return handle_constant_buffers;
     }
 
-    enum class DeltaResult { Configured, Failed, NeedsFull };
+    enum class DeltaResult { Configured, Failed, NeedsFull, HandlesChanged };
     /// Binds the constant and storage buffers again (storage buffer addresses are read from
     /// constant buffers) and records the draw's descriptors with the image views, samplers and
-    /// texture buffers the last full Configure resolved.
-    DeltaResult ConfigureDelta();
+    /// texture buffers the last full Configure resolved. With recheck_handles (a handle constant
+    /// buffer was bound or written), and always for computed handles, it first reads every
+    /// texture and image handle again: HandlesChanged (nothing done) if one differs from the
+    /// last full Configure's.
+    DeltaResult ConfigureDelta(bool recheck_handles);
+
+    /// Whether a shader reads a texture or image handle computed from buffer words.
+    [[nodiscard]] bool HasComputedHandles() const noexcept {
+        return has_computed_handles;
+    }
+
+    /// EDEN_NX2_DELTA_HANDLES (default on): delta draws for pipelines with computed handles, and
+    /// handle constant buffer binds and writes checked by reading the handles again.
+    [[nodiscard]] static bool DeltaHandles() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_DELTA_HANDLES");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
 
     /// EDEN_NX2_FAST_DRAW_VERIFY: the next Configure compares what it resolves with the views
     /// and samplers a delta draw would have kept; DeltaMismatch reports the result.
@@ -294,6 +313,16 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    bool has_computed_handles{};
+    std::vector<u32> delta_handles;  ///< Raw handles the last full Configure read, in order
+    std::vector<u32> read_handles;   ///< Raw handles read by the current Configure
+
+    /// The raw texture/image handle `desc` element `index` of `stage` reads now (as Configure;
+    /// `configure` counts and logs zero computed handles).
+    template <typename Descriptor>
+    u32 ReadRawHandle(size_t stage, const Descriptor& desc, u32 index, bool configure);
+    /// Reads every handle again; whether all equal delta_handles.
+    bool HandlesUnchanged();
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
