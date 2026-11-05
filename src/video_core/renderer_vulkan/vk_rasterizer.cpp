@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <limits>
@@ -1984,9 +1985,32 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
-        std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.IsRegionGpuModified(addr, size)) {
-            return true;
+        // EDEN_NX2_GPU_MODIFIED_BITMAP (default on): granules without GPU-modified ranges answer
+        // from the lock-free bitmap, so the split's front (macro DMA reads, semaphore reads)
+        // doesn't wait for the mutex the back holds across draws. EDEN_NX2_WAIT_VERIFY=1 checks
+        // each such answer under the mutex.
+        namespace Profile = VideoCommon::Nx2Profile;
+        static const bool bitmap = VideoCommon::Nx2EnvSwitch("EDEN_NX2_GPU_MODIFIED_BITMAP", true);
+        if (bitmap && !buffer_cache.MayBeRegionGpuModified(addr, size)) {
+            Profile::Add(Profile::Counter::MustFlushLockFree, 1);
+            if (VideoCommon::GpuSplit::VerifyWaits()) [[unlikely]] {
+                std::scoped_lock lock{buffer_cache.mutex};
+                if (buffer_cache.IsRegionGpuModified(addr, size)) {
+                    Profile::Add(Profile::Counter::MustFlushBitmapMisses, 1);
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "GPU-modified bitmap missed {:#x} ({} bytes)", addr, size);
+                    }
+                    return true;
+                }
+            }
+        } else {
+            Profile::Add(Profile::Counter::MustFlushLocked, 1);
+            std::scoped_lock lock{buffer_cache.mutex};
+            if (buffer_cache.IsRegionGpuModified(addr, size)) {
+                return true;
+            }
         }
     }
     if (!Settings::IsGPULevelHigh()) {

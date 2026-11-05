@@ -126,6 +126,10 @@ enum class Counter : u32 {
     ListWaitUnsubmitted, ///< ... copies the back hadn't submitted yet
     ListCopySubmitNow,  ///< Copies submitted at once because the front waited (back)
     ListCopyDeferred,   ///< Copies whose submission was deferred (back)
+    // RasterizerVulkan::MustFlushRegion's buffer cache check (EDEN_NX2_GPU_MODIFIED_BITMAP).
+    MustFlushLockFree,     ///< Answered from the bitmap, no mutex
+    MustFlushLocked,       ///< Looked up under the mutex
+    MustFlushBitmapMisses, ///< EDEN_NX2_WAIT_VERIFY: bitmap said no, the ranges said yes
     Count,
 };
 
@@ -297,6 +301,14 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += fmt::format(" | list copies submitted at once {:.1f}/s, deferred {:.1f}/s",
                             per_second(Counter::ListCopySubmitNow),
                             per_second(Counter::ListCopyDeferred));
+    }
+    if (data.counters[static_cast<size_t>(Counter::MustFlushLockFree)] +
+            data.counters[static_cast<size_t>(Counter::MustFlushLocked)] !=
+        0) {
+        line += fmt::format(" | flush checks lock-free {:.0f}/s, locked {:.0f}/s ({:.0f} missed)",
+                            per_second(Counter::MustFlushLockFree),
+                            per_second(Counter::MustFlushLocked),
+                            per_second(Counter::MustFlushBitmapMisses));
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
