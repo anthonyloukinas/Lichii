@@ -166,7 +166,9 @@ default. The service turns it on at boot. A call without `after` returns the new
 it with `SetGlobalFilter` (`logging.cpp:449`), the call the Qt settings dialog makes. Lines
 already filtered out were never formatted, so the new filter applies only to later lines.
 
-**`capture_frame`** `{sampled?, timeout_s?, manifest_lines?, index?}`. It reuses `FrameDump`.
+**`capture_frame`** `{sampled?, timeout_s?, manifest_lines?, index?, count?}`. It reuses `FrameDump`.
+`count` (1 to 8, default `EDEN_NX2_FRAME_DUMP_COUNT` or 1) captures consecutive frames into
+`frame-<k>/` and returns one manifest summary per frame under `frames`.
 `FrameDump::Arm` (`vk_frame_dump.cpp:222`) points the next capture at a fresh directory and resets
 the per-capture counters, so `EDEN_NX2_FRAME_DUMP` is not needed. When to capture is decided by
 `FrameDumpSchedule`, which has no Vulkan state and is unit-tested. It handles both the env
@@ -309,8 +311,8 @@ the server again on the same port.
 - Vulkan only for `capture_frame` and `reject_shaders`. The drain point is in
   `RasterizerVulkan`. OpenGL would need the same three lines in `RasterizerOpenGL::TickFrame`,
   plus a frame dump it does not have.
-- A runtime capture uses up an `EDEN_NX2_FRAME_DUMP_AT` capture that has not fired yet. They share
-  one `FrameDump`.
+- A runtime capture uses up an `EDEN_NX2_FRAME_DUMP_AT` capture that has not fired yet (except
+  `AT=file`, which re-arms). They share one `FrameDump`.
 - One request at a time. A second client waits while a capture runs.
 - `log_tail` sees lines logged after the game finished loading. The boot itself is in
   `eden_log.txt`.

@@ -155,6 +155,10 @@ public:
     u32 written_compute_storage_buffers = 0;
     // Bound by a native (Switch 2) compute program, whose pointers carry no size.
     u32 native_compute_storage_buffers = 0;
+    // Native bindings whose written bytes the shader's store extent bounds for this dispatch.
+    u32 bounded_compute_storage_buffers = 0;
+    // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
+    std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -314,8 +318,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+                                  bool is_written,
+                                  const Shader::StorageWriteExtent& write_extent = {});
 
     /// Binds a native program's read-only storage buffers for pointers loaded from records
     /// (Shader::Info::native_indirect_slots) at first_index on, one per element of `bases`, and

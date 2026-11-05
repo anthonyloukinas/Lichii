@@ -1,0 +1,66 @@
+# Ocarina of Time test harness
+
+Unattended, repeatable runs of Ocarina of Time on Lichii: boot, title, load the newest save,
+walk forward, then turn the camera through four ~90° headings with a screenshot and an fps sample
+at each, then a clean shutdown and a summary.
+
+    python3 -I tools/oot/harness/run.py --headless --duration 300
+    python3 -I tools/oot/harness/run.py --binary ~/dev/Lichii/build/bin/lichii --headless   # A/B
+    python3 -I tools/oot/harness/run.py --env EDEN_NX2_COMPUTE_WRITE_MARK=0 --headless       # knob A/B
+    python3 -I tools/oot/harness/analyze.py ~/Downloads/OOT/harness-runs/<stamp>            # re-summarise
+
+Drop `--headless` to watch it in a nested gamescope window on the desktop. Exit status: 0 full
+run, 2 a step failed (the run stops there, with a `FAIL-*` / `last-state` screenshot), 3 refused
+to start (another emulator instance, or under 40 GiB available).
+
+## What it never touches
+
+The emulator runs with its working directory in `~/Downloads/OOT/harness-profile`, whose `user/`
+directory puts the Yuzu-lineage path code in portable mode. `portable.py` builds it by **copying**
+`~/.config/eden` (qt-config.ini + the per-game ini), `~/.local/share/eden` (NAND, save) and
+`~/.cache/eden/shader` (warm pipeline caches); `--refresh-profile` recopies them. Every run
+re-copies the seed config and save into `user/` and patches only the copies: absolute paths
+re-pointed into the profile, player 0 mapped to the virtual pad, no stop confirmation, no update
+check, and the per-game pins (GPU Mode Fast, reactive flushing off, async shaders, preload all
+pipelines, no eviction; `--pin key=value` adds more). The run checks mtimes of the live files
+before and after and records any change in `run.json` (`live_files_changed`).
+
+## How it works
+
+- **Input**: `pad.py` creates an Xbox-layout uinput gamepad (vendor 1209, product 0e0d) before
+  launch. SDL3 numbers its buttons/axes in evdev code order, so the harness writes the matching
+  `engine:sdl,guid:03000000091200000d0e000001000000,port:0,...` params for player 0 (A = button 1
+  east, B = 0 south, ...). Background events are on (`SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS`),
+  so focus does not matter.
+- **Display / screenshots**: gamescope (`--backend headless` with `--headless`), the emulator via
+  Xwayland, screenshots with `gamescopectl screenshot` against the run's own gamescope socket
+  (read from the emulator's environment). The screenshot backend is a class in `run.py`
+  (`SHOT_BACKENDS`); the debug-server channel from upstream PR #111 can be added beside it.
+- **fps**: MangoHud as gamescope's `--mangoapp` (the in-process MangoHud layer crashes this
+  emulator at exit and stalls shutdown ~50 s; mangoapp does not). Logging is started and stopped
+  with `mangohudctl set log_session` at the in-game window, so `mangohud.csv` holds only the
+  measured part. The emulator log's per-frame `NX2 deferred writes frame=` lines give guest fps and
+  the deferred-write counters for the same windows; `nvidia-smi dmon -s tu -o DT` gives PCIe/SM.
+- **Screen states** (`states.py`): reference crops in `refs/` (title logo, the "Load" banner, the
+  Load/Cancel dialog) compared as 64x32 grayscale thumbnails; in-game is the heart HUD (red pixels
+  top-left). `python3 -I states.py <png>...` prints the classification and scores for screenshots;
+  `states.py make-refs title=... load_list=... load_confirm=...` rebuilds references.
+- **Camera turns**: 6 right-stick pulses of 0.2 s with 0.6 s gaps = ~90° (24 = a full turn,
+  measured with `--probe-steps 24`). Shorter gaps over-turn: with 0.3 s the headings drifted about
+  90° every two cycles. Each cycle after the first logs a rotation-closure score (thumbnail MAD of
+  the q0 view against cycle 0's; ~37 for visually matching views, since fog, leaves and NPCs move,
+  ~55 when drifted). The per-visit rows in summary.md show whether a heading's fps is stable.
+- **Shutdown**: SIGTERM to the emulator (SIGINT is `_exit(1)` in this frontend), wait for exit and
+  check the log for "Emulation cleanup completed"; SIGKILL after `--shutdown-timeout`. Core dumps
+  of the emulator are disabled unless `--keep-cores`.
+
+## Output: `~/Downloads/OOT/harness-runs/<stamp>/`
+
+`screenshots/` (title, file-select, load-confirm, in-game, spawn, after-walk, heading<q>-c<cycle>),
+`mangohud.csv` (+ mangoapp's own summary), `pcie.txt`, `eden_log.txt`, `gamescope.txt`,
+`harness.log`, `run.json` (steps, phase windows, clock offsets), `summary.json`, `summary.md`
+(per-phase and per-heading: MangoHud fps median/p5/p95, frametime p95/p99, guest fps,
+native_dispatches, native_marked_KB, fence_copy_MB, pool collected vs applied, PCIe rx p95, SM %).
+
+Rules it enforces: one emulator instance (refuses if `bin/lichii` is running; `--wait-idle N`
+waits), MemAvailable ≥ 40 GiB, Python niced.

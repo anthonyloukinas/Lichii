@@ -129,6 +129,10 @@ void AddNVNStorageBuffers(IR::Program& program) {
         })};
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
+            if (program.info.stores_global_memory) {
+                // A global store may land anywhere in it
+                it->write_extent = {};
+            }
             continue;
         }
         // Native read-only bindings for loaded pointers stay last (the compute pipeline binds

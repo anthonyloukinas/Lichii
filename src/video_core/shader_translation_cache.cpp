@@ -28,7 +28,9 @@ namespace VideoCommon::TranslationCache {
 namespace {
 
 // Bump when the file layout or what a key covers changes.
-constexpr u32 FormatVersion = 1;
+// 2: StorageBufferDescriptor gained write_extent (records store descriptors as raw structures).
+// 3: StorageBufferDescriptor gained native_indirect, Info native_indirect_slots.
+constexpr u32 FormatVersion = 3;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;

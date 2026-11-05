@@ -852,12 +852,14 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     channel_state->enabled_compute_storage_buffers = 0;
     channel_state->written_compute_storage_buffers = 0;
     channel_state->native_compute_storage_buffers = 0;
+    channel_state->bounded_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
 
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                              bool is_written) {
+                                              bool is_written,
+                                              const Shader::StorageWriteExtent& write_extent) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -897,8 +899,46 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     channel_state->native_compute_storage_buffers =
         (channel_state->native_compute_storage_buffers & ~(1U << ssbo_index)) |
         ((native_pointer ? 1U : 0U) << ssbo_index);
-    channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer);
+    const Binding binding = StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer);
+    channel_state->compute_storage_buffers[ssbo_index] = binding;
+
+    // How much of the binding the dispatch marks GPU-written (docs/oot-white-petals.md). A native
+    // pointer has no size, so the binding is up to 8 MiB past it.
+    u64 mark = binding.size;
+    bool bounded = false;
+    if (native_pointer && is_written && binding.size != 0) {
+        switch (Settings::values.native_compute_write_mark.GetValue()) {
+        case Settings::NativeComputeWriteMark::Auto: {
+            const auto& qmd = launch_desc;
+            const std::array<u32, 3> block{qmd.block_dim_x.Value(), qmd.block_dim_y.Value(),
+                                           qmd.block_dim_z.Value()};
+            std::optional<std::array<u32, 3>> grid;
+            if (!kepler_compute->GetIndirectComputeAddress()) {
+                grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                          qmd.grid_dim_z.Value()};
+            }
+            if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
+                // The extent counts from the pointer, the binding from the pointer aligned down.
+                const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                mark = std::min<u64>(binding.size, pad + *extent);
+                bounded = true;
+            }
+            break;
+        }
+        case Settings::NativeComputeWriteMark::Full:
+            break;
+        case Settings::NativeComputeWriteMark::Cap64K:
+            mark = std::min<u64>(binding.size, 64_KiB);
+            break;
+        }
+        // EDEN_NX2_COMPUTE_WRITE_MARK caps any mode (A/B experiments).
+        mark = std::min<u64>(mark, Tegra::g_nx2_compute_write_mark);
+    }
+    channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
+    channel_state->bounded_compute_storage_buffers =
+        (channel_state->bounded_compute_storage_buffers & ~(1U << ssbo_index)) |
+        ((bounded ? 1U : 0U) << ssbo_index);
 }
 
 template <class P>
@@ -920,6 +960,8 @@ void BufferCache<P>::BindComputeIndirectStorageBuffers(
         channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
         channel_state->written_compute_storage_buffers &= ~(1U << ssbo_index);
         channel_state->native_compute_storage_buffers |= 1U << ssbo_index;
+        channel_state->bounded_compute_storage_buffers &= ~(1U << ssbo_index);
+        channel_state->compute_storage_write_marks[ssbo_index] = 0;
         channel_state->compute_storage_buffers[ssbo_index] = NULL_BINDING;
     }
     const auto& launch_desc = kepler_compute->launch_description;
@@ -1758,7 +1800,8 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
             if (is_written && write_mark_limit != 0) {
-                // write_mark_limit: EDEN_NX2_COMPUTE_WRITE_MARK, spread over the segments in order.
+                // write_mark_limit: the native write mark (BindComputeStorageBuffer), spread over
+                // the segments in order.
                 const u32 mark = static_cast<u32>(std::min<u64>(segment.size, write_mark_limit));
                 MarkWrittenBuffer(segment.buffer_id, segment.device_addr, mark);
                 if (write_mark_limit != ~u64{0}) {
@@ -1926,13 +1969,14 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const Binding& binding = channel_state->compute_storage_buffers[index];
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-        // EDEN_NX2_COMPUTE_WRITE_MARK (experiment, docs/oot-white-petals.md): a native program's
-        // binding is min(layout, 8 MiB) because its pointer has no size, and marking all of it
-        // GPU-written defers the CPU's later writes to those pages. Clamp only what is claimed
-        // written; the binding keeps its size so the shader can still read all of it.
+        // A native program's binding is min(layout, 8 MiB) because its pointer has no size, and
+        // marking all of it GPU-written defers the CPU's later writes to those pages. Mark only
+        // what BindComputeStorageBuffer worked out the dispatch can write; the binding keeps its
+        // size so the shader can still read all of it.
         const bool native =
             ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
-        const u64 write_mark_limit = native ? Tegra::g_nx2_compute_write_mark : ~u64{0};
+        const u64 write_mark_limit =
+            native ? u64{channel_state->compute_storage_write_marks[index]} : ~u64{0};
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
@@ -1956,6 +2000,12 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             Tegra::Nx2Count(c.native_storage_bindings, 1);
             Tegra::Nx2Count(c.native_storage_bytes, size);
             Tegra::Nx2Count(c.native_marked_bytes, mark);
+            if (is_written) {
+                const bool bounded =
+                    ((channel_state->bounded_compute_storage_buffers >> index) & 1) != 0;
+                Tegra::Nx2Count(bounded ? c.native_bounded_bindings : c.native_unbounded_bindings,
+                                1);
+            }
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {

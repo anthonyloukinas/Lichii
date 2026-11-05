@@ -350,7 +350,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             continue;
         }
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written);
+                                              desc.is_written, desc.write_extent);
         ++ssbo_index;
     }
     std::array<u64, Shader::Info::MAX_NATIVE_INDIRECT_BINDINGS> indirect_bases{};

@@ -2560,6 +2560,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     }
                     auto count = write_count(definition);
                     switch (op) {
+                    // 0x211/0x811 (LEA/LEA.HI, register/immediate Rb) write only Rd; a carry-out
+                    // predicate they may write is not in written_predicates above, so it already
+                    // counts as a guard clobber.
                     case 0x827: case 0x307: case 0x211: case 0x811: case 0xa11: case 0x624: case 0x831:
                     case 0x832: case 0x224:
                         count = 1;
