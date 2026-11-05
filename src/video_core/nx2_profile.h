@@ -118,6 +118,14 @@ enum class Counter : u32 {
     // EDEN_NX2_STEP_WRITER_SKIP (DmaPusher::SkipWriterWait).
     StepWriterSkips,  ///< Entries read without waiting for queued compute and copy work
     StepWriterMisses, ///< ... that the work wrote after all (back thread)
+    // GPU-written command list copies (BufferCacheRuntime::WaitSubmittedTick, front; and
+    // RasterizerVulkan::SubmitNx2ListCopies, back).
+    ListWaits,          ///< Reads that waited for the host GPU's copy
+    ListWaitNs,         ///< ... their total wait (ns)
+    ListWaitSpinMet,    ///< ... copies done within the spin (EDEN_NX2_LIST_WAIT_SPIN_US)
+    ListWaitUnsubmitted, ///< ... copies the back hadn't submitted yet
+    ListCopySubmitNow,  ///< Copies submitted at once because the front waited (back)
+    ListCopyDeferred,   ///< Copies whose submission was deferred (back)
     Count,
 };
 
@@ -272,6 +280,23 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += fmt::format(" | entries read without the writer wait {:.0f} ({:.0f} too early)",
                             per_second(Counter::StepWriterSkips),
                             per_second(Counter::StepWriterMisses));
+    }
+    if (data.counters[static_cast<size_t>(Counter::ListWaits)] != 0) {
+        const auto waits = data.counters[static_cast<size_t>(Counter::ListWaits)];
+        line += fmt::format(
+            " | list copy waits {:.1f}/s, {:.0f} us/s, {:.0f} us each ({:.1f}/s met spinning, "
+            "{:.1f}/s unsubmitted)",
+            per_second(Counter::ListWaits), per_second(Counter::ListWaitNs) / 1000.0,
+            static_cast<double>(data.counters[static_cast<size_t>(Counter::ListWaitNs)]) /
+                1000.0 / static_cast<double>(waits),
+            per_second(Counter::ListWaitSpinMet), per_second(Counter::ListWaitUnsubmitted));
+    }
+    if (data.counters[static_cast<size_t>(Counter::ListCopySubmitNow)] +
+            data.counters[static_cast<size_t>(Counter::ListCopyDeferred)] !=
+        0) {
+        line += fmt::format(" | list copies submitted at once {:.1f}/s, deferred {:.1f}/s",
+                            per_second(Counter::ListCopySubmitNow),
+                            per_second(Counter::ListCopyDeferred));
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {

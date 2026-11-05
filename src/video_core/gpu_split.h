@@ -117,6 +117,10 @@ public:
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
     }
+    /// Any thread (meant for the back): whether the front is waiting for the back right now.
+    [[nodiscard]] bool FrontWaiting() const {
+        return wait_target.load(std::memory_order_relaxed) != ~u64{0};
+    }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);

@@ -1879,9 +1879,27 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
-        scheduler.Flush();
+    if (!buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+        return;
     }
+    // EDEN_NX2_LIST_COPY_SUBMIT_NOW (default on): when the split's front is waiting for the back
+    // right now, it is about to read the list (it waits for its writers, DmaPusher::Step), so
+    // submit the copy at once: deferred, it went with the next submission, after the draws
+    // recorded meanwhile, and the front first had to ask for it (WaitSubmitted).
+    namespace Profile = VideoCommon::Nx2Profile;
+    static const bool submit_now =
+        VideoCommon::Nx2EnvSwitch("EDEN_NX2_LIST_COPY_SUBMIT_NOW", true);
+    if (submit_now && VideoCommon::GpuSplit::OnBackThread() &&
+        VideoCommon::GpuSplit::Get().FrontWaiting()) {
+        Profile::Add(Profile::Counter::ListCopySubmitNow, 1);
+        scheduler.Flush();
+        return;
+    }
+    if (scheduler.DeferFlush()) {
+        Profile::Add(Profile::Counter::ListCopyDeferred, 1);
+        return;
+    }
+    scheduler.Flush();
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
