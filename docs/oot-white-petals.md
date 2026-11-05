@@ -58,6 +58,13 @@ totals since the previous line:
   it is written by the CPU.
 - `invalidations`: `InvalidateGPUCache` calls (the points where collected writes are applied).
 - `applied_ranges` / `applied_bytes` / `applied_pool_bytes`: collected writes applied by those calls.
+- `fence_downloads` and `sync_downloads` (`ranges/bytes/pool_bytes`): buffer-cache bytes copied
+  from host buffers back to guest memory. Fence downloads land when a fence pops;
+  synchronous ones (`BufferCache::DownloadMemory`, the page-download branch of `WriteMemory`, a CPU
+  read of GPU-written memory) stall on the host GPU, and `sync_download_calls` counts those
+  stalls. An 8 MiB write mark makes every CPU read or write of a marked page a candidate for a
+  download, so the clamp may cut transfer volume as well as fix the leaves. Texture-cache
+  downloads are not counted.
 - `write_mark`: the active `EDEN_NX2_COMPUTE_WRITE_MARK` (`full` when unset).
 
 If `pool_bytes` alternates from frame to frame in step with the flicker, the mechanism is confirmed.

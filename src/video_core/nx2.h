@@ -59,6 +59,12 @@ struct Nx2DeferredWriteCounters {
     std::atomic<u64> applied_ranges{0};
     std::atomic<u64> applied_bytes{0};
     std::atomic<u64> applied_pool_bytes{0};
+    // GPU -> guest buffer-cache downloads: [0] at a fence (async), [1] synchronous (a CPU read,
+    // a CPU write over GPU bytes, a DMA/flush request), which stall on the host GPU.
+    std::array<std::atomic<u64>, 2> download_ranges{};
+    std::array<std::atomic<u64>, 2> download_bytes{};
+    std::array<std::atomic<u64>, 2> download_pool_bytes{};
+    std::atomic<u64> sync_download_calls{0};
 };
 inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
 
@@ -83,6 +89,14 @@ inline void Nx2NoteAppliedWrite(u64 address, u64 size) {
     c.applied_ranges.fetch_add(1, std::memory_order_relaxed);
     c.applied_bytes.fetch_add(size, std::memory_order_relaxed);
     c.applied_pool_bytes.fetch_add(Nx2PoolOverlap(address, size), std::memory_order_relaxed);
+}
+
+inline void Nx2NoteDownload(bool sync, u64 address, u64 size) {
+    auto& c = g_nx2_deferred_writes;
+    c.download_ranges[sync].fetch_add(1, std::memory_order_relaxed);
+    c.download_bytes[sync].fetch_add(size, std::memory_order_relaxed);
+    c.download_pool_bytes[sync].fetch_add(Nx2PoolOverlap(address, size),
+                                          std::memory_order_relaxed);
 }
 
 // EDEN_NX2_COMPUTE_WRITE_MARK=<bytes> (experiment, docs/oot-white-petals.md): the most a native

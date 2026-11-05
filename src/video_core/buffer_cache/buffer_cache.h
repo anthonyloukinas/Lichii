@@ -845,6 +845,9 @@ void BufferCache<P>::PopAsyncBuffers() {
         // Only what no write replaced since the copy was taken: the rest is older than guest
         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+            if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+                Tegra::Nx2NoteDownload(false, start, end - start);
+            }
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
             gpu_modified_ranges.Subtract(start, end - start);
@@ -2462,6 +2465,9 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     const u8* const mapped_memory = download_staging.mapped_span.data();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+        if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+            Tegra::Nx2NoteDownload(true, device_addr, download.copy.size);
+        }
         device_memory.WriteBlockUnsafe(
             device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
@@ -2497,6 +2503,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         });
     if (total_size_bytes == 0) {
         return;
+    }
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        Tegra::g_nx2_deferred_writes.sync_download_calls.fetch_add(1, std::memory_order_relaxed);
+        for (const BufferCopy& copy : copies) {
+            Tegra::Nx2NoteDownload(true, buffer.CpuAddr() + copy.src_offset, copy.size);
+        }
     }
 
     if constexpr (requires { buffer.Mapped(); }) {
