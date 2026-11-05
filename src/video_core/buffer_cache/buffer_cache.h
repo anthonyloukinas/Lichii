@@ -116,6 +116,8 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    memory_tracker.TickHotPages();
+    ReportPageProtection();
     if (Nx2FastDraw::g_buffer_skip) [[unlikely]] {
         const u64 now = Nx2Profile::Now();
         if (skip_stats.window_start == 0) {
@@ -3093,7 +3095,74 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 }
 
 template <class P>
+void BufferCache<P>::ApplyHotEpoch() {
+    if (!memory_tracker.HasHotPages()) {
+        return;
+    }
+    const u64 epoch = Nx2HotPages::g_epoch.load(std::memory_order_acquire);
+    if (epoch == hot_applied_epoch) {
+        return;
+    }
+    hot_applied_epoch = epoch;
+    // A CPU write's side effects (WriteMemory) for pages nothing traps writes on.
+    const u64 marked = memory_tracker.MarkHotPagesWritten([&](DAddr addr, u64 size) {
+        Nx2NoteListHostWrite(addr, size);
+        if (!native_indirect_cache.empty()) {
+            InvalidateNativeIndirectCache(addr, size);
+        }
+        MarkVertexBuffersStale(addr, size);
+    });
+    if (marked == 0) {
+        return;
+    }
+    hot_applies.fetch_add(1, std::memory_order_relaxed);
+    if (Nx2FastDraw::g_enabled) {
+        Nx2FastDraw::NoteHotWrite(GpuSplit::OnBackThread());
+    }
+    Nx2HotPages::Count(Nx2HotPages::g_counters.epochs, 1);
+    Nx2HotPages::Count(Nx2HotPages::g_counters.remarked, marked);
+}
+
+template <class P>
+void BufferCache<P>::ReportPageProtection() {
+    const u64 now = Nx2Profile::Now();
+    if (protection_report_start == 0) {
+        protection_report_start = now;
+        return;
+    }
+    if (now - protection_report_start < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - protection_report_start) / 1e9;
+    protection_report_start = now;
+    auto& c = Nx2HotPages::g_counters;
+    const auto rate = [&](std::atomic<u64>& counter) {
+        return static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / seconds;
+    };
+    const double protect_calls = rate(c.protect_calls);
+    const double protect_pages = rate(c.protect_pages);
+    const double back_protect_calls = rate(c.back_protect_calls);
+    const double unprotect_calls = rate(c.unprotect_calls);
+    const double unprotect_pages = rate(c.unprotect_pages);
+    const double promoted = rate(c.promoted);
+    const double cooled = rate(c.cooled);
+    const double demoted = rate(c.demoted);
+    const double kept = rate(c.kept);
+    const double epochs = rate(c.epochs);
+    const double remarked = rate(c.remarked);
+    LOG_INFO(HW_GPU,
+             "Page protection per second: protect {:.0f} calls {:.0f} pages ({:.0f} calls on the "
+             "GPU back), unprotect {:.0f} calls {:.0f} pages | hot pages {} ({}): promoted {:.0f} "
+             "cooled {:.0f} demoted {:.0f}, uploads left {:.0f} writable, {:.0f} epochs marked "
+             "{:.0f} written",
+             protect_calls, protect_pages, back_protect_calls, unprotect_calls, unprotect_pages,
+             memory_tracker.HotPageCount(), Nx2HotPages::g_enabled ? "on" : "off", promoted,
+             cooled, demoted, kept, epochs, remarked);
+}
+
+template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    ApplyHotEpoch();
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
 #else

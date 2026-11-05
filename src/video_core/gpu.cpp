@@ -21,6 +21,7 @@
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/nx2_hot_pages.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -210,6 +211,8 @@ struct GPU::Impl {
 
     /// Push GPU command entries to be processed
     void PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
+        // EDEN_NX2_HOT_PAGES: the guest's writes so far are for this work (or later).
+        VideoCommon::Nx2HotPages::BumpEpoch();
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 

@@ -271,6 +271,13 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
                                                                   bool is_indirect) {
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     ReusableDraw& draw = reusable_draw;
+    // EDEN_NX2_HOT_PAGES: a reused draw doesn't upload: mark hot pages written (a light change
+    // or a break) first if the guest may have written them since.
+    if (buffer_cache.HotEpochPending()) [[unlikely]] {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ApplyHotEpoch();
+    }
+    hot_applies_at_take = buffer_cache.HotApplies();
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
     const std::array<u32, 5> break_set =
         FastDraw::g_track_breaks ? FastDraw::TakeIntervalBreaks() : std::array<u32, 5>{};
@@ -363,6 +370,11 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
     }();
     if (ineligible) {
         ++fast_draw_stats.ineligible[static_cast<size_t>(*ineligible)];
+        return;
+    }
+    // EDEN_NX2_HOT_PAGES: hot pages marked written while this draw resolved may have reached
+    // bindings it had already uploaded.
+    if (buffer_cache.HotApplies() != hot_applies_at_take) {
         return;
     }
     reusable_draw = ReusableDraw{

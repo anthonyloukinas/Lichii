@@ -290,6 +290,7 @@ private:
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 
     /// EDEN_NX2_FAST_DRAW: what the last fully resolved draw left bound (nx2_fast_draw.h).
+    u64 hot_applies_at_take{}; ///< EDEN_NX2_HOT_PAGES: BufferCache::HotApplies before the resolve
     struct ReusableDraw {
         GraphicsPipeline* pipeline{};
         const Tegra::Engines::Maxwell3D* maxwell3d{};

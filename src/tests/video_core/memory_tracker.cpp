@@ -82,9 +82,128 @@ private:
     size_t update_calls = 0;
 };
 
+// EDEN_NX2_HOT_PAGES changes how often pages written again and again are protected: the
+// tests below count protections, so it is off except where a test turns it on.
+struct HotPagesOff {
+    HotPagesOff() {
+        VideoCommon::Nx2HotPages::g_enabled = false;
+    }
+} hot_pages_off;
+
+struct HotPagesOn {
+    HotPagesOn() {
+        VideoCommon::Nx2HotPages::g_enabled = true;
+    }
+    ~HotPagesOn() {
+        VideoCommon::Nx2HotPages::g_enabled = false;
+    }
+};
+
 } // Anonymous namespace
 
 using MemoryTracker = VideoCommon::MemoryTrackerBase<RasterizerInterface>;
+
+namespace {
+/// Uploads [addr, addr + size) and returns the bytes uploaded.
+u64 Upload(MemoryTracker& tracker, DAddr addr, u64 size) {
+    u64 bytes = 0;
+    tracker.ForEachUploadRange(addr, size, [&](u64, u64 range) { bytes += range; });
+    return bytes;
+}
+
+/// The guest writes a page three times after its uploads: the third makes it hot.
+void MakeHot(MemoryTracker& tracker, RasterizerInterface& rasterizer, DAddr page) {
+    REQUIRE(Upload(tracker, page, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(page) == 1);
+    for (int i = 0; i < 3; ++i) {
+        tracker.MarkRegionAsCpuModified(page + 8, 8);
+        REQUIRE(rasterizer.Count(page) == 0);
+        REQUIRE(Upload(tracker, page, PAGE) == PAGE);
+    }
+}
+} // Anonymous namespace
+
+TEST_CASE("MemoryTracker: hot pages stay writable and are marked written per epoch",
+          "[video_core]") {
+    HotPagesOn on;
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker(rasterizer);
+    MakeHot(tracker, rasterizer, c);
+    // The third upload left it writable, and its neighbour is untouched.
+    REQUIRE(rasterizer.Count(c) == 0);
+    REQUIRE(tracker.HasHotPages());
+    REQUIRE(Upload(tracker, c, PAGE) == 0);
+    REQUIRE(Upload(tracker, c + PAGE, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c + PAGE) == 1);
+
+    // An epoch marks it written: uploaded again, still writable.
+    std::vector<Range> runs;
+    REQUIRE(tracker.MarkHotPagesWritten([&](u64 addr, u64 size) { runs.emplace_back(addr, size); }) == 1);
+    REQUIRE(runs == std::vector<Range>{{c, PAGE}});
+    REQUIRE(tracker.IsRegionCpuModified(c, PAGE));
+    REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c) == 0);
+
+    // A CPU write the tracker hears of changes nothing about its protection.
+    tracker.MarkRegionAsCpuModified(c, 4);
+    REQUIRE(rasterizer.Count(c) == 0);
+    REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c) == 0);
+}
+
+TEST_CASE("MemoryTracker: a GPU write protects a hot page and keeps it CPU-modified",
+          "[video_core]") {
+    HotPagesOn on;
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker(rasterizer);
+    MakeHot(tracker, rasterizer, c);
+    REQUIRE(rasterizer.Count(c) == 0);
+    tracker.MarkRegionAsGpuModified(c + 16, 16);
+    REQUIRE(rasterizer.Count(c) == 1);
+    REQUIRE(tracker.IsRegionGpuModified(c, PAGE));
+    REQUIRE(tracker.IsRegionCpuModified(c, PAGE));
+    // Marking hot pages written skips it now.
+    REQUIRE(tracker.MarkHotPagesWritten([](u64, u64) {}) == 0);
+    // The pending upload leaves the protection as it is.
+    REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c) == 1);
+    // A later CPU write unprotects it as before, and it doesn't count towards hot (GPU-modified).
+    tracker.MarkRegionAsCpuModified(c, 4);
+    REQUIRE(rasterizer.Count(c) == 0);
+    tracker.UnmarkRegionAsGpuModified(c, PAGE);
+    REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c) == 1);
+}
+
+TEST_CASE("MemoryTracker: hot pages are demoted and refault counts decay", "[video_core]") {
+    HotPagesOn on;
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker(rasterizer);
+    MakeHot(tracker, rasterizer, c);
+    for (u64 frame = 1; frame < VideoCommon::Nx2HotPages::DemoteFrames; ++frame) {
+        tracker.TickHotPages();
+    }
+    REQUIRE(tracker.HotPageCount() == 1);
+    tracker.TickHotPages();
+    REQUIRE(tracker.HotPageCount() == 0);
+    // Demoted CPU-modified: the next upload sends it and protects it.
+    REQUIRE(tracker.IsRegionCpuModified(c, PAGE));
+    REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c) == 1);
+
+    // Two protection losses, a decay window, one more: not hot.
+    for (int i = 0; i < 2; ++i) {
+        tracker.MarkRegionAsCpuModified(c, 4);
+        REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    }
+    for (u64 frame = 0; frame < VideoCommon::Nx2HotPages::DecayFrames; ++frame) {
+        tracker.TickHotPages();
+    }
+    tracker.MarkRegionAsCpuModified(c, 4);
+    REQUIRE(Upload(tracker, c, PAGE) == PAGE);
+    REQUIRE(rasterizer.Count(c) == 1);
+    REQUIRE_FALSE(tracker.HasHotPages());
+}
 
 TEST_CASE("MemoryTracker: Small region", "[video_core]") {
     RasterizerInterface rasterizer;

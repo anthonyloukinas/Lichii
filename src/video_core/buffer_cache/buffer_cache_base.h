@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <functional>
 #include <memory>
@@ -39,6 +40,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/nx2_hot_pages.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -239,6 +241,19 @@ public:
     ~BufferCache();
 
     void TickFrame();
+
+    /// EDEN_NX2_HOT_PAGES: whether hot pages must be marked written before buffers are used
+    [[nodiscard]] bool HotEpochPending() const noexcept {
+        return memory_tracker.HasHotPages() &&
+               Nx2HotPages::g_epoch.load(std::memory_order_acquire) != hot_applied_epoch;
+    }
+    /// EDEN_NX2_HOT_PAGES: marks hot pages written if the guest passed a submission or an
+    /// acquire since they last were (the guest may have written them for what follows)
+    void ApplyHotEpoch();
+    /// EDEN_NX2_HOT_PAGES: how many times ApplyHotEpoch marked pages written
+    [[nodiscard]] u64 HotApplies() const noexcept {
+        return hot_applies.load(std::memory_order_relaxed);
+    }
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool,
@@ -689,6 +704,10 @@ private:
     /// Words a read back found changed: always read back with a wait
     boost::container::small_vector<DAddr, 16> native_indirect_volatile;
     bool native_indirect_speculation_off{};
+    u64 hot_applied_epoch{};      ///< EDEN_NX2_HOT_PAGES
+    std::atomic<u64> hot_applies{};
+    u64 protection_report_start{};
+    void ReportPageProtection();
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
