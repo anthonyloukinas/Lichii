@@ -36,13 +36,13 @@ void LayerPass(IR::Program& program, const HostTranslateInfo& host_info);
 void VendorWorkaroundPass(IR::Program& program);
 void VerificationPass(const IR::Program& program);
 bool HasBrokenPattern(const IR::Program& program);
-/// EDEN_NX2_DYN_CBUF_POINTERS=1 (off by default since upstream #150, read once): native global
-/// accesses whose base pointer is read from a constant buffer at a dynamic offset bind every
-/// pointer of that buffer, instead of upstream's slot walk.
+/// EDEN_NX2_DYN_CBUF_POINTERS (read once; on unless =0, or off with EDEN_NX2_POINTER_RULES=upstream
+/// unless set): native global accesses whose base pointer is read from a constant buffer at a
+/// dynamic offset bind every pointer of that buffer, instead of upstream #150's slot walk.
 bool NativeDynamicCbufPointers();
-/// EDEN_NX2_INDIRECT_POINTERS=1 or =guest (off by default since upstream #150): native loads
-/// through a pointer loaded from a record that upstream's table entries leave unbound get
-/// read-only native_indirect bindings, and the runtime pick checks the bound length.
+/// EDEN_NX2_INDIRECT_POINTERS (same default; =guest also counts as on): native loads through a
+/// pointer loaded from a record that upstream's table entries leave unbound get read-only
+/// native_indirect bindings, and the runtime pick checks the bound length.
 bool NativeIndirectPointers();
 /// Also for task and mesh programs (bound per draw); EDEN_NX2_INDIRECT_POINTERS=compute: compute
 /// programs only
