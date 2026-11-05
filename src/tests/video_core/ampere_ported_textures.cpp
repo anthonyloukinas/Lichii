@@ -108,7 +108,7 @@ TEST_CASE("Ampere per-tap gathers reject unproven offsets and unsupported modes"
             REQUIRE(lowered.error == "native per-tap gather offset range");
         }
     }
-    for (const u32 bit : {60U, 72U, 76U, 78U, 79U, 80U, 81U, 89U, 91U}) {
+    for (const u32 bit : {60U, 72U, 76U, 78U, 80U, 81U, 89U, 91U}) {
         auto invalid = PerTapProgram();
         invalid[2].words[bit / 32] ^= 1U << (bit % 32);
         INFO("bit " << bit);
@@ -181,6 +181,32 @@ TEST_CASE("Ampere depth gathers preserve coordinates reference and result pairs"
             REQUIRE(lowered.instructions.size() == expected.size() + 1);
         }
     }
+}
+
+TEST_CASE("Ampere half gathers prove literal IMAD offsets across outgoing branches",
+          "[video_core][ampere][gather]") {
+    const std::array code{
+        Instruction{{0xff007424, 0x00010000, 0x078e00ff, 0}},
+        Instruction{{0xff017424, 0x01010100, 0x078e00ff, 0}},
+        Instruction{{0x00000947, 16, 0x03800000, 0}},
+        Instruction{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0}},
+        Exit,
+    };
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto start = lowered.source_instruction_offsets[3];
+    CHECK(lowered.instructions[start] == MoveImmediate(7ULL << 16, 248, 0x00010000));
+    CHECK(lowered.instructions[start + 1] == MoveImmediate(7ULL << 16, 249, 0x01010100));
+    auto invalid = code;
+    invalid[2].words[1] = 0;
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather control-flow proof");
+    invalid = code;
+    invalid[0].words[0] = 0xff001424;
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    invalid = code;
+    invalid[2].words = {0x00007805, 0, 0x0001ff00, 0};
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
 }
 
 TEST_CASE("Ampere half texture results keep the first component in the low lane",

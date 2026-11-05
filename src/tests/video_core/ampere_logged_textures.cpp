@@ -84,6 +84,9 @@ struct TextureTranslation {
     std::array<u32, IR::NUM_REGS> registers{};
     Vector sample{0x3f800000, 0xbf000000, 0x3e800000, 0x3f400000};
     Vector coordinates{};
+    Vector offsets{}, offsets2{};
+    u32 handle{0x110};
+    u32 component{};
     u32 level{};
     u32 textures{};
 
@@ -96,6 +99,8 @@ struct TextureTranslation {
             REQUIRE(((word >> 16) & 15) == guard);
             if ((word >> 48) == 0x5c98) {
                 visitor.MOV_reg(word);
+            } else if ((word >> 56) == 0x01) {
+                visitor.MOV32I(word);
             } else if ((word >> 48) == 0x4c98) {
                 visitor.MOV_cbuf(word);
             } else if ((word >> 48) == 0x5ca8) {
@@ -104,7 +109,7 @@ struct TextureTranslation {
                 visitor.ISCADD_reg(word);
             } else if ((word >> 56) == 0xd2) {
                 visitor.TLDS(word);
-            } else if ((word >> 56) == 0xc8) {
+            } else if ((word >> 58) == 0x32) {
                 visitor.TLD4(word);
             } else if ((word >> 56) == 0xde) {
                 visitor.TEX_b(word);
@@ -143,13 +148,23 @@ struct TextureTranslation {
             case IR::Opcode::CompositeConstructF16x2:
                 result = {arg(0), arg(1)};
                 break;
+            case IR::Opcode::CompositeConstructU32x4:
+                result = {arg(0), arg(1), arg(2), arg(3)};
+                break;
+            case IR::Opcode::BitFieldSExtract:
+                result[0] = static_cast<u32>(static_cast<s32>(arg(0) << (32 - arg(1) - arg(2))) >> (32 - arg(2)));
+                break;
             case IR::Opcode::BoundImageFetch:
             case IR::Opcode::BoundImageGather:
-                REQUIRE(arg(0) == 0x110);
+                REQUIRE(arg(0) == handle);
                 coordinates = read(inst.Arg(1));
                 if (inst.GetOpcode() == IR::Opcode::BoundImageFetch) {
                     level = arg(3);
                     REQUIRE(inst.Flags<IR::TextureInstInfo>().relaxed_precision == 1);
+                } else {
+                    component = inst.Flags<IR::TextureInstInfo>().gather_component;
+                    if (!inst.Arg(2).IsEmpty()) offsets = read(inst.Arg(2));
+                    if (!inst.Arg(3).IsEmpty()) offsets2 = read(inst.Arg(3));
                 }
                 result = sample;
                 ++textures;
@@ -283,6 +298,60 @@ TEST_CASE("Welcome Tour logged half gathers round and pack both destination orde
             for (u32 reg = 0; reg < 246; ++reg) {
                 if (reg != 2 && reg != instruction.Bits(64, 8)) {
                     REQUIRE(translated.registers[reg] == before[reg]);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Ampere half per-tap gathers round and pack each pair in low-high order",
+          "[video_core][ampere][gather][logged_textures]") {
+    // nvdisasm -b SM87, old negative case with bit 79 set:
+    // TLD4.SCR.R.F16.RN.PTP.NODEP R8, R10, R4, R8, 0xe, 0x4, 2D ;
+    const Instruction former_negative{{0x040a7b63, 0x33800408, 0x041eaf08, 0x100fc200}};
+    const Instruction captured{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    for (const auto& capture : {former_negative, captured}) {
+        for (const u32 component : {0U, 1U, 2U, 3U}) {
+            for (const u32 guard : {1U, 7U, 9U}) {
+                auto gather = capture;
+                gather.words[0] = (gather.words[0] & ~0xf000U) | (guard << 12);
+                gather.words[2] = (gather.words[2] & ~(3U << 23)) | (component << 23);
+                const u32 meta = gather.Bits(32, 8);
+                const std::array code{
+                    Instruction{{0x00007802U | (meta << 16), 0xff00ff00, 0xf00, 0}},
+                    Instruction{{0x00007802U | ((meta + 1) << 16), 0x01000001, 0xf00, 0}},
+                    gather, Exit,
+                };
+                auto lowered = Shader::Ampere::LowerToMaxwell(code);
+                INFO(lowered.error);
+                REQUIRE(lowered);
+                lowered.instructions.erase(lowered.instructions.begin(),
+                    lowered.instructions.begin() + lowered.source_instruction_offsets[2]);
+                TextureTranslation translated;
+                translated.env.binding = lowered.required_texture_buffer;
+                translated.handle = gather.Bits(40, 14) * 4;
+                translated.registers.fill(0xdeadbeef);
+                translated.registers[gather.Bits(24, 8)] = 0x3e000000;
+                translated.registers[gather.Bits(24, 8) + 1] = 0x3f400000;
+                translated.sample = {0x3f801000, 0x3f801001, 0x80000000, 0x3f400000};
+                const auto before = translated.registers;
+                translated.Translate(lowered, guard);
+                translated.Run();
+                CHECK(translated.textures == 1);
+                CHECK(translated.component == component);
+                CHECK(translated.coordinates == TextureTranslation::Vector{0x3e000000, 0x3f400000});
+                CHECK(translated.offsets == TextureTranslation::Vector{0, 0xffffffff, 0, 0xffffffff});
+                CHECK(translated.offsets2 == TextureTranslation::Vector{1, 0, 0, 1});
+                CHECK(translated.registers[gather.Bits(16, 8)] == 0x3c013c00);
+                CHECK(translated.registers[gather.Bits(64, 8)] == 0x3a008000);
+                for (u32 reg = 0; reg < 246; ++reg) {
+                    if (reg != gather.Bits(16, 8) && reg != gather.Bits(64, 8))
+                        REQUIRE(translated.registers[reg] == before[reg]);
+                }
+                for (const u32 rounding : {2U, 3U}) {
+                    auto invalid = code;
+                    invalid[2].words[2] = (invalid[2].words[2] & ~(3U << 15)) | (rounding << 15);
+                    CHECK_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
                 }
             }
         }

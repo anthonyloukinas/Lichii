@@ -2501,12 +2501,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                            dest + 2 > register_limit || second_dest + 2 > register_limit ||
                            (second_dest < dest + 2 && dest < second_dest + 2) ||
                            (insn.words[3] & 0xc00001ffU))) ||
-                (half && (bindless || offsets || per_tap || !insn.Bits(60, 1) || insn.Bits(80, 1) ||
+                (half && (bindless || offsets || !insn.Bits(60, 1) || insn.Bits(80, 1) ||
                           insn.Bits(91, 1) ||
                           (source_b != 255 && source_b >= register_limit) ||
                           mask != 15 || dest >= register_limit || second_dest >= register_limit)) ||
                 (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245))) ||
-                (per_tap && (bindless || insn.Bits(78, 3) || insn.Bits(91, 1))) ||
+                (per_tap && (bindless || depth || insn.Bits(80, 1) || insn.Bits(91, 1))) ||
                 insn.Bits(89, 1) || mask == 0 ||
                 (bindless ? (handle >= 246 || insn.Bits(46, 13) || !insn.Bits(91, 1))
                           : (insn.Bits(40, 14) > 0x1fff || binding >= 18 ||
@@ -2517,49 +2517,99 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit) ||
                     (second_dest != 255 && second_dest + 1 >= register_limit))
                     return fail(index, "native per-tap gather operands");
-                // The backward scan below is only sound for straight-line programs: every
-                // instruction up to the terminal EXIT must be one of these non-branching forms.
-                bool terminal = false;
-                for (const auto& instruction : code) {
-                    if (instruction.Bits(12, 4) == 15) continue;
-                    const u32 op = instruction.Bits(0, 12);
-        uses_uniform_bank |= op == 0x83b && instruction.Bits(91, 1);
-                    if (op == 0x94d && instruction.Bits(12, 4) == 7) {
-                        terminal = true;
-                        break;
-                    }
-                    if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
-                        op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
-                        op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
-                        return fail(index, "native per-tap gather control-flow proof");
-                }
-                if (!terminal) return fail(index, "native per-tap gather terminal proof");
                 std::array<std::optional<u32>, 2> packed_offsets;
-                for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
-                    const auto& definition = code[--cursor];
-                    if (definition.Bits(12, 4) == 15) continue;
-                    const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
-                    if (op == 0xb63) {
-                        const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
-                        const u32 high = definition.Bits(64, 8);
-                        for (u32 i = 0; i < 2; ++i) {
-                            if (packed_offsets[i]) continue;
-                            const u32 reg = source_b + i;
-                            if ((target != 255 && reg >= target &&
-                                 reg < target + (high == 255 ? count : (std::min)(count, 2U))) ||
-                                (high != 255 && count > 2 && reg >= high && reg < high + count - 2))
-                                return fail(index, "native per-tap gather offset clobber");
+                if (half) {
+                    if (!bounded_control)
+                        return fail(index, "native per-tap gather control-flow proof");
+                    for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
+                        if (control_entries[cursor])
+                            return fail(index, "native per-tap gather control-flow proof");
+                        const auto& definition = code[--cursor];
+                        if (definition.Bits(12, 4) == 15) continue;
+                        const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                        if (op == 0xb63) {
+                            const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
+                            const u32 high = definition.Bits(64, 8);
+                            const bool packed = definition.Bits(79, 1);
+                            const u32 first_count = packed ? (high == 255 ? (count + 1) / 2 : 1U) : high == 255 ? count : std::min(count, 2U);
+                            const u32 second_count = packed ? (count > 2 ? 1U : 0U) : count > 2 ? count - 2 : 0U;
+                            for (u32 i = 0; i < 2; ++i) {
+                                if (packed_offsets[i]) continue;
+                                const u32 reg = source_b + i;
+                                if ((target != 255 && reg >= target && reg < target + first_count) ||
+                                    (high != 255 && reg >= high && reg < high + second_count))
+                                    return fail(index, "native per-tap gather offset clobber");
+                            }
+                            continue;
                         }
-                        continue;
+                        auto count = write_count(definition);
+                        switch (op) {
+                        case 0x827: case 0x307: case 0xa11: case 0x624: case 0x831: case 0x832:
+                            count = 1;
+                            break;
+                        case 0x805:
+                            count = 2;
+                            break;
+                        case 0x945: case 0x947:
+                            count = 0;
+                            break;
+                        }
+                        if (!count) return fail(index, "native per-tap gather offset proof");
+                        for (u32 i = 0; i < 2; ++i) {
+                            if (packed_offsets[i] || target == 255 || source_b + i < target || source_b + i >= target + *count)
+                                continue;
+                            const bool move = op == 0x802 && !definition.Bits(24, 8) && definition.words[2] == 0xf00;
+                            const bool imad = op == 0x424 && definition.Bits(24, 8) == 255 && definition.words[2] == 0x078e00ff;
+                            if ((!move && !imad) || definition.Bits(12, 4) != 7 ||
+                                (definition.words[3] & 0xc00001ffU))
+                                return fail(index, "native per-tap gather nonconstant offsets");
+                            packed_offsets[i] = definition.words[1];
+                        }
                     }
-                    if (op != 0x802 && op != 0x307 && op != 0x421 && op != 0xa20)
-                        return fail(index, "native per-tap gather offset proof");
-                    for (u32 i = 0; i < 2; ++i) {
-                        if (packed_offsets[i] || target != source_b + i) continue;
-                        if (op != 0x802 || definition.Bits(12, 4) != 7 || definition.Bits(24, 8) ||
-                            definition.words[2] != 0x00000f00)
-                            return fail(index, "native per-tap gather nonconstant offsets");
-                        packed_offsets[i] = definition.words[1];
+                } else {
+                    // The backward scan below is only sound for straight-line programs: every
+                    // instruction up to the terminal EXIT must be one of these non-branching forms.
+                    bool terminal = false;
+                    for (const auto& instruction : code) {
+                        if (instruction.Bits(12, 4) == 15) continue;
+                        const u32 op = instruction.Bits(0, 12);
+            uses_uniform_bank |= op == 0x83b && instruction.Bits(91, 1);
+                        if (op == 0x94d && instruction.Bits(12, 4) == 7) {
+                            terminal = true;
+                            break;
+                        }
+                        if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
+                            op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
+                            op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
+                            return fail(index, "native per-tap gather control-flow proof");
+                    }
+                    if (!terminal) return fail(index, "native per-tap gather terminal proof");
+                    for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
+                        const auto& definition = code[--cursor];
+                        if (definition.Bits(12, 4) == 15) continue;
+                        const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                        if (op == 0xb63) {
+                            const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
+                            const u32 high = definition.Bits(64, 8);
+                            for (u32 i = 0; i < 2; ++i) {
+                                if (packed_offsets[i]) continue;
+                                const u32 reg = source_b + i;
+                                if ((target != 255 && reg >= target &&
+                                     reg < target + (high == 255 ? count : (std::min)(count, 2U))) ||
+                                    (high != 255 && count > 2 && reg >= high && reg < high + count - 2))
+                                    return fail(index, "native per-tap gather offset clobber");
+                            }
+                            continue;
+                        }
+                        if (op != 0x802 && op != 0x307 && op != 0x421 && op != 0xa20)
+                            return fail(index, "native per-tap gather offset proof");
+                        for (u32 i = 0; i < 2; ++i) {
+                            if (packed_offsets[i] || target != source_b + i) continue;
+                            if (op != 0x802 || definition.Bits(12, 4) != 7 || definition.Bits(24, 8) ||
+                                definition.words[2] != 0x00000f00)
+                                return fail(index, "native per-tap gather nonconstant offsets");
+                            packed_offsets[i] = definition.words[1];
+                        }
                     }
                 }
                 for (const auto& packed : packed_offsets) {
