@@ -24,6 +24,11 @@ Field results (2026-11-05):
   shadow filter is pixel shader `d5e90d353c783c23` (a depth-compare gather reading a 4096²
   shadow map). Accurate also disables the GPU split, delays fences, makes DMA reads safe and
   refreshes macro parameters, so different pages go stale under each mode.
+- Transfer volume: `nvidia-smi dmon` over about 16 s of gameplay at Fast shows `txpci`
+  (GPU to host) at 9–27 GB/s (PCIe 4.0 x16 saturated) against 0.24–0.65 GB/s `rxpci`, and
+  5–30 MB/s when idle. That is the download path. An 8 MiB write mark on bindings that write
+  17–45 KB would make most of those downloads cover bytes the GPU never wrote; the
+  `*_downloads` counters below measure it.
 
 Both knobs below are experiments, read once at startup from the environment. Neither has a
 settings entry.
