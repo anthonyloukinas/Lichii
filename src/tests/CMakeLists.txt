@@ -24,6 +24,7 @@ add_executable(tests
     audio_core/batch_decoder.cpp
     audio_core/hardware_audio_codec.cpp
     core/memory_acquire.cpp
+    core/builtin_patches.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp
     video_core/ampere_fast_fusion_logged.cpp
@@ -85,6 +86,7 @@ add_executable(tests
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/event.cpp
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
@@ -145,6 +147,11 @@ if (TARGET dynarmic::dynarmic)
 endif()
 
 add_test(NAME tests COMMAND tests)
+
+if (WIN32 AND ARCHITECTURE_x86_64)
+    add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)
+    target_link_libraries(event_wait_probe PRIVATE common)
+endif()
 
 add_executable(update_checker_tests
     common/update_checker.cpp
