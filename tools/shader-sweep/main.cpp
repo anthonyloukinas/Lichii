@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
+#include "common/cityhash.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
@@ -241,9 +242,16 @@ public:
         return IsNativeProgram();
     }
     bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override {
+        if (assume_storage_pointers && !pointers.contains(CbufKey(bank, offset))) {
+            // Offline approximation: every 8-byte aligned constant-buffer word may be a pointer.
+            return true;
+        }
         return Lookup(pointers, CbufKey(bank, offset), "storage pointer classification") != 0;
     }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
+        if (assume_storage_pointers && !cbuf_values.contains(CbufKey(bank, offset))) {
+            return 0;
+        }
         return Lookup(cbuf_values, CbufKey(bank, offset), "constant buffer value");
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
@@ -306,6 +314,7 @@ public:
     void Dump(u64, u64) override {}
 
     bool captured{};
+    bool assume_storage_pointers{};
     std::vector<u64> code;
 
 private:
@@ -525,6 +534,8 @@ int main(int argc, char** argv) {
         u32 version{};
         bool lower_only{};
         bool capture_extent{};
+        bool assume_storage_pointers{};
+        std::string dump_ir;
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
             if (arg == "--help") {
@@ -533,7 +544,8 @@ int main(int argc, char** argv) {
                              "  [--format instructions|native-header] [--environment FILE "
                              "--cache-version 46|47|48|49|50]\n"
                              "  [--pipeline-key FILE] [--capture-extent] "
-                             "(--output SPV | --lower-only WORDS)\n";
+                             "(--output SPV | --lower-only WORDS) [--dump-ir FILE]\n"
+                             "  [--assume-storage-pointers]\n";
                 return 0;
             }
             if (!arg.starts_with("--")) {
@@ -544,6 +556,10 @@ int main(int argc, char** argv) {
             }
             if (arg == "--capture-extent") {
                 capture_extent = true;
+                continue;
+            }
+            if (arg == "--assume-storage-pointers") {
+                assume_storage_pointers = true;
                 continue;
             }
             if (++i == argc)
@@ -557,6 +573,8 @@ int main(int argc, char** argv) {
                 environment = value;
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
+            else if (arg == "--dump-ir")
+                dump_ir = value;
             else if (arg == "--cache-version") {
                 if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50")
                     throw std::runtime_error("Expected cache version 46, 47, 48, 49 or 50");
@@ -577,12 +595,22 @@ int main(int argc, char** argv) {
         if (format != "instructions" && format != "native-header")
             throw std::runtime_error("Invalid input format");
         for (const auto& path : {input, environment, pipeline_key}) {
+            if (!path.empty() && !dump_ir.empty() &&
+                std::filesystem::weakly_canonical(path) ==
+                    std::filesystem::weakly_canonical(dump_ir)) {
+                throw std::runtime_error("IR dump must not overwrite an input");
+            }
             if (!path.empty() && std::filesystem::weakly_canonical(path) ==
                                      std::filesystem::weakly_canonical(output)) {
                 throw std::runtime_error("Output must not overwrite an input");
             }
         }
         OfflineEnvironment env;
+        env.assume_storage_pointers = assume_storage_pointers;
+        if (assume_storage_pointers) {
+            diagnostic["assumptions"].push_back(
+                "Uncaptured constant-buffer words are storage pointers and read as zero");
+        }
         if (!environment.empty())
             env.Load(ReadFile(environment), version);
         if (requested_stage) {
@@ -724,6 +752,40 @@ int main(int argc, char** argv) {
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
+        if (env.IsNativeProgram()) {
+            // The key the emulator's frame dumps and logs use for a native program
+            // (shader_environment.cpp NativeShaderHash)
+            diagnostic["native_hash"] = fmt::format(
+                "{:016x}", Common::CityHash64(reinterpret_cast<const char*>(env.code.data()),
+                                              env.code.size() * sizeof(u64)) ^
+                               0x4f554e4345000002ULL);
+        }
+        if (env.ShaderStage() == Stage::Compute) {
+            diagnostic["workgroup"] = program.workgroup_size;
+        }
+        diagnostic["storage_buffers"] = Json::array();
+        for (const auto& descriptor : program.info.storage_buffers_descriptors) {
+            const auto& extent = descriptor.write_extent;
+            diagnostic["storage_buffers"].push_back({
+                {"cbuf_index", descriptor.cbuf_index},
+                {"cbuf_offset", descriptor.cbuf_offset},
+                {"is_written", descriptor.is_written},
+                {"bounded", extent.bounded},
+                {"const_end", extent.const_end},
+                {"local_stride", extent.local_stride},
+                {"group_stride", extent.group_stride},
+                {"guarded", extent.guarded},
+                {"guard_const", extent.guard_const},
+                {"guard_local_stride", extent.guard_local_stride},
+                {"guard_group_stride", extent.guard_group_stride},
+            });
+        }
+        if (!dump_ir.empty()) {
+            std::ofstream ir_file(dump_ir, std::ios::trunc);
+            ir_file << Shader::IR::DumpProgram(program);
+            if (!ir_file)
+                throw std::runtime_error("Cannot write " + dump_ir);
+        }
         diagnostic["phase"] = "spirv";
         Shader::Profile profile{};
         profile.supported_spirv = 0x00010400;
