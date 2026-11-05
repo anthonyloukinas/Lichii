@@ -608,6 +608,11 @@ struct Values {
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
+    // Destroys graphics pipelines unused for 9000 frames (vk_pipeline_cache.cpp).
+    // EDEN_NX2_PIPELINE_EVICT=0 forces it off.
+    SwitchableSetting<bool> evict_unused_pipelines{linkage, true, "evict_unused_pipelines",
+                                                   Category::RendererAdvanced};
+
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
 

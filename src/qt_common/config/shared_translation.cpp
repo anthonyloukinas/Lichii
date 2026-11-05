@@ -281,6 +281,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
               "on all other drivers."));
+    INSERT(Settings, evict_unused_pipelines, tr("Evict unused pipelines"),
+           tr("Destroys graphics pipelines a game has not used for 9000 frames, which saves driver "
+              "memory.\nAn evicted pipeline is fully re-translated and rebuilt when it is needed "
+              "again, which can cause objects and textures to pop in.\nTurn off on desktop GPUs "
+              "with VRAM to spare."));
     INSERT(
         Settings, use_reactive_flushing, tr("Enable Reactive Flushing"),
         tr("Uses reactive flushing instead of predictive flushing, allowing more accurate memory "

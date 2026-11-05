@@ -1037,14 +1037,23 @@ void PipelineCache::TickFrame() {
 }
 
 void PipelineCache::EvictUnusedPipelines() {
-    // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
-    // 2-3 ms below, so none are evicted there.
-    if (device.IsMoltenVK()) {
+    // "Evict unused pipelines" (per game, read on each call); EDEN_NX2_PIPELINE_EVICT=0 forces it
+    // off. Building a pipeline again on MoltenVK means a Metal compile mid-game, so none are
+    // evicted there either.
+    static const bool env_off = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT");
+        return value != nullptr && value[0] == '0';
+    }();
+    if (env_off || !Settings::values.evict_unused_pipelines.GetValue() || device.IsMoltenVK()) {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
+    // this long is destroyed. Rebuilding it is not a driver-cache hit: the pipeline is gone from
+    // graphics_cache, so the Maxwell lowering and SPIR-V translation run again on the GPU thread
+    // (~7.5 ms each measured on Ocarina of Time; one log: 434 evicted, then 177 rebuilt in 10 s for
+    // 1323 ms on the GPU thread). With asynchronous shaders its draws are discarded until it is
+    // rebuilt, which shows as pop-in every few minutes.
     constexpr u64 EvictAfterFrames = 9000;
     if (frame_count <= EvictAfterFrames) {
         return;
