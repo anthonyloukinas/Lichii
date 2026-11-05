@@ -153,6 +153,42 @@ compares the SPIR-V bytes, the `Shader::Info` field by field, and the bindings.
   table up front is unbounded. It would also leave the work itself, and the boot
   time, unchanged. It could still complement this cache for new programs later.
 
+## Programs known before first use
+
+The game's shader containers (BNSH in `Shader/*.bfsha`, `Effect/*.vsetb.byml`,
+Layout2Shader and the agl `sharcb` files) hold every dumped graphics program (1203 of
+1203) and 111 of 122 compute programs byte for byte, about 41k unique programs in all.
+Each code pool is mapped into GPU memory as one contiguous copy of the on-disk pool, so
+a program can be recognised as soon as its pool is mapped, before its first draw.
+
+That makes ahead-of-time **lowering** easy, because lowering needs only the
+instructions and the geometry flag. It is not worth doing on its own. Per program,
+lowering costs a median of 0.055 ms (mean 0.121 ms; 131 ms for all 1080 dumped graphics
+programs). A pipeline's translation costs a median of 8.79 ms in `TranslateProgram`
+plus 0.84 ms in `EmitSPIRV`. Pre-lowering would remove less than 1% of the
+GPU-thread time.
+
+Ahead-of-time **translation** is what would help, and it is what this cache is built
+to accept. Translation needs the live environment's answers: constant-buffer words
+for bindless handles, texture descriptor types, and storage pointer classification.
+Emission also needs the pipeline's runtime info. An entry made in advance is
+therefore only a guess, and replaying its queries is what makes the guess safe to
+use:
+
+1. When a pool is mapped, a worker translates its new programs, answering queries from
+   the GPU state at that moment.
+2. The results go into this cache as ordinary entries, and the SPIR-V is emitted for
+   the runtime info most common for that stage.
+3. At the first draw, the entry's queries are replayed. A stale guess fails replay and
+   is translated as today. A correct guess skips translation, and a variant miss
+   costs only the stage's own translation.
+
+This is not implemented. It addresses the part this cache cannot: programs the game
+has never drawn before, which were 25% to 58% of runtime pipeline time in the
+sessions above. The 19% of programs that make no queries could be seeded with no
+guessing at all. Their variant still depends on runtime info, though, so they too
+would be emitted for the most common state and checked by the variant key.
+
 ## Results
 
 These are `eden-cli --precompile-shaders` runs in a portable profile with the same
