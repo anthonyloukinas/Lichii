@@ -136,6 +136,9 @@ enum class Counter : u32 {
     MustFlushLockFree,     ///< Answered from the bitmap, no mutex
     MustFlushLocked,       ///< Looked up under the mutex
     MustFlushBitmapMisses, ///< EDEN_NX2_WAIT_VERIFY: bitmap said no, the ranges said yes
+    // BindSmallUniformReusing's compare in guest memory.
+    UboInPlaceSame,    ///< Small uniform buffers unchanged, nothing copied
+    UboInPlaceChanged, ///< Small uniform buffers changed, copied once
     Count,
 };
 // What the zones and drain waits measure in: the time stamp counter without the fences the wall
@@ -374,6 +377,13 @@ inline void Report(const char* thread_name = "GPU thread") {
                             per_second(Counter::MustFlushLockFree),
                             per_second(Counter::MustFlushLocked),
                             per_second(Counter::MustFlushBitmapMisses));
+    }
+    if (const u64 same = data.counters[static_cast<size_t>(Counter::UboInPlaceSame)],
+        changed = data.counters[static_cast<size_t>(Counter::UboInPlaceChanged)];
+        same != 0 || changed != 0) {
+        line += fmt::format(" | uniform buffers compared in place {:.0f} unchanged, {:.0f} changed",
+                            static_cast<double>(same) * 1e9 / window,
+                            static_cast<double>(changed) * 1e9 / window);
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
