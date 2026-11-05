@@ -81,10 +81,19 @@ struct Nx2DeferredWriteCounters {
     std::atomic<u64> native_storage_bytes{0};
     std::atomic<u64> native_marked_bytes{0};
     // Read-only bindings for pointers native programs load from records: bound, left out by the
-    // binding cap, and records read back from the host copy because GPU work wrote them.
+    // binding cap, records read back from the host copy because GPU work wrote them, and the
+    // waits for the GPU those read backs took. Compute dispatches, then task and mesh stages of
+    // draws. Cache hits: GPU-written records reused from an earlier read back (no wait).
     std::atomic<u64> native_indirect_bound{0};
     std::atomic<u64> native_indirect_dropped{0};
     std::atomic<u64> native_indirect_host_reads{0};
+    std::atomic<u64> native_indirect_waits{0};
+    std::atomic<u64> native_indirect_gfx_bound{0};
+    std::atomic<u64> native_indirect_gfx_dropped{0};
+    std::atomic<u64> native_indirect_gfx_host_reads{0};
+    std::atomic<u64> native_indirect_gfx_waits{0};
+    std::atomic<u64> native_indirect_gfx_draws{0};
+    std::atomic<u64> native_indirect_cache_hits{0};
     // Written native bindings whose mark the shader's store extent bounded this dispatch, and the
     // ones that kept the mode's full mark (unknown extent, Full, or the 64 KiB cap).
     std::atomic<u64> native_bounded_bindings{0};
@@ -150,10 +159,12 @@ inline const u64 g_nx2_compute_write_mark = [] {
 
 // EDEN_NX2_INDIRECT_POINTERS=guest (experiment): read native programs' pointer records from
 // guest memory only, even where the GPU wrote them (no host read back, no wait). Default: from
-// the buffer's host copy when the record's bytes are marked GPU-written.
+// the buffer's host copy when the record's bytes are marked GPU-written. =compute keeps the
+// bindings to compute programs (Shader::Optimization::NativeIndirectGraphicsPointers); the words
+// combine (compute,guest).
 inline const bool g_nx2_indirect_guest_reads = [] {
     const char* value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
-    return value != nullptr && std::string_view{value} == "guest";
+    return value != nullptr && std::string_view{value}.find("guest") != std::string_view::npos;
 }();
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1

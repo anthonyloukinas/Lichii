@@ -41,6 +41,9 @@ bool HasBrokenPattern(const IR::Program& program);
 bool NativeDynamicCbufPointers();
 /// EDEN_NX2_INDIRECT_POINTERS=0: native loads through a pointer loaded from a record stay unbound
 bool NativeIndirectPointers();
+/// Also for task and mesh programs (bound per draw); EDEN_NX2_INDIRECT_POINTERS=compute: compute
+/// programs only
+bool NativeIndirectGraphicsPointers();
 
 // Dual Vertex
 void VertexATransformPass(IR::Program& program);

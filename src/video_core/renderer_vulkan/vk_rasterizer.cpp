@@ -2438,6 +2438,13 @@ void RasterizerVulkan::TickFrame() {
         const u64 indirect_bound = take(c.native_indirect_bound);
         const u64 indirect_dropped = take(c.native_indirect_dropped);
         const u64 indirect_host_reads = take(c.native_indirect_host_reads);
+        const u64 indirect_waits = take(c.native_indirect_waits);
+        const u64 indirect_gfx_bound = take(c.native_indirect_gfx_bound);
+        const u64 indirect_gfx_dropped = take(c.native_indirect_gfx_dropped);
+        const u64 indirect_gfx_host_reads = take(c.native_indirect_gfx_host_reads);
+        const u64 indirect_gfx_waits = take(c.native_indirect_gfx_waits);
+        const u64 indirect_gfx_draws = take(c.native_indirect_gfx_draws);
+        const u64 indirect_cache_hits = take(c.native_indirect_cache_hits);
         LOG_INFO(Render_Vulkan,
                  "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
                  "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
@@ -2448,7 +2455,10 @@ void RasterizerVulkan::TickFrame() {
                  "native_dispatches={} native_storage_bindings={} native_bound_bytes={} "
                  "native_marked_bytes={} native_bounded={} native_unbounded={} fence_copies={} "
                  "fence_copy_bytes={} fence_copy_pool_bytes={} mapped_read_bytes={} "
-                 "write_mark={} write_mark_cap={} native_indirect(bound/dropped/host_reads)={}/{}/{}",
+                 "write_mark={} write_mark_cap={} "
+                 "native_indirect(bound/dropped/host_reads/waits)={}/{}/{}/{} "
+                 "native_indirect_gfx(draws/bound/dropped/host_reads/waits)={}/{}/{}/{}/{} "
+                 "native_indirect_cache_hits={}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
                  Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
                  applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
@@ -2460,7 +2470,9 @@ void RasterizerVulkan::TickFrame() {
                  Tegra::g_nx2_compute_write_mark == ~u64{0}
                      ? std::string{"none"}
                      : std::to_string(Tegra::g_nx2_compute_write_mark),
-                 indirect_bound, indirect_dropped, indirect_host_reads);
+                 indirect_bound, indirect_dropped, indirect_host_reads, indirect_waits,
+                 indirect_gfx_draws, indirect_gfx_bound, indirect_gfx_dropped,
+                 indirect_gfx_host_reads, indirect_gfx_waits, indirect_cache_hits);
     }
     ++render_trace_frame;
     render_trace_draws = 0;

@@ -1180,7 +1180,7 @@ void EmitContext::DefineRescalingInputPushConstant(const Info& info) {
     Name(push_constant_struct, "ResolutionInfo");
     if (indirect_bases) {
         MemberDecorate(push_constant_struct, native_indirect_bases_member_index,
-                       spv::Decoration::Offset, NATIVE_INDIRECT_BASES_OFFSET);
+                       spv::Decoration::Offset, NativeIndirectBasesOffset());
         MemberName(push_constant_struct, native_indirect_bases_member_index,
                    "native_indirect_bases");
     }
@@ -1263,16 +1263,22 @@ void EmitContext::DefineMeshDrawBase() {
 bool EmitContext::UsesNativeIndirectBases(const Info& info) const {
     // The render area block is a push constant block of its own (one per entry point allowed);
     // without the bases the indirect bindings are left out of the selection.
-    return stage == Stage::Compute && profile.unified_descriptor_binding &&
-           !info.uses_render_area &&
+    return (stage == Stage::Compute || stage == Stage::Task || stage == Stage::Mesh) &&
+           profile.unified_descriptor_binding && !info.uses_render_area &&
            std::ranges::any_of(info.storage_buffers_descriptors,
                                [](const auto& desc) { return desc.native_indirect; });
 }
 
 Id EmitContext::NativeIndirectBasesType() {
-    const Id type{TypeArray(U32[2], Const(static_cast<u32>(Info::MAX_NATIVE_INDIRECT_BINDINGS)))};
+    const Id type{
+        TypeArray(U32[2], Const(static_cast<u32>(Info::MaxNativeIndirectBindings(stage))))};
     Decorate(type, spv::Decoration::ArrayStride, static_cast<u32>(sizeof(u64)));
     return type;
+}
+
+u32 EmitContext::NativeIndirectBasesOffset() const {
+    return NATIVE_INDIRECT_BASES_OFFSET +
+           NativeIndirectBasesFirst(stage) * static_cast<u32>(sizeof(u64));
 }
 
 void EmitContext::DefineNativeIndirectBases(const Info& info) {
@@ -1280,16 +1286,33 @@ void EmitContext::DefineNativeIndirectBases(const Info& info) {
     if (!UsesNativeIndirectBases(info) || Sirit::ValidId(native_indirect_bases_push_constant)) {
         return;
     }
-    const Id push_constant_struct{TypeStruct(NativeIndirectBasesType())};
+    // A task or mesh program's draw base (DefineMeshDrawBase, at a lower offset) goes in the same
+    // block.
+    const bool draw_base{UsesMeshDrawBase() && !Sirit::ValidId(mesh_draw_base_push_constant)};
+    boost::container::static_vector<Id, 2> members;
+    if (draw_base) {
+        members.push_back(U32[1]);
+    }
+    members.push_back(NativeIndirectBasesType());
+    const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "NativeIndirectBases");
-    MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, NATIVE_INDIRECT_BASES_OFFSET);
-    MemberName(push_constant_struct, 0, "native_indirect_bases");
-    native_indirect_bases_member_index = 0;
+    if (draw_base) {
+        MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, MeshDrawBaseOffset());
+        MemberName(push_constant_struct, 0, "mesh_draw_base");
+        mesh_draw_base_member_index = 0;
+    }
+    native_indirect_bases_member_index = draw_base ? 1U : 0U;
+    MemberDecorate(push_constant_struct, native_indirect_bases_member_index,
+                   spv::Decoration::Offset, NativeIndirectBasesOffset());
+    MemberName(push_constant_struct, native_indirect_bases_member_index, "native_indirect_bases");
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     native_indirect_bases_push_constant =
         AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(native_indirect_bases_push_constant, "native_indirect_bases_push_constants");
+    if (draw_base) {
+        mesh_draw_base_push_constant = native_indirect_bases_push_constant;
+    }
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(native_indirect_bases_push_constant);
     }

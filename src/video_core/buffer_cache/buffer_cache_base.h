@@ -330,6 +330,12 @@ public:
                                            std::span<const Shader::NativeIndirectSlot> slots,
                                            std::span<u64> bases);
 
+    /// BindComputeIndirectStorageBuffers for a task or mesh program of a draw (graphics stage
+    /// `stage`), after its other storage buffers
+    void BindGraphicsIndirectStorageBuffers(size_t stage, size_t first_index,
+                                            std::span<const Shader::NativeIndirectSlot> slots,
+                                            std::span<u64> bases);
+
     void UnbindComputeTextureBuffers();
 
     void BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_addr, u32 size, PixelFormat format,
@@ -631,8 +637,36 @@ private:
                                                  bool native_pointer) const;
 
     /// The 64-bit pointers at addrs (0 for a null or unmapped address), from the buffers' host
-    /// copies where GPU work wrote them
-    void ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs, std::span<u64> out);
+    /// copies where GPU work wrote them (graphics: counted as a draw's)
+    void ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs, std::span<u64> out,
+                                    bool graphics);
+
+    struct NativeIndirectResult {
+        size_t bound;   ///< bindings written to `out` (and `bases`)
+        size_t dropped; ///< distinct targets left out because `out` was full
+    };
+    /// Reads the records' pointers (cbuf_address(index): the constant buffer's address, 0 when
+    /// unbound) and binds the distinct targets other_bindings don't cover to `out`
+    template <typename CbufAddress>
+    NativeIndirectResult ResolveNativeIndirectBindings(
+        std::span<const Shader::NativeIndirectSlot> slots, CbufAddress&& cbuf_address,
+        std::span<const Binding> other_bindings, std::span<Binding> out, std::span<u64> bases,
+        bool graphics);
+
+    /// Drops the cached pointer words GPU work, a copy or the CPU is writing over
+    void InvalidateNativeIndirectCache(DAddr device_addr, u64 size);
+
+    /// Enables a graphics storage buffer slot (driver limit accounting); false when over it
+    bool EnableGraphicsStorageBuffer(size_t stage, size_t ssbo_index, bool is_written);
+
+    struct NativeIndirectCachedPointer {
+        DAddr device_addr;
+        u64 value;
+    };
+    static constexpr size_t MAX_NATIVE_INDIRECT_CACHE = 64;
+    /// Pointer words read back from GPU-written records, valid until their bytes are written
+    boost::container::small_vector<NativeIndirectCachedPointer, MAX_NATIVE_INDIRECT_CACHE>
+        native_indirect_cache;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
