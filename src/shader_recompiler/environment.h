@@ -69,6 +69,7 @@ struct ConstBufferAddr {
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
 };
 
+// A query added here must also be recorded in VideoCommon::TranslationCache::RecordingEnvironment.
 class Environment {
 public:
     virtual ~Environment() = default;
@@ -106,6 +107,10 @@ public:
     [[nodiscard]] virtual bool HasHLEMacroState() const = 0;
 
     [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
+
+    /// False when the translation reads state its recorded inputs do not cover (code past the
+    /// cached size, trap guards); such programs are not kept in the translation cache.
+    [[nodiscard]] virtual bool CanCacheTranslation() const { return true; }
 
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
