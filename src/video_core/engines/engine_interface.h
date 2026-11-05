@@ -43,6 +43,11 @@ public:
         }
     }
 
+    /// In a method_sink entry: a write the GPU thread split's front found only stores the
+    /// register's value although execution_mask has the register (GpuSplit::SinkMethod).
+    /// Methods are 16-bit.
+    static constexpr u32 SplitPlainTag = 1U << 16;
+
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
     /// Methods that can write memory in command order (uploads, reports, copies, dispatches):
     /// the split's front waits for the last one sent before its macros read memory. Draws and

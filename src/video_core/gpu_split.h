@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -104,6 +105,26 @@ public:
         return enabled;
     }
 
+    /// EDEN_NX2_MACRO_SINK=1 (default off): the state writes the front's macros make (3D
+    /// registers outside execution_mask; native compute registers that only store their value)
+    /// go to the back's method sink like the command list's own state writes, instead of one
+    /// CallMethod each; the back applies its sink, in order, before the engine's next executable
+    /// method. Compute also drops writes that keep a register's value.
+    [[nodiscard]] static bool MacroSink() {
+        return macro_sink;
+    }
+
+    /// The front's writes that took a batched path (EDEN_NX2_MACRO_SINK), logged every 10 s.
+    enum class Batched : u32 {
+        MacroSunk,   ///< 3D macro state writes sent to the method sink
+        ComputeSunk, ///< Compute state writes sent to the method sink
+        ComputeSame, ///< Compute state writes dropped: the register held the value
+        Count,
+    };
+    void CountBatched(Batched counter, u64 amount = 1) {
+        batched[static_cast<size_t>(counter)] += amount;
+    }
+
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
@@ -162,6 +183,17 @@ public:
                    (u64{argument} << 32);
         Commit(1);
         NoteMethod(engine, method, memory_noted);
+    }
+    /// EDEN_NX2_MACRO_SINK: a write that only stores a register's value, to an engine whose
+    /// execution_mask has the register (native compute): the back puts it in the engine's method
+    /// sink tagged EngineInterface::SplitPlainTag, applied before the engine's next other write.
+    void SinkMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(1);
+        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Sink | (u64{method & 0xffff} << 8) |
+                   (u64{argument} << 32);
+        Commit(1);
+        NoteMethod(engine, method, false);
     }
 
     /// Defer flag: the call doesn't end EDEN_NX2_FAST_DRAW reuse (nx2_fast_draw.h).
@@ -277,6 +309,13 @@ private:
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    /// Method: into the method sink, tagged (SinkMethod). Call entries use bit 7 as FastDrawNeutral.
+    static constexpr u64 Sink = 1 << 7;
+
+    static inline const bool macro_sink = [] {
+        const char* value = std::getenv("EDEN_NX2_MACRO_SINK");
+        return value != nullptr && value[0] != '0';
+    }();
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -371,6 +410,10 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    std::array<u64, static_cast<size_t>(Batched::Count)> batched{};
+    std::chrono::steady_clock::time_point batched_since{};
+    u32 publishes{};
+    void ReportBatched();
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
