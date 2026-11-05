@@ -821,6 +821,13 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
             Nx2Profile::Add(Nx2Profile::Counter::DownloadBytesOnDmaPages, on_dma_pages);
         }
         download_ranges.Add(orig_device_addr, copy.size);
+        if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+            auto& c = Tegra::g_nx2_deferred_writes;
+            Tegra::Nx2Count(c.fence_copies, 1);
+            Tegra::Nx2Count(c.fence_copy_bytes, copy.size);
+            Tegra::Nx2Count(c.fence_copy_pool_bytes,
+                            Tegra::Nx2PoolOverlap(orig_device_addr, copy.size));
+        }
         buffer.MarkUsage(copy.src_offset, copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, copies, false);
         normalized_copies.push_back(second_copy);
@@ -2547,6 +2554,11 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
             runtime.Wait(buffer.LastUsageTick());
+            if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+                for (const BufferCopy& copy : copies) {
+                    Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.mapped_read_bytes, copy.size);
+                }
+            }
             for (const BufferCopy& copy : copies) {
                 device_memory.WriteBlockUnsafe(buffer.CpuAddr() + copy.src_offset,
                                                mapped.data() + copy.src_offset, copy.size);

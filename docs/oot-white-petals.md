@@ -32,6 +32,61 @@ Field results (2026-11-05):
 Both knobs below are experiments, read once at startup from the environment. Neither has a
 settings entry.
 
+## The PCIe readback (performance)
+
+Run (b), `EDEN_NX2_COMPUTE_WRITE_MARK=65536` at Fast, 6,632 frames at about 35 fps, field verdict
+"runs way better":
+
+| | full mark (run a) | 64 KiB mark (run b) |
+|---|---|---|
+| `txpci` (GPU to host), nvidia-smi | 9–27 GB/s | mean 0.17 GB/s, max 0.93 |
+| pool bytes collected / applied per frame | 136 / 96 KB (40 KB short) | 131 / 125 KB (6 KB short) |
+| fence downloads written back per frame | 16 MB | 2.8 MB |
+| pool share of those | 4.9 MB | 1.5 MB |
+
+The chain, as far as it is measured:
+
+1. 8 MiB mark: each native dispatch's storage binding is marked GPU-written over up to 8 MiB
+   (about 130 dispatches a frame, 17–45 KB really written each). Measured.
+2. Pages counted GPU-written: `gpu_modified_ranges` and the tracker's GPU bits cover the CPU's
+   own data in the pool. Measured in the dump.
+3. GPU-to-host traffic: every range in a download-at-fence region is copied by the GPU into
+   host staging at each fence (`CommitAsyncFlushesHigh`). That copy is GPU-to-host and shows as
+   `txpci`. **Leading candidate, not yet measured:** the next dispatch's 8 MiB mark subtracts
+   the range from `pending_download_ranges` again, so `PopAsyncBuffers` writes back little (the
+   16 MB above) while the GPU has copied far more. `fence_copy_bytes` measures the copy itself.
+   The other GPU-to-host candidate is the CPU reading host-visible device-local (ReBAR) buffers
+   directly in `DownloadBufferMemory`'s mapped branch (`mapped_read_bytes`); run (a) had sync
+   downloads, which include that branch, near 0, so it is the weaker candidate.
+4. Link saturated: 9–27 GB/s on PCIe 4.0 x16. The clamp cuts it by about 100x. Measured.
+
+The `DeviceLocal` staging requests in `vk_compute_pass.cpp` and the BC re-encode in
+`vk_texture_cache.cpp` are GPU-only scratch (a shader writes, a later GPU pass reads) and do not
+cross PCIe.
+
+## Toward a proper fix
+
+The clamp is a guess about how far a dispatch writes. What a real bound could come from:
+
+- **The guest binding.** NVN binds storage with an address and a size, but a native Switch 2
+  program reads a bare 64-bit pointer from its constant buffer; the word after it is another
+  parameter, not a size (`StorageBufferBinding`). No size is available here.
+- **BNSH reflection.** `tools/bnsh.py` and `shader-index.json` locate the control section and the
+  code; their uniform and sampler tables are known. A storage-block size table has not been found.
+  In nn::gfx reflection (Switch 1), storage ("unordered access") buffers carry names and slots
+  but no sizes, so even if found it would not bound them. Unverified for NVN2.
+- **The shader IR (recommended).** `global_memory_to_storage_buffer_pass.cpp` already tracks
+  each global access back to its constant-buffer pointer and folds immediate offsets
+  (`imm_offset`), but `StorageBufferDescriptor` keeps only `cbuf_index`, `cbuf_offset`, `count`
+  and `is_written`. For each written storage buffer, record a store extent:
+  `max_const_offset + access_size` when every store's offset is constant, or
+  `stride * invocation_index + const` when it is affine in the global invocation id, else
+  unbounded. At dispatch, the QMD's grid and block sizes turn that into bytes, and
+  `BindHostComputeStorageBuffers` marks `min(binding, extent)`. Skinning writes one palette per
+  invocation, which is affine. Anything unbounded keeps the 8 MiB mark, so nothing regresses.
+- **A per-game heuristic** (this knob as a setting) is the fallback if the IR route stalls. It
+  is wrong for any title whose native compute really writes further than the cap.
+
 ## `EDEN_NX2_COMPUTE_WRITE_MARK=<bytes>`
 
 Limits how much of a **native** compute storage binding is marked GPU-written to
@@ -78,6 +133,10 @@ totals since the previous line:
 - `native_dispatches`, `native_storage_bindings`, `native_bound_bytes`, `native_marked_bytes`:
   native compute dispatches this frame, their storage bindings, the bytes those bindings cover
   (up to 8 MiB each) and the bytes marked GPU-written for them after the clamp.
+- `fence_copies`, `fence_copy_bytes`, `fence_copy_pool_bytes`: fence downloads as the GPU
+  copies them into host staging, before superseded ranges are dropped.
+- `mapped_read_bytes`: bytes the CPU read straight from host-visible device-local buffers in
+  `DownloadBufferMemory` (also counted in `sync_downloads`).
 - `write_mark`: the active `EDEN_NX2_COMPUTE_WRITE_MARK` (`full` when unset).
 
 Field run (a), 3,808 frames at Fast: collected writes every frame, not alternating (about 290 KB

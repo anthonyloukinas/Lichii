@@ -1949,6 +1949,10 @@ void RasterizerVulkan::TickFrame() {
         const u64 native_bindings = take(c.native_storage_bindings);
         const u64 native_bound_bytes = take(c.native_storage_bytes);
         const u64 native_marked_bytes = take(c.native_marked_bytes);
+        const u64 fence_copies = take(c.fence_copies);
+        const u64 fence_copy_bytes = take(c.fence_copy_bytes);
+        const u64 fence_copy_pool_bytes = take(c.fence_copy_pool_bytes);
+        const u64 mapped_read_bytes = take(c.mapped_read_bytes);
         LOG_INFO(Render_Vulkan,
                  "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
                  "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
@@ -1957,13 +1961,15 @@ void RasterizerVulkan::TickFrame() {
                  "sync_download_calls={} staging(requests/bytes) upload={} download={} "
                  "device_local={} buffer_upload_bytes={} native_storage_upload_bytes={} "
                  "native_dispatches={} native_storage_bindings={} native_bound_bytes={} "
-                 "native_marked_bytes={} write_mark={}",
+                 "native_marked_bytes={} fence_copies={} fence_copy_bytes={} "
+                 "fence_copy_pool_bytes={} mapped_read_bytes={} write_mark={}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
                  Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
                  applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
                  sync_downloads, sync_calls, staging_upload, staging_download, staging_device,
                  buffer_upload_bytes, native_upload_bytes, native_dispatches, native_bindings,
-                 native_bound_bytes, native_marked_bytes,
+                 native_bound_bytes, native_marked_bytes, fence_copies, fence_copy_bytes,
+                 fence_copy_pool_bytes, mapped_read_bytes,
                  Tegra::g_nx2_compute_write_mark == ~u64{0}
                      ? std::string{"full"}
                      : std::to_string(Tegra::g_nx2_compute_write_mark));
