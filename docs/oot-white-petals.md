@@ -60,6 +60,14 @@ The chain, as far as it is measured:
    downloads, which include that branch, near 0, so it is the weaker candidate.
 4. Link saturated: 9–27 GB/s on PCIe 4.0 x16. The clamp cuts it by about 100x. Measured.
 
+Upstream PR #104 (`0bf0f834b9`, "download only the Preflushable pages of a GPU write at fences",
+`EDEN_NX2_EXACT_PREFLUSH=0` reverts it) attacks step 3 from the download side: a GPU write that
+touched any Preflushable page used to be queued whole, so an 8 MiB mark with one CPU-read page
+was copied back at every fence. It now queues only the Preflushable pages. The clamp attacks
+step 1, the write mark itself, which also decides which CPU writes are deferred (the leaves). The
+two are complementary. With both in, what is left to characterise is Daniel's residual: leaves
+fixed, occasional flashing remains, fog better but blown out.
+
 The `DeviceLocal` staging requests in `vk_compute_pass.cpp` and the BC re-encode in
 `vk_texture_cache.cpp` are GPU-only scratch (a shader writes, a later GPU pass reads) and do not
 cross PCIe.
@@ -102,6 +110,21 @@ are untouched. Accepts decimal or `0x` hex.
   stale CPU uploads can overwrite compute results, and CPU reads of compute output see old data.
 
 If the leaves stop flashing with a small limit on Fast settings, the over-mark is the cause.
+
+A/B ladder for the residual, on a build with PR #104 (Fast, reactive flushing off,
+`EDEN_NX2_DEFERRED_WRITE_LOG=1` on every run):
+
+| Mark | Reading |
+|---|---|
+| unset | baseline with PR #104 alone |
+| `262144` | if the residual flashing goes away compared with 64 KiB, some dispatches write past 64 KiB: under-marking (the CPU reads stale data from pages the GPU really wrote) |
+| `65536` | run (b) |
+| `16384` | if flashing gets worse than at 64 KiB, under-marking; if it stays the same, the residual is leftover deferral (`pool_bytes` greater than `applied_pool_bytes`) |
+| `0` | nothing marked: everything that relies on compute output read back by the CPU breaks |
+
+Under-marking shows as worse flashing and broken compute-fed geometry as the mark shrinks.
+Leftover deferral does not change with the mark below about 64 KiB, and the collected-minus-applied
+pool bytes stay above zero.
 
 ## `EDEN_NX2_DEFERRED_WRITE_LOG=1`
 
