@@ -65,6 +65,20 @@ struct Nx2DeferredWriteCounters {
     std::array<std::atomic<u64>, 2> download_bytes{};
     std::array<std::atomic<u64>, 2> download_pool_bytes{};
     std::atomic<u64> sync_download_calls{0};
+    // StagingBufferPool::Request, every buffer- and texture-cache staging allocation:
+    // [0] Upload (host -> GPU), [1] Download (GPU -> host), [2] DeviceLocal (GPU-side scratch).
+    std::array<std::atomic<u64>, 3> staging_requests{};
+    std::array<std::atomic<u64>, 3> staging_bytes{};
+    // Buffer-cache uploads of CPU-modified pages (SynchronizeBuffer), and the part done while
+    // binding native compute storage buffers.
+    std::atomic<u64> buffer_upload_bytes{0};
+    std::atomic<u64> native_storage_upload_bytes{0};
+    // Native (Switch 2) compute dispatches, their storage bindings, the bytes those bindings
+    // cover and the bytes marked GPU-written for them (after EDEN_NX2_COMPUTE_WRITE_MARK).
+    std::atomic<u64> native_dispatches{0};
+    std::atomic<u64> native_storage_bindings{0};
+    std::atomic<u64> native_storage_bytes{0};
+    std::atomic<u64> native_marked_bytes{0};
 };
 inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
 
@@ -89,6 +103,10 @@ inline void Nx2NoteAppliedWrite(u64 address, u64 size) {
     c.applied_ranges.fetch_add(1, std::memory_order_relaxed);
     c.applied_bytes.fetch_add(size, std::memory_order_relaxed);
     c.applied_pool_bytes.fetch_add(Nx2PoolOverlap(address, size), std::memory_order_relaxed);
+}
+
+inline void Nx2Count(std::atomic<u64>& counter, u64 value) {
+    counter.fetch_add(value, std::memory_order_relaxed);
 }
 
 inline void Nx2NoteDownload(bool sync, u64 address, u64 size) {

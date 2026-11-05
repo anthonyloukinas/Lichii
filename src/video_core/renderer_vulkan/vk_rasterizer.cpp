@@ -1937,16 +1937,33 @@ void RasterizerVulkan::TickFrame() {
         };
         const std::string fence_downloads = down(0);
         const std::string sync_downloads = down(1);
+        const auto staging = [&](size_t kind) {
+            return fmt::format("{}/{}", take(c.staging_requests[kind]), take(c.staging_bytes[kind]));
+        };
+        const std::string staging_upload = staging(0);
+        const std::string staging_download = staging(1);
+        const std::string staging_device = staging(2);
+        const u64 buffer_upload_bytes = take(c.buffer_upload_bytes);
+        const u64 native_upload_bytes = take(c.native_storage_upload_bytes);
+        const u64 native_dispatches = take(c.native_dispatches);
+        const u64 native_bindings = take(c.native_storage_bindings);
+        const u64 native_bound_bytes = take(c.native_storage_bytes);
+        const u64 native_marked_bytes = take(c.native_marked_bytes);
         LOG_INFO(Render_Vulkan,
                  "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
                  "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
                  "applied_ranges={} applied_bytes={} applied_pool_bytes={} "
                  "fence_downloads(ranges/bytes/pool_bytes)={} sync_downloads={} "
-                 "sync_download_calls={} write_mark={}",
+                 "sync_download_calls={} staging(requests/bytes) upload={} download={} "
+                 "device_local={} buffer_upload_bytes={} native_storage_upload_bytes={} "
+                 "native_dispatches={} native_storage_bindings={} native_bound_bytes={} "
+                 "native_marked_bytes={} write_mark={}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
                  Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
                  applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
-                 sync_downloads, sync_calls,
+                 sync_downloads, sync_calls, staging_upload, staging_download, staging_device,
+                 buffer_upload_bytes, native_upload_bytes, native_dispatches, native_bindings,
+                 native_bound_bytes, native_marked_bytes,
                  Tegra::g_nx2_compute_write_mark == ~u64{0}
                      ? std::string{"full"}
                      : std::to_string(Tegra::g_nx2_compute_write_mark));
