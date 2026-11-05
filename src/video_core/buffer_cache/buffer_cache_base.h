@@ -153,6 +153,8 @@ public:
     std::array<u32, NUM_STAGES> written_storage_buffers{};
     u32 enabled_compute_storage_buffers = 0;
     u32 written_compute_storage_buffers = 0;
+    // Bound by a native (Switch 2) compute program, whose pointers carry no size.
+    u32 native_compute_storage_buffers = 0;
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -234,7 +236,8 @@ public:
     void TickFrame();
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
-                               std::span<const MultiRangeSegment> pool);
+                               std::span<const MultiRangeSegment> pool,
+                               u64 write_mark_limit = ~u64{0});
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);

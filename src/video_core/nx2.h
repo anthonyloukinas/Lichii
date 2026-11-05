@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -19,6 +20,64 @@ namespace Tegra {
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
+
+// EDEN_NX2_DEFERRED_WRITE_LOG=1 (experiment, docs/oot-white-petals.md): count guest CPU writes to
+// GPU-cached memory that are only collected (core/memory.cpp), and how many of the collected ones
+// are applied by InvalidateGPUCache, then log the totals once per frame. Off: one branch on a
+// constant bool per collected write.
+inline const bool g_nx2_deferred_write_log = [] {
+    const char* value = std::getenv("EDEN_NX2_DEFERRED_WRITE_LOG");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}();
+// The device range of Ocarina of Time's skinning pool in the white-petals frame dump.
+inline constexpr u64 Nx2DeferredPoolBegin = 0x2b300000;
+inline constexpr u64 Nx2DeferredPoolEnd = 0x2b900000;
+struct Nx2DeferredWriteCounters {
+    std::atomic<u64> collected_writes{0};
+    std::atomic<u64> collected_bytes{0};
+    std::atomic<u64> pool_writes{0};
+    std::atomic<u64> pool_bytes{0};
+    std::atomic<u64> applied_calls{0};
+    std::atomic<u64> applied_ranges{0};
+    std::atomic<u64> applied_bytes{0};
+    std::atomic<u64> applied_pool_bytes{0};
+};
+inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
+
+inline u64 Nx2PoolOverlap(u64 address, u64 size) {
+    const u64 begin = std::max<u64>(address, Nx2DeferredPoolBegin);
+    const u64 end = std::min<u64>(address + size, Nx2DeferredPoolEnd);
+    return end > begin ? end - begin : 0;
+}
+
+inline void Nx2NoteCollectedWrite(u64 address, u64 size) {
+    auto& c = g_nx2_deferred_writes;
+    c.collected_writes.fetch_add(1, std::memory_order_relaxed);
+    c.collected_bytes.fetch_add(size, std::memory_order_relaxed);
+    if (const u64 overlap = Nx2PoolOverlap(address, size); overlap != 0) {
+        c.pool_writes.fetch_add(1, std::memory_order_relaxed);
+        c.pool_bytes.fetch_add(overlap, std::memory_order_relaxed);
+    }
+}
+
+inline void Nx2NoteAppliedWrite(u64 address, u64 size) {
+    auto& c = g_nx2_deferred_writes;
+    c.applied_ranges.fetch_add(1, std::memory_order_relaxed);
+    c.applied_bytes.fetch_add(size, std::memory_order_relaxed);
+    c.applied_pool_bytes.fetch_add(Nx2PoolOverlap(address, size), std::memory_order_relaxed);
+}
+
+// EDEN_NX2_COMPUTE_WRITE_MARK=<bytes> (experiment, docs/oot-white-petals.md): the most a native
+// compute storage binding claims to have written. Unset: the whole binding (up to 8 MiB). 0: none.
+inline const u64 g_nx2_compute_write_mark = [] {
+    const char* value = std::getenv("EDEN_NX2_COMPUTE_WRITE_MARK");
+    if (value == nullptr || value[0] == '\0') {
+        return ~u64{0};
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 0);
+    return end == value ? ~u64{0} : static_cast<u64>(parsed);
+}();
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read

@@ -108,8 +108,14 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
+            if (g_nx2_deferred_write_log) [[unlikely]] {
+                Nx2NoteAppliedWrite(address, size);
+            }
             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
         });
+        if (g_nx2_deferred_write_log) [[unlikely]] {
+            g_nx2_deferred_writes.applied_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         system.GatherGPUDirtyMemory(callback_writes);
     }
 
