@@ -110,6 +110,8 @@ public:
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     void ProbeMeshCountSource(u64 seq, DAddr addr, u32 size) override;
+    /// EDEN_NX2_MESH_COUNT_TRACE: logs zpass_pixel_count_enable transitions at `site`.
+    void TraceZpassEnable(bool enable, const char* site);
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -400,6 +402,11 @@ private:
     /// Vertex and fragment hashes of the draw being recorded, for GPU timing.
     std::pair<u64, u64> trace_draw_hashes{};
     std::array<u64, 6> mesh_count_hashes{}; ///< EDEN_NX2_MESH_COUNT_TRACE: the draw's shaders
+    // EDEN_NX2_MESH_COUNT_TRACE: the last zpass_pixel_count_enable passed to the query cache,
+    // and the calls this frame.
+    u64 zpass_trace_frame{};
+    u32 zpass_trace_calls{};
+    bool zpass_trace_enabled{};
     u32 trace_captures{};
     u32 trace_capture_dropped{};
     u32 trace_failure_details{};

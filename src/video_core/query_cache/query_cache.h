@@ -24,6 +24,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
@@ -268,6 +269,19 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    // EDEN_NX2_MESH_COUNT_TRACE: which report a macro DMA read finds and when it is written.
+    u64 trace_id{};
+    if (Nx2MeshCountTrace::g_enabled) {
+        using Nx2MeshCountTrace::QueryPath;
+        const QueryPath path = is_fence ? QueryPath::Fence
+                               : !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload
+                                   ? QueryPath::Immediate
+                                   : QueryPath::SyncOperation;
+        trace_id = Nx2MeshCountTrace::NoteQueryRequest(
+            addr, cpu_addr, static_cast<u32>(requested_type), static_cast<u32>(counter_type),
+            payload, static_cast<u32>(flags), has_timestamp, is_fence,
+            requested_type != counter_type, path);
+    }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -285,7 +299,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type] {
+                                     asid = gpu_memory->GetID(), counter_type, trace_id] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -293,6 +307,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          "reason=invalidated flags={:#x}",
                          trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
                          static_cast<u32>(query_base->flags));
+            }
+            if (trace_id != 0) {
+                Nx2MeshCountTrace::NoteQueryWrite(trace_id, 0,
+                                                  Nx2MeshCountTrace::QueryStatus::Invalidated);
             }
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
@@ -306,6 +324,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          "reason=unsynchronized flags={:#x}",
                          trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
                          static_cast<u32>(query_base->flags));
+            }
+            if (trace_id != 0) {
+                Nx2MeshCountTrace::NoteQueryWrite(trace_id, 0,
+                                                  Nx2MeshCountTrace::QueryStatus::Unsynced);
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
@@ -325,6 +347,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             std::memcpy(pointer, &value, sizeof(value));
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        if (trace_id != 0) {
+            Nx2MeshCountTrace::NoteQueryWrite(trace_id, query_base->value,
+                                              Nx2MeshCountTrace::QueryStatus::Written);
+        }
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,
@@ -351,6 +377,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 std::memcpy(pointer, &payload, sizeof(payload));
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+            if (trace_id != 0) {
+                Nx2MeshCountTrace::NoteQueryWrite(trace_id, payload,
+                                                  Nx2MeshCountTrace::QueryStatus::Immediate);
+            }
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
                 LOG_INFO(HW_GPU,
                          "DKB_QUERY write n={} path=immediate as={} gpu={:#x} device={:#x} type={} "

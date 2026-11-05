@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_cache.h"
 #include "video_core/rasterizer_interface.h"
@@ -181,6 +182,9 @@ public:
         });
 
         has_started = true;
+        if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+            VideoCommon::Nx2MeshCountTrace::NoteZpassHost(true);
+        }
     }
 
 
@@ -193,6 +197,9 @@ public:
             cmdbuf.EndQuery(query_pool, static_cast<u32>(query_index));
         });
         has_started = false;
+        if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+            VideoCommon::Nx2MeshCountTrace::NoteZpassHost(false);
+        }
     }
 
     void ResetCounter() override {
@@ -355,6 +362,10 @@ public:
         }
         if (!current_query) {
             new_query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
+            if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+                VideoCommon::Nx2MeshCountTrace::NoteZpassNoCounter(address, has_timestamp,
+                                                                   has_started);
+            }
             return index;
         }
         new_query->start_bank_id = current_query->start_bank_id;
@@ -403,6 +414,10 @@ public:
             });
             query->value = total;
             query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
+            if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+                VideoCommon::Nx2MeshCountTrace::NoteZpassHostResult(query->guest_address, total,
+                                                                    query->size_slots);
+            }
             if (const u64 trace =
                     VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::HostResult)) {
                 LOG_INFO(Render_Vulkan,

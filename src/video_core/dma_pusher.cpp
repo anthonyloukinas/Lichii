@@ -27,6 +27,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -101,6 +102,7 @@ bool DmaPusher::Step() {
 
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
+        nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Prefetch);
         command_resume_offset +=
             ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         if (puller.HasPendingAcquire()) {
@@ -208,18 +210,21 @@ bool DmaPusher::Step() {
                 header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Submitted);
             command_resume_offset += ProcessCommands(commands, 0);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Copy);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
@@ -228,6 +233,7 @@ bool DmaPusher::Step() {
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Slow);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
@@ -431,6 +437,12 @@ void DmaPusher::WatchArgument(u32 method, u32 argument) const {
     }
 }
 
+// EDEN_NX2_MESH_COUNT_TRACE: where a macro parameter word came from.
+static VideoCommon::Nx2MeshCountTrace::PushSource PushSource(GPUVAddr segment, u8 entry_path) {
+    return {.va = segment,
+            .path = static_cast<VideoCommon::Nx2MeshCountTrace::EntryPath>(entry_path)};
+}
+
 bool DmaPusher::WantsSegment() const {
     // Only macro parameters and compute uploads read the engine's current_dma_segment.
     const auto engine = subchannel_type[dma_state.subchannel];
@@ -473,7 +485,8 @@ void DmaPusher::CallMethod(u32 argument) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
                         maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
-                                                   dma_state.is_last_call);
+                                                   dma_state.is_last_call,
+                                                   PushSource(segment, nx2_entry_path));
                         return;
                     }
                 } else if (type == Engines::EngineTypes::KeplerCompute) {
@@ -532,7 +545,8 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
                         maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
-                                                        num_methods, dma_state.method_count);
+                                                        num_methods, dma_state.method_count,
+                                                        PushSource(segment, nx2_entry_path));
                         return;
                     }
                 } else if (type == Engines::EngineTypes::KeplerCompute) {

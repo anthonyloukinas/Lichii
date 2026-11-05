@@ -3206,10 +3206,13 @@ public:
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
+    /// `source` is where the pushbuffer had the argument (EDEN_NX2_MESH_COUNT_TRACE only).
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                         u32 argument, bool is_last_call);
+                         u32 argument, bool is_last_call,
+                         VideoCommon::Nx2MeshCountTrace::PushSource source);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                              const u32* base_start, u32 amount, u32 methods_pending);
+                              const u32* base_start, u32 amount, u32 methods_pending,
+                              VideoCommon::Nx2MeshCountTrace::PushSource source);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3411,6 +3414,9 @@ private:
     /// holding the registers; `split` is set on the split's front.
     void TraceMeshCount(VideoCommon::GpuSplit* split, const u32* reg_array, u32 value,
                         bool from_macro);
+    /// EDEN_NX2_MESH_COUNT_TRACE, split front: a register write (count writes, report ops).
+    void TraceFrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value,
+                         bool from_macro);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

@@ -782,6 +782,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    TraceZpassEnable(maxwell3d->regs.zpass_pixel_count_enable != 0, "draw");
     const std::optional<u32> probe =
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
     {
@@ -1405,6 +1406,7 @@ void RasterizerVulkan::DrawTexture() {
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    TraceZpassEnable(maxwell3d->regs.zpass_pixel_count_enable != 0, "draw_texture");
     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
@@ -1582,6 +1584,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // would begin it outside the pass and end it inside the next draw's pass.
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                               !can_defer_clear && regs.zpass_pixel_count_enable);
+    TraceZpassEnable(!can_defer_clear && regs.zpass_pixel_count_enable, "clear");
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
@@ -1861,6 +1864,18 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
     gpu.InvalidateGPUCache();
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2FlushListPages(pages);
+}
+
+void RasterizerVulkan::TraceZpassEnable(bool enable, const char* site) {
+    if (!VideoCommon::Nx2MeshCountTrace::g_enabled) {
+        return;
+    }
+    if (zpass_trace_frame != render_trace_frame) {
+        zpass_trace_frame = render_trace_frame;
+        zpass_trace_calls = 0;
+    }
+    VideoCommon::Nx2MeshCountTrace::NoteZpassEnable(zpass_trace_enabled, enable, site,
+                                                    render_trace_frame, zpass_trace_calls++);
 }
 
 void RasterizerVulkan::ProbeMeshCountSource(u64 seq, DAddr addr, u32 size) {
