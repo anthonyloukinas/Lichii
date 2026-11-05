@@ -600,7 +600,9 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     return out;
 }
 
-void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+void PatchManager::CollectLayeredFSDirs(ContentRecordType type, std::vector<VirtualDir>& layers,
+                                        std::vector<VirtualDir>& layers_ext,
+                                        std::vector<std::string>* names) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
     if ((type != ContentRecordType::Program && type != ContentRecordType::Data &&
@@ -610,17 +612,25 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     }
 
     const auto disabled = GetDisabledAddons();
-    std::vector<VirtualDir> patch_dirs = load_dir->GetSubdirectories();
-    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
+    std::vector<VirtualDir> patch_dirs;
+    if (load_dir != nullptr) {
+        patch_dirs = load_dir->GetSubdirectories();
+    }
+    if (sdmc_load_dir != nullptr &&
+        std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
         patch_dirs.push_back(sdmc_load_dir);
     }
     std::sort(patch_dirs.begin(), patch_dirs.end(),
               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
 
-    std::vector<VirtualDir> layers;
-    std::vector<VirtualDir> layers_ext;
     layers.reserve(patch_dirs.size() + 1);
     layers_ext.reserve(patch_dirs.size() + 1);
+    const auto add_layer = [&](const VirtualDir& subdir, VirtualDir dir) {
+        if (names != nullptr) {
+            names->push_back(fmt::format("{}/{}", subdir->GetName(), dir->GetName()));
+        }
+        layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(dir)));
+    };
     for (const auto& subdir : patch_dirs) {
         if (std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) != disabled.cend()) {
             continue;
@@ -628,12 +638,12 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
 
         auto romfs_dir = FindSubdirectoryCaseless(subdir, "romfs");
         if (romfs_dir != nullptr)
-            layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfs_dir)));
+            add_layer(subdir, std::move(romfs_dir));
 
         // Support for romfslite introduced in Atmosphere 1.9.5
         auto romfslite_dir = FindSubdirectoryCaseless(subdir, "romfslite");
         if (romfslite_dir != nullptr)
-            layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfslite_dir)));
+            add_layer(subdir, std::move(romfslite_dir));
 
         auto ext_dir = FindSubdirectoryCaseless(subdir, "romfs_ext");
         if (ext_dir != nullptr)
@@ -642,9 +652,29 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         if (type == ContentRecordType::HtmlDocument) {
             auto manual_dir = FindSubdirectoryCaseless(subdir, "manual_html");
             if (manual_dir != nullptr)
-                layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(manual_dir)));
+                add_layer(subdir, std::move(manual_dir));
         }
     }
+}
+
+std::vector<VirtualDir> PatchManager::GetRomFSModLayers() const {
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
+    std::vector<std::string> names;
+    CollectLayeredFSDirs(ContentRecordType::Program, layers, layers_ext, &names);
+    for (const auto& name : names) {
+        LOG_INFO(Loader, "    RomFS: LayeredFS layer {} for title_id={:016X}", name, title_id);
+    }
+    if (!layers_ext.empty()) {
+        LOG_WARNING(Loader, "    RomFS: romfs_ext layers are not applied to this title");
+    }
+    return layers;
+}
+
+void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
+    CollectLayeredFSDirs(type, layers, layers_ext, nullptr);
 
     // When there are no layers to apply, return early as there is no need to rebuild the RomFS
     if (layers.empty() && layers_ext.empty()) {

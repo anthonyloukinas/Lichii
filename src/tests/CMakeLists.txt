@@ -107,6 +107,7 @@ add_executable(tests
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
     core/nup_metadata.cpp
+    core/nup_layeredfs.cpp
     core/nx2_image_layout.cpp
     core/nx2_video_input_queue.cpp
     core/ldn.cpp

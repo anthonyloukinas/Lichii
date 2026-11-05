@@ -14,6 +14,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/vfs/vfs_layered.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -200,6 +201,12 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
+    // The update is merged into the RomFS tree here instead of by PatchRomFS, so LayeredFS mods
+    // are layered over that tree before it is packed.
+    romfs_mod_layers = FileSys::PatchManager{base_title_id, system.GetFileSystemController(),
+                                             system.GetContentProvider()}
+                           .GetRomFSModLayers();
+
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
@@ -225,9 +232,16 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         update_index ? nup->GetRomFSDir(*update_index) : FileSys::VirtualDir{};
     // A standalone update carries the complete merged tree; a base+update pair
     // overlays the update onto the base (SPEC §4.1.4).
-    const auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
+    auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
     if (merged == nullptr) {
         return ResultStatus::ErrorNoRomFS;
+    }
+    if (!romfs_mod_layers.empty()) {
+        std::vector<FileSys::VirtualDir> layers{romfs_mod_layers};
+        auto name = merged->GetName();
+        layers.push_back(std::move(merged));
+        merged = FileSys::LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers),
+                                                                    std::move(name));
     }
     out_file = FileSys::CreateRomFS(merged);
     if (out_file == nullptr) {

@@ -91,6 +91,10 @@ public:
                                          VirtualFile packed_update_raw = nullptr,
                                          bool apply_layeredfs = true) const;
 
+    // Enabled LayeredFS romfs directories (romfs, romfslite) of the program, highest priority
+    // first, for loaders that build their RomFS from a directory tree. Logs each layer.
+    [[nodiscard]] std::vector<VirtualDir> GetRomFSModLayers() const;
+
     // Returns a vector of patches
     [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
 
@@ -113,6 +117,9 @@ private:
     [[nodiscard]] VirtualDir GetModificationLoadRoot(bool sdmc = false) const;
     [[nodiscard]] std::vector<std::string> GetDisabledAddons() const;
     void ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const;
+    void CollectLayeredFSDirs(ContentRecordType type, std::vector<VirtualDir>& layers,
+                              std::vector<VirtualDir>& layers_ext,
+                              std::vector<std::string>* names) const;
     [[nodiscard]] std::vector<VirtualFile> CollectPatches(const std::vector<VirtualDir>& patch_dirs,
                                                           const std::string& build_id) const;
 

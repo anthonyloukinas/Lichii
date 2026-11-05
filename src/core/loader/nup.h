@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/file_sys/nup_container.h"
 #include "core/loader/loader.h"
@@ -57,6 +58,7 @@ private:
 
     std::unique_ptr<FileSys::NACP> nacp_file;
     FileSys::VirtualFile icon_file;
+    std::vector<FileSys::VirtualDir> romfs_mod_layers;
     u64 base_title_id{};
     std::string display_title;
     std::string display_version;
