@@ -79,6 +79,10 @@ struct Nx2DeferredWriteCounters {
     std::atomic<u64> native_storage_bindings{0};
     std::atomic<u64> native_storage_bytes{0};
     std::atomic<u64> native_marked_bytes{0};
+    // Written native bindings whose mark the shader's store extent bounded this dispatch, and the
+    // ones that kept the mode's full mark (unknown extent, Full, or the 64 KiB cap).
+    std::atomic<u64> native_bounded_bindings{0};
+    std::atomic<u64> native_unbounded_bindings{0};
     // Fence downloads as copied by the GPU into host staging (CommitAsyncFlushesHigh), before
     // PopAsyncBuffers drops what later GPU or CPU writes superseded; and the pool's share.
     std::atomic<u64> fence_copies{0};
@@ -125,8 +129,9 @@ inline void Nx2NoteDownload(bool sync, u64 address, u64 size) {
                                           std::memory_order_relaxed);
 }
 
-// EDEN_NX2_COMPUTE_WRITE_MARK=<bytes> (experiment, docs/oot-white-petals.md): the most a native
-// compute storage binding claims to have written. Unset: the whole binding (up to 8 MiB). 0: none.
+// EDEN_NX2_COMPUTE_WRITE_MARK=<bytes> (docs/oot-white-petals.md): the most a native compute
+// storage binding claims to have written, on top of the native_compute_write_mark setting.
+// Unset: no further cap. 0: none.
 inline const u64 g_nx2_compute_write_mark = [] {
     const char* value = std::getenv("EDEN_NX2_COMPUTE_WRITE_MARK");
     if (value == nullptr || value[0] == '\0') {
