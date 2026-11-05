@@ -77,6 +77,19 @@ public:
         return target;
     }
 
+    /// The newest logged write over [begin, begin + size) still in the log, 0 if none (diagnostics).
+    [[nodiscard]] u64 NewestOverlap(GPUVAddr begin, u64 size) const {
+        const GPUVAddr end = begin + size;
+        const size_t oldest = count > Capacity ? count - Capacity : 0;
+        for (size_t i = count; i > oldest; --i) {
+            const Entry& entry = entries[(i - 1) % Capacity];
+            if (entry.begin < end && begin < entry.end) {
+                return entry.position;
+            }
+        }
+        return 0;
+    }
+
     /// The position after the newest logged write (0 if none): what waiting for all of them takes.
     [[nodiscard]] u64 NewestPosition() const {
         return newest_position;

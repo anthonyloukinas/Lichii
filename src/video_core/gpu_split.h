@@ -240,6 +240,19 @@ public:
     /// As WaitForMemoryWriters, but of the logged ranged writes only those overlapping
     /// [address, address + size): what executing the rest cannot change.
     bool WaitForMemoryRange(GPUVAddr address, u64 size, DrainSite site);
+    /// EDEN_NX2_WAIT_VERIFY reports (front thread): the newest logged write over the range (0 if
+    /// none), the back's position, the ranged and the full wait's targets.
+    struct MemoryWaitInfo {
+        u64 logged_write;
+        u64 consumed;
+        u64 range_target;
+        u64 full_target;
+    };
+    [[nodiscard]] MemoryWaitInfo DescribeMemoryWait(GPUVAddr address, u64 size) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return {write_log.NewestOverlap(address, size), consumed_cache,
+                MemoryTarget(address, size, nullptr), MemoryWritersTarget()};
+    }
     /// Whether WaitForMemoryWriters would wait now (front thread).
     [[nodiscard]] bool MemoryWritersPending() {
         consumed_cache = consumed.load(std::memory_order_acquire);

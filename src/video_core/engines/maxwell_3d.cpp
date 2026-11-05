@@ -1554,7 +1554,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                      static_cast<u32>(GetNativeMacroEngine().native_interpreter.data_ram_writes.size()));
     }
     std::vector<u32> verify_before;
+    VideoCommon::GpuSplit::MemoryWaitInfo verify_info{};
     if (ranged && VideoCommon::GpuSplit::VerifyWaits() && split.MemoryWritersPending()) {
+        verify_info = split.DescribeMemoryWait(source, read_bytes);
         verify_before.resize(words);
         memory_manager.ReadBlockUnsafe(source, verify_before.data(), read_bytes);
         split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaCheck);
@@ -1604,14 +1606,26 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 const auto device = memory_manager.GpuToCpuAddress(source);
+                const size_t shown = std::min<size_t>(words, 8);
+                std::vector<u32> after(shown);
+                memory_manager.ReadBlockUnsafe(source, after.data(), shown * sizeof(u32));
+                // A logged write over the words that the back had already run (position at or
+                // below the back's) lands outside ring order (a fenced release or a query's
+                // result); none at all means the guest CPU or a writer the log misses.
                 LOG_WARNING(HW_GPU,
                             "Split wait verify: macro DMA read {:#x} ({} words, device {:#x}, "
                             "GPU-written page {}) changed in {} words after the full memory "
-                            "write wait; first at {}: {:#x} -> {:#x}",
+                            "write wait; first at {}: {:#x} -> {:#x}; words {:08x} -> {:08x}; "
+                            "newest logged write over it at {} (back at {}, ranged wait to {}, "
+                            "full wait to {})",
                             source, words, device.value_or(0),
                             device && Tegra::Nx2IsGpuWritten(*device), verify_changed,
                             verify_first, verify_before[verify_first],
-                            memory_manager.Read<u32>(source + u64{verify_first} * sizeof(u32)));
+                            memory_manager.Read<u32>(source + u64{verify_first} * sizeof(u32)),
+                            fmt::join(std::span{verify_before.data(), shown}, " "),
+                            fmt::join(after, " "), verify_info.logged_write,
+                            verify_info.consumed, verify_info.range_target,
+                            verify_info.full_target);
             }
         }
     }
