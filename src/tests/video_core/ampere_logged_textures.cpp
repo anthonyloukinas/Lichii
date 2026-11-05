@@ -553,3 +553,23 @@ TEST_CASE("Half gathers reject reserved second coordinates before scratch copies
         }
     }
 }
+
+TEST_CASE("Half per-tap gathers prove offsets across an unrelated LEA.HI",
+          "[video_core][ampere][gather][logged_textures]") {
+    // Ocarina of Time 1080p upscaler (native program at 0x11491edc00), nvdisasm -b SM87:
+    // LEA.HI R8, R8, R7, RZ, 0x1f ; between the offset moves and
+    // TLD4.SCR.R.F16.RN.PTP R12, R10, R10, R0, 0x0, 0x30, 2D ;
+    const Instruction lea{{0x08087211, 0x00000007, 0x078ff8ff, 0x000fc800}};
+    const Instruction gather{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    auto code = std::array{
+        Instruction{{0x00007802, 0xff00ff00, 0xf00, 0}},
+        Instruction{{0x00017802, 0x01000001, 0xf00, 0}},
+        lea, gather, Exit,
+    };
+    const auto lowered = Shader::Ampere::LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    code[2].words[0] = 0x08017211;
+    CHECK(Shader::Ampere::LowerToMaxwell(code).error ==
+          "native per-tap gather nonconstant offsets");
+}
