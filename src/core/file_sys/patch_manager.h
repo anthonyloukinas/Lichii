@@ -91,6 +91,15 @@ public:
                                          VirtualFile packed_update_raw = nullptr,
                                          bool apply_layeredfs = true) const;
 
+    // Layers this title's LayeredFS mod directories (romfs, romfslite, romfs_ext) over a RomFS
+    // tree a loader already holds unpacked, and packs the result. Unlike PatchRomFS this never
+    // applies a game update and skips the ExtractRomFS round trip; used by containers that
+    // merge their own updates (NUP). Returns nullptr when no mod layer applies.
+    // out_mod_files, if given, receives the number of files the mod layers contribute.
+    [[nodiscard]] VirtualFile PatchRomFSDirectory(VirtualDir base_romfs,
+                                                  ContentRecordType type = ContentRecordType::Program,
+                                                  std::size_t* out_mod_files = nullptr) const;
+
     // Returns a vector of patches
     [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
 
@@ -112,6 +121,8 @@ public:
 private:
     [[nodiscard]] VirtualDir GetModificationLoadRoot(bool sdmc = false) const;
     [[nodiscard]] std::vector<std::string> GetDisabledAddons() const;
+    bool CollectLayeredFSDirs(ContentRecordType type, std::vector<VirtualDir>& layers,
+                              std::vector<VirtualDir>& layers_ext) const;
     void ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const;
     [[nodiscard]] std::vector<VirtualFile> CollectPatches(const std::vector<VirtualDir>& patch_dirs,
                                                           const std::string& build_id) const;

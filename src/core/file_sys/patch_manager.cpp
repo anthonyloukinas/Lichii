@@ -600,25 +600,28 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     return out;
 }
 
-void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+bool PatchManager::CollectLayeredFSDirs(ContentRecordType type, std::vector<VirtualDir>& layers,
+                                        std::vector<VirtualDir>& layers_ext) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
     if ((type != ContentRecordType::Program && type != ContentRecordType::Data &&
          type != ContentRecordType::HtmlDocument) ||
         (load_dir == nullptr && sdmc_load_dir == nullptr)) {
-        return;
+        return false;
     }
 
     const auto disabled = GetDisabledAddons();
-    std::vector<VirtualDir> patch_dirs = load_dir->GetSubdirectories();
-    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
+    std::vector<VirtualDir> patch_dirs;
+    if (load_dir != nullptr) {
+        patch_dirs = load_dir->GetSubdirectories();
+    }
+    if (sdmc_load_dir != nullptr &&
+        std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
         patch_dirs.push_back(sdmc_load_dir);
     }
     std::sort(patch_dirs.begin(), patch_dirs.end(),
               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
 
-    std::vector<VirtualDir> layers;
-    std::vector<VirtualDir> layers_ext;
     layers.reserve(patch_dirs.size() + 1);
     layers_ext.reserve(patch_dirs.size() + 1);
     for (const auto& subdir : patch_dirs) {
@@ -646,8 +649,14 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         }
     }
 
+    return !layers.empty() || !layers_ext.empty();
+}
+
+void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
     // When there are no layers to apply, return early as there is no need to rebuild the RomFS
-    if (layers.empty() && layers_ext.empty()) {
+    if (!CollectLayeredFSDirs(type, layers, layers_ext)) {
         return;
     }
 
@@ -671,6 +680,54 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
 
     LOG_INFO(Loader, "    RomFS: LayeredFS patches applied successfully");
     romfs = std::move(packed);
+}
+
+namespace {
+std::size_t CountFilesRecursive(const VirtualDir& dir) {
+    if (dir == nullptr) {
+        return 0;
+    }
+    std::size_t count = dir->GetFiles().size();
+    for (const auto& subdir : dir->GetSubdirectories()) {
+        count += CountFilesRecursive(subdir);
+    }
+    return count;
+}
+} // Anonymous namespace
+
+VirtualFile PatchManager::PatchRomFSDirectory(VirtualDir base_romfs, ContentRecordType type,
+                                              std::size_t* out_mod_files) const {
+    if (out_mod_files != nullptr) {
+        *out_mod_files = 0;
+    }
+    if (base_romfs == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
+    if (!CollectLayeredFSDirs(type, layers, layers_ext)) {
+        return nullptr;
+    }
+
+    if (out_mod_files != nullptr) {
+        for (const auto& layer : layers) {
+            *out_mod_files += CountFilesRecursive(layer);
+        }
+        for (const auto& layer : layers_ext) {
+            *out_mod_files += CountFilesRecursive(layer);
+        }
+    }
+
+    // Mods take priority over the base tree, which is the bottom layer.
+    layers.emplace_back(std::move(base_romfs));
+
+    auto layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
+    auto layered_ext = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers_ext));
+    if (layered == nullptr) {
+        return nullptr;
+    }
+    return CreateRomFS(std::move(layered), std::move(layered_ext));
 }
 
 VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs,

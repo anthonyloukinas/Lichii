@@ -200,6 +200,22 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
+    // The NUP merges its own update into the exposed RomFS, so IsRomFSUpdatable() is false and
+    // RomFSFactory never runs PatchRomFS (whose update lookup does not apply here). Apply only the
+    // LayeredFS mod layer, directly over the merged tree, before the factory reads the RomFS.
+    if (auto merged = GetMergedRomFSDir(); merged != nullptr) {
+        const FileSys::PatchManager patch_manager{base_title_id, system.GetFileSystemController(),
+                                                  system.GetContentProvider()};
+        std::size_t mod_files = 0;
+        auto patched = patch_manager.PatchRomFSDirectory(
+            std::move(merged), FileSys::ContentRecordType::Program, &mod_files);
+        if (patched != nullptr) {
+            patched_romfs = std::move(patched);
+            LOG_INFO(Loader, "NUP: LayeredFS mod RomFS applied to title {:016X}: {} file(s) overlaid",
+                     base_title_id, mod_files);
+        }
+    }
+
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
@@ -217,7 +233,7 @@ ResultStatus AppLoader_NUP::VerifyIntegrity(
     return nup->VerifyIntegrity(std::move(progress_callback));
 }
 
-ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
+FileSys::VirtualDir AppLoader_NUP::GetMergedRomFSDir() const {
     const auto base_index = nup->FindBasePackage();
     const auto base_romfs = base_index ? nup->GetRomFSDir(*base_index) : FileSys::VirtualDir{};
     const auto update_index = nup->FindBestUpdatePackage();
@@ -225,7 +241,15 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         update_index ? nup->GetRomFSDir(*update_index) : FileSys::VirtualDir{};
     // A standalone update carries the complete merged tree; a base+update pair
     // overlays the update onto the base (SPEC §4.1.4).
-    const auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
+    return FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
+}
+
+ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
+    if (patched_romfs != nullptr) {
+        out_file = patched_romfs;
+        return ResultStatus::Success;
+    }
+    const auto merged = GetMergedRomFSDir();
     if (merged == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }
@@ -237,7 +261,7 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
 }
 
 bool AppLoader_NUP::IsRomFSUpdatable() const {
-    // The update is already merged into the exposed RomFS.
+    // The update is already merged into the exposed RomFS; LayeredFS mods are applied in Load().
     return false;
 }
 
