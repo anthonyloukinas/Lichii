@@ -123,6 +123,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23:
         case 0x243: case 0x245: case 0x306:
         case 0x919: case 0xc12: case 0x300: case 0x210: case 0x308:
+        case 0x803: // P2R Rd
             return instruction.Bits(16, 8) == 255 ? 0U : 1U;
         case 0x225: case 0x625: case 0x825:
             return 2;
@@ -2106,6 +2107,32 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
 
         case 0x243:
+            if ((insn.Bits(24, 8) != 255 || insn.Bits(78, 2) != 3) && !(insn.words[1] & ~0xffU) &&
+                (insn.words[2] & ~0xc000U) == 0x000004ffU) {
+                // F2IP.U8.F32 Rd, Ra, Rb, RZ: Rb's byte in bits 0-7 and Ra's in bits 8-15, each
+                // NaN -> 0, clamped to [0, 255], rounded by bits 78-79 (F2I's field; Ocarina
+                // packs colour*255 with 0 = nearest-even). Only the Ra = RZ, truncating form
+                // was known before; Rb in the low byte follows from it.
+                const u32 rounding = insn.Bits(78, 2);
+                const auto convert = [&](u32 source, u32 target) {
+                    emit(0x5800000000000000ULL | predicate | 250 | (u64{source} << 8) |
+                         (u64{source} << 20) | (u64{7} << 39) | (u64{7} << 48));
+                    emit(0x5c40000000000000ULL | predicate | 250 | (u64{source} << 8) |
+                         (u64{250} << 20) | (u64{7} << 48));
+                    mov_imm(252, 0);
+                    emit(0x5c60000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                         (u64{252} << 20) | (u64{15} << 39));
+                    mov_imm(252, 0x437f0000U);
+                    emit(0x5c60000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                         (u64{252} << 20) | (u64{7} << 39));
+                    emit(0x5cb0000000000000ULL | predicate | target | (u64{2} << 8) | (u64{2} << 10) |
+                         (u64{250} << 20) | (u64{rounding} << 39));
+                };
+                convert(insn.Bits(32, 8), 249);
+                convert(insn.Bits(24, 8), 251);
+                emit(base(0x5c18000000000000ULL) | (u64{251} << 8) | (u64{249} << 20) | (u64{8} << 39));
+                break;
+            }
             if (insn.Bits(24, 8) != 255 || (insn.words[1] & ~0xffU) ||
                 insn.words[2] != 0x0000c4ffU)
                 return fail(index, "native packed float-to-byte mode");
@@ -3460,7 +3487,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 carry_out = insn.Bits(81, 3);
             if (insn.Bits(72, 1) || insn.Bits(74, 1) || insn.Bits(80, 1) ||
                 (carry_out != 7 && ((opcode != 0x811 && insn.Bits(63, 1)) ||
-                                    (rewritten_uniform && (opcode != 0x211 || carry_out > 1)))) ||
+                                    (rewritten_uniform && opcode != 0x211))) ||
                 ((opcode == 0x211 || opcode == 0xa11) && insn.Bits(62, 1)) || (opcode == 0xc11 && (insn.words[1] & ~0x8000003fU)))
                 return fail(index, "native LEA carry/high mode");
             // 0x211 bit 63 negates Rb (LEA Rd, Ra, -Rb, s), as Maxwell ISCADD's bit 48.
@@ -3565,8 +3592,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const u32 carry_out = insn.Bits(81, 3);
                 const u32 a = insn.Bits(24, 8);
                 if ((carry_in && carry_out != 7) || (opcode == 0x210 && (insn.words[1] & ~0xffU)) ||
-                    (rewritten_uniform && carry_out != 7 && carry_out > 1) ||
-                    (rewritten_uniform && carry_in && insn.Bits(87, 3) > 1 && insn.Bits(87, 3) != 7))
+                    (rewritten_uniform && guarded_uniform))
                     return fail(index, "native integer carry mode");
                 if (opcode == 0x810) {
                     emit(0x1c00000000000000ULL | predicate | 250 | (u64{a} << 8) | (u64{insn.words[1]} << 20));

@@ -194,12 +194,15 @@ struct LoggedMachine {
                     if (mask & (1U << i))
                         predicates[i] = (value >> i) & 1;
             } else if ((word & 0xfff0000000000000ULL) == 0x5b60000000000000ULL) {
-                REQUIRE((bits(49, 3) == 5 || bits(49, 3) == 6));
+                REQUIRE((bits(49, 3) == 1 || bits(49, 3) == 5 || bits(49, 3) == 6));
                 REQUIRE(bits(45, 2) == 0);
                 REQUIRE(bits(0, 3) == 7);
                 const bool result = bits(49, 3) == 5 ? Read(0, a) != Read(0, b)
-                                    : bits(48, 1)    ? s32(Read(0, a)) >= s32(Read(0, b))
-                                                     : Read(0, a) >= Read(0, b);
+                                    : bits(49, 3) == 1
+                                        ? (bits(48, 1) ? s32(Read(0, a)) < s32(Read(0, b))
+                                                       : Read(0, a) < Read(0, b))
+                                    : bits(48, 1) ? s32(Read(0, a)) >= s32(Read(0, b))
+                                                  : Read(0, a) >= Read(0, b);
                 const u32 output = bits(3, 3);
                 if (output != 7)
                     predicates[output] = result && Predicate(bits(39, 4));
@@ -248,6 +251,9 @@ struct LoggedMachine {
                                     : std::fmod(floor, 2.0) == 0.0 ? floor
                                                                    : floor + 1;
                 write(0, u32(s32(bits(39, 2) == 1 ? floor : rounded)));
+            } else if ((word & 0xfc00000000000000ULL) == 0x1c00000000000000ULL) {
+                REQUIRE(bits(52, 6) == 0); // IADD32I without CC, X, negation or saturation
+                write(0, Read(0, a) + bits(20, 32));
             } else if (((word >> 48) & 0xfffc) == 0x5c10) {
                 REQUIRE(bits(48, 2) == 0);
                 const u64 sum = u64{Read(0, a)} + Read(0, b) + (bits(43, 1) && carry);
@@ -366,6 +372,8 @@ struct HalfIR {
                 visitor.SHL_reg(word);
             else if (((word >> 48) & 0xfffc) == 0x5c10)
                 visitor.IADD_reg(word);
+            else if (((word >> 48) & 0xfffe) == 0x5c18)
+                visitor.ISCADD_reg(word);
             else if ((word & 0xfc00000000000000ULL) == 0x1c00000000000000ULL)
                 visitor.IADD32I(word);
             else if ((word >> 58) == 1)
@@ -541,8 +549,13 @@ struct HalfIR {
     }
 
     u32 Run(u32 input, u32 source = 2, u32 destination = 8) {
+        return Run({{source, input}}, destination);
+    }
+
+    u32 Run(std::initializer_list<std::pair<u32, u32>> inputs, u32 destination) {
         registers.fill(0xdeadbeef);
-        registers[source] = input;
+        for (const auto& [source, input] : inputs)
+            registers[source] = input;
         values.clear();
         for (const auto& inst : block.Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::SetRegister)
@@ -550,7 +563,9 @@ struct HalfIR {
             else
                 values.emplace(&inst, Evaluate(inst));
         }
-        REQUIRE(registers[source] == input);
+        for (const auto& [source, input] : inputs)
+            if (source != destination)
+                REQUIRE(registers[source] == input);
         return registers[destination];
     }
 };
@@ -568,6 +583,54 @@ TEST_CASE("Ocarina packed float-to-byte conversion clamps before packing", "[vid
                             std::numeric_limits<f32>::quiet_NaN()}) {
         const u32 expected = std::isnan(input) ? 0U : u32(std::clamp(input, 0.0f, 255.0f));
         CHECK(translation.Run(std::bit_cast<u32>(input), 9, 10) == expected);
+    }
+}
+
+TEST_CASE("Ocarina two-source F2IP packs Rb's byte below Ra's with its rounding mode",
+          "[video_core][ampere][oot]") {
+    // Culling programs 0x11497fdf00 (+0x6e80, +0x6eb0) and 0x11497dea00 (+0x6270, +0x62a0):
+    // F2IP.U8.F32 Rd, Ra, Rb, RZ with rounding field 0 (nearest even), packing colour * 255.
+    // Byte order (Rb low) is inferred from the Ra = RZ form, not checked against nvdisasm.
+    struct Case {
+        Instruction instruction;
+        u32 dest, a, b;
+    };
+    const auto byte = [](f32 value, bool truncate) {
+        if (std::isnan(value)) return 0U;
+        const f32 clamped = std::clamp(value, 0.0f, 255.0f);
+        return u32(truncate ? std::trunc(clamped) : std::nearbyint(clamped));
+    };
+    constexpr std::array inputs{-std::numeric_limits<f32>::infinity(), -1.0f, -0.5f, 0.0f,
+                                0.5f, 1.5f, 2.5f, 127.49f, 127.5f, 254.5f, 254.6f, 255.0f,
+                                300.0f, std::numeric_limits<f32>::infinity(),
+                                std::numeric_limits<f32>::quiet_NaN()};
+    for (const Case& c : {Case{{{0x2c2d7243, 0x00000015, 0x000004ff, 0x000fc400}}, 45, 44, 21},
+                          Case{{{0x2e2e7243, 0x0000001f, 0x000004ff, 0x000fe200}}, 46, 46, 31},
+                          Case{{{0x28297243, 0x00000027, 0x000004ff, 0x000fc400}}, 41, 40, 39},
+                          Case{{{0x2a2a7243, 0x00000025, 0x000004ff, 0x000fe400}}, 42, 42, 37}}) {
+        for (const bool truncate : {false, true}) {
+            auto instruction = c.instruction;
+            if (truncate) instruction.words[2] |= 0xc000;
+            const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+            INFO(lowered.error);
+            REQUIRE(lowered);
+            HalfIR translation{lowered.instructions};
+            for (const f32 a : inputs) {
+                for (const f32 b : inputs) {
+                    CAPTURE(a, b, truncate);
+                    CHECK(translation.Run({{c.a, std::bit_cast<u32>(a)}, {c.b, std::bit_cast<u32>(b)}},
+                                          c.dest) == (byte(b, truncate) | (byte(a, truncate) << 8)));
+                }
+            }
+        }
+    }
+    // A third source, other formats and immediate forms stay rejected.
+    const Instruction convert{{0x2c2d7243, 0x00000015, 0x000004ff, 0x000fc400}};
+    for (const auto change : {std::array{2U, 0x000004feU}, std::array{2U, 0x000006ffU},
+                              std::array{1U, 0x00000115U}, std::array{2U, 0x000014ffU}}) {
+        auto changed = convert;
+        changed.words[change[0]] = change[1];
+        CHECK_FALSE(LowerToMaxwell(std::array{changed, Exit}));
     }
 }
 
@@ -1030,6 +1093,72 @@ TEST_CASE(
                     }
                 }
             }
+        }
+    }
+}
+
+TEST_CASE("Ocarina uniform LEA and IADD3 carry outs reach UP2 and UP3",
+          "[video_core][ampere][oot]") {
+    // ULEA URd, UPn, URa, URb, 2 from 0x11497fdf00 (+0x6550, UP3), 0x11497dea00 (+0x5950, UP2)
+    // and 0x11498cc900 (+0x610, UP2); UIADD3 UR10, UP2, UR10, 0xc, URZ from 0x11497dea00
+    // (+0x6f40). UPn lives in R239 bit 6-n; URn is R(216+n).
+    struct Case {
+        Instruction instruction;
+        u32 dest, a, b, shift, up;
+    };
+    constexpr std::array values{0U, 1U, 0x3fffffffU, 0x40000000U, 0x7fffffffU, 0xfffffff4U,
+                                0xffffffffU};
+    for (const Case& c : {Case{{{0x070a7291, 0x0000000a, 0x0f86103f, 0x000fe200}}, 226, 223, 226, 2, 3},
+                          Case{{{0x060a7291, 0x0000000a, 0x0f84103f, 0x000fe200}}, 226, 222, 226, 2, 2},
+                          Case{{{0x0b047291, 0x00000004, 0x0f84103f, 0x000fc600}}, 220, 227, 220, 2, 2},
+                          Case{{{0x0a0a7890, 0x0000000c, 0x0ff5e03f, 0x000fc800}}, 226, 226, ~0U, 0, 2}}) {
+        const auto lowered = LowerToMaxwell(std::array{c.instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        for (const u32 a : values) {
+            for (const u32 b : values) {
+                for (const u32 packed : {0x12340015U, 0x1234006aU}) {
+                    LoggedMachine machine;
+                    machine.registers[0][c.a] = a;
+                    if (c.b != ~0U && c.b != c.a) machine.registers[0][c.b] = b;
+                    machine.registers[0][239] = packed;
+                    const u32 rhs = c.b == ~0U ? 0xcU : c.b == c.a ? a : b;
+                    const u64 sum = u64{u32(a << c.shift)} + rhs;
+                    const u32 mask = 1U << (6 - c.up);
+                    const u32 expected_predicates = (packed & ~mask) | (sum >> 32 ? mask : 0U);
+                    const auto before = machine.registers[0];
+                    const auto predicates = machine.predicates;
+                    machine.Run(lowered.instructions);
+                    CAPTURE(a, b, packed);
+                    for (u32 reg = 0; reg < 246; ++reg)
+                        CHECK(machine.registers[0][reg] == (reg == c.dest  ? u32(sum)
+                                                            : reg == 239 ? expected_predicates
+                                                                         : before[reg]));
+                    CHECK(machine.predicates == predicates);
+                }
+            }
+        }
+    }
+    // The program's next instruction, UIADD3.X UR11, URZ, UR11, UP3, adds the ULEA's carry into
+    // the high word of the 64-bit address.
+    const auto pair = LowerToMaxwell(std::array{
+        Instruction{{0x070a7291, 0x0000000a, 0x0f86103f, 0x000fe200}},
+        Instruction{{0x3f0b7290, 0x0000000b, 0x09ffe43f, 0x000fe400}}, Exit});
+    INFO(pair.error);
+    REQUIRE(pair);
+    for (const u32 index : {0U, 0x3fffffffU, 0x40000000U, 0xffffffffU}) {
+        for (const u64 address : {0x2273c44000ULL, 0x22fffffff0ULL, 0xffffffffULL}) {
+            LoggedMachine machine;
+            machine.registers[0][223] = index;
+            machine.registers[0][226] = u32(address);
+            machine.registers[0][227] = u32(address >> 32);
+            const auto predicates = machine.predicates;
+            machine.Run(pair.instructions);
+            const u64 expected = address + u32(index << 2);
+            CAPTURE(index, address);
+            CHECK(machine.registers[0][226] == u32(expected));
+            CHECK(machine.registers[0][227] == u32(expected >> 32));
+            CHECK(machine.predicates == predicates);
         }
     }
 }

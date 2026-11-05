@@ -138,6 +138,29 @@ TEST_CASE("Ampere calls find a return address set ahead of them", "[video_core][
     REQUIRE(lowered.error == "native call linkage mode");
 }
 
+TEST_CASE("Ampere calls see their return address past a P2R", "[video_core][ampere]") {
+    // Ocarina culling program 0x1149820600 (+0x1f90): MOV R18, ret; P2R R16, PR, RZ, 0x40;
+    // CALL.REL.NOINC; ... a callee ending in MOV R19, 0; RET.REL.NODEC R18.
+    std::array<Instruction, 6> code{{
+        {{0x00127802, 0x30, 0x00000f00, 0}},
+        {{0xff107803, 0x00000040, 0x00000000, 0x000fe200}},
+        {{0x00007944, 0x10, 0x03c00000, 0x010fea00}},
+        EXIT,
+        {{0x00137802, 0, 0x00000f00, 0}},
+        {{0x12007950, 0xffffffa0, 0x03c3ffff, 0x000fea00}},
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.source_size == sizeof(code));
+
+    // A P2R into the link register in between still rejects the call.
+    code[1].words[0] = 0xff127803;
+    const auto clobbered = LowerToMaxwell(code);
+    REQUIRE(!static_cast<bool>(clobbered));
+    REQUIRE(clobbered.error == "native call linkage mode");
+}
+
 TEST_CASE("Ampere programs go on past an EXIT that a branch jumps over", "[video_core][ampere]") {
     // A call, then a branch over an EXIT to more of the program, with another call there.
     const std::array<Instruction, 8> code{{

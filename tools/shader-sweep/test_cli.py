@@ -215,6 +215,49 @@ class CliTests(unittest.TestCase):
                              "--output", self.output)
                 self.validate()
 
+    def test_oot_uniform_carries_and_two_source_byte_pack(self):
+        # Ocarina's culling programs 0x11497fdf00 / 0x11497dea00 / 0x11498cc900: ULEA carrying
+        # into UP3 or UP2 with the UIADD3.X that consumes UP3, UIADD3 carrying into UP2, and
+        # F2IP.U8.F32 R45, R44, R21 (round to nearest). MOV R0, URd (or Rd) keeps each result
+        # live as the colour output.
+        move = lambda dest: struct.pack("<4I", 0x00007c02, dest, 0x08000f00, 0)
+        cases = (
+            ((0x070a7291, 0x0000000a, 0x0f86103f, 0x000fe200),
+             (0x3f0b7290, 0x0000000b, 0x09ffe43f, 0x000fe400), move(11)),
+            ((0x060a7291, 0x0000000a, 0x0f84103f, 0x000fe200), move(10)),
+            ((0x0b047291, 0x00000004, 0x0f84103f, 0x000fc600), move(4)),
+            ((0x0a0a7890, 0x0000000c, 0x0ff5e03f, 0x000fc800), move(10)),
+            ((0x2c2d7243, 0x00000015, 0x000004ff, 0x000fc400),
+             struct.pack("<4I", 0x00007202, 45, 0x00000f00, 0)),
+        )
+        for case in cases:
+            with self.subTest(first=hex(case[0][0])):
+                code = b"".join(part if isinstance(part, bytes) else struct.pack("<4I", *part)
+                                for part in case)
+                source = self.write("oot-carry.bin", code + NATIVE_EXIT)
+                self.run_cli(source, "--lower-only", self.output)
+                capture = self.write("shader.env", environment(50, 4))
+                self.run_cli(source, "--environment", capture, "--cache-version", 50,
+                             "--output", self.output)
+                self.validate()
+
+    def test_oot_call_link_set_before_a_p2r(self):
+        # 0x1149820600 +0x1f90: MOV R18, ret; P2R R16, PR, RZ, 0x40; CALL.REL.NOINC to a callee
+        # that ends MOV R19, 0; RET.REL.NODEC R18.
+        code = struct.pack("<24I",
+                           0x00127802, 0x30, 0x00000f00, 0,
+                           0xff107803, 0x40, 0, 0x000fe200,
+                           0x00007944, 0x10, 0x03c00000, 0x010fea00,
+                           *struct.unpack("<4I", NATIVE_EXIT),
+                           0x00137802, 0, 0x00000f00, 0,
+                           0x12007950, 0xffffffa0, 0x03c3ffff, 0x000fea00)
+        source = self.write("oot-call.bin", code)
+        self.run_cli(source, "--lower-only", self.output)
+        capture = self.write("shader.env", environment(50, 5))
+        self.run_cli(source, "--environment", capture, "--cache-version", 50,
+                     "--output", self.output)
+        self.validate()
+
     def test_oot_uniform_multiply_and_signed_source(self):
         for instruction in (
             (0x040474a4, 0x00003c00, 0x0f8e0206, 0x000fc600),

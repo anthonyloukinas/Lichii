@@ -60,6 +60,9 @@ so in `assumptions`. Task, mesh, and vertex-A cache records report missing pipel
 
 Fixtures with a `native_header` field (hex of a raw dump, with `stage` and `flags`) are
 compiled from the raw dump instead of a cache environment.
+Fixtures with a `native_code` field (hex of an instruction-only compute dump) are compiled with
+a synthetic environment built from `compute_environment` (workgroup x, y, z and shared bytes),
+for programs the runtime rejected and so never cached.
 
 For matching a raw capture against a cache, lower without choosing a graphics stage:
 

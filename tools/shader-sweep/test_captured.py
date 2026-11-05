@@ -19,6 +19,14 @@ def serialize_environment(env):
     return data + bytes.fromhex(env["tail"])
 
 
+def compute_environment(x, y, z, shared):
+    """A v50 compute record with a Maxwell EXIT as code and no constant or texture data."""
+    code = bytes(80) + struct.pack("<Q", 0xE30000000007000F)
+    record = struct.pack("<6Q", len(code), 0, 0, 0, 0, 0)
+    record += struct.pack("<7I", 0, 2, 80, 0, len(code) - 8, 1, 5) + code
+    return record + struct.pack("<4I", x, y, z, shared)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compile and validate captured shader regression fixtures")
     parser.add_argument("compiler", type=Path)
@@ -42,6 +50,16 @@ def main():
                 raw.write_bytes(bytes.fromhex(fixture["native_header"]))
                 command = [str(args.compiler.resolve()), str(raw), "--format", "native-header",
                            "--stage", fixture["stage"], *fixture.get("flags", []),
+                           "--output", str(output)]
+            elif "native_code" in fixture:
+                # An instruction-only compute dump (rejected programs never reach the cache):
+                # compiled with a synthetic environment holding only the workgroup and shared
+                # memory sizes (compute_environment: [x, y, z, shared bytes]).
+                raw = root / "shader.bin"
+                raw.write_bytes(bytes.fromhex(fixture["native_code"]))
+                env.write_bytes(compute_environment(*fixture["compute_environment"]))
+                command = [str(args.compiler.resolve()), str(raw), "--environment", str(env),
+                           "--cache-version", "50", *fixture.get("flags", []),
                            "--output", str(output)]
             else:
                 env.write_bytes(serialize_environment(fixture["environment"]))
