@@ -14,11 +14,30 @@
 #include "video_core/nx2_draw_runs.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
+#include "video_core/nx2_target_trace.h"
 
 namespace Tegra::Engines {
 namespace {
 
 void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
+    if (VideoCommon::Nx2TargetTrace::g_enabled) [[unlikely]] {
+        namespace TT = VideoCommon::Nx2TargetTrace;
+        const auto& regs = maxwell3d.regs;
+        const auto hit = TT::MatchTargets<Maxwell3D::Regs>(regs.reg_array.data());
+        if (hit && TT::TakeLine()) {
+            const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                           regs.pipelines[1].reserved[1];
+            LOG_INFO(HW_GPU,
+                     "NX2 target draw frame={} target={} {:#x} {}x{} DROPPED(render condition "
+                     "false: address={:#x} mode={} override={}) indirect={} program1={:#x} "
+                     "count={}",
+                     TT::g_frame.load(std::memory_order_relaxed), hit->depth ? "depth" : "rt",
+                     hit->address, hit->width, hit->height, regs.render_enable.Address(),
+                     static_cast<u32>(regs.render_enable.mode),
+                     static_cast<u32>(regs.render_enable_override), indirect, vs,
+                     maxwell3d.draw_manager.draw_state.vertex_buffer.count);
+        }
+    }
     if (!VideoCommon::RenderTrace::Enabled()) {
         return;
     }

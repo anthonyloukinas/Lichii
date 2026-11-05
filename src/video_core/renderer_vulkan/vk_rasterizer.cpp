@@ -62,6 +62,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_draw_runs.h"
 #include "video_core/nx2_mesh_count_trace.h"
+#include "video_core/nx2_target_trace.h"
 #include "common/nx2_sample_profile.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_debug_control.h"
@@ -634,6 +635,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_draws;
     }
+    if (VideoCommon::Nx2TargetTrace::g_enabled) [[unlikely]] {
+        ++target_trace_draw_index;
+        target_trace_active =
+            VideoCommon::Nx2TargetTrace::MatchTargets<Maxwell>(maxwell3d->regs.reg_array.data())
+                .has_value();
+        if (target_trace_active) {
+            target_trace_outcome = "not-reached";
+            target_trace_failure = {};
+            target_trace_pipeline = nullptr;
+            target_trace_path = "none";
+            buffer_cache.nx2_indirect_note = {};
+            buffer_cache.nx2_indirect_note_on = true;
+        }
+    }
+    SCOPE_EXIT {
+        if (target_trace_active) [[unlikely]] {
+            TargetTraceDraw(is_indexed, is_indirect);
+        }
+    };
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -689,6 +709,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }()};
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline &&
                               pipeline->TakesDeltaDraws();
+    if (target_trace_active) [[unlikely]] {
+        target_trace_pipeline = pipeline;
+    }
     if (verify_pipeline != nullptr) {
         ++fast_draw_stats.verified;
         fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
@@ -738,6 +761,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             path = DrawPath::Full;
             break;
         }
+    }
+    if (target_trace_active) [[unlikely]] {
+        target_trace_path = path == DrawPath::Full ? "full" : path == DrawPath::Delta ? "delta" : "reused";
     }
     if (path == DrawPath::Reused) {
         ++fast_draw_stats.reused;
@@ -1017,10 +1043,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 LOG_WARNING(HW_GPU, "Draw skipped: {} {} from {} (vertex/index count past {})",
                             count, is_indexed ? "indices" : "vertices", first, MaxVertices);
             }
+            TargetTraceEarlyDrop(is_indexed, "count past 16M");
             return;
         }
     }
     if (TryNx2IndirectReset(is_indexed, instance_count)) {
+        TargetTraceEarlyDrop(is_indexed, "taken as an indirect reset");
         return;
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
@@ -1116,7 +1144,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     if (!skip_list.empty()) {
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
+        if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) {
+            TargetTraceEarlyDrop(is_indexed, "EDEN_NX2_SKIP_VS");
+            return;
+        }
     }
     // EDEN_NX2_RT_TRACE: log the first draw to every distinct colour target (debug aid).
     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
@@ -1285,6 +1316,9 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 void RasterizerVulkan::TraceDrawFailure(std::string_view reason) {
+    if (target_trace_active) [[unlikely]] {
+        target_trace_failure = reason;
+    }
     if (!Common::DkbFrameTrace::Enabled()) {
         return;
     }
@@ -1503,6 +1537,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                            regs.clear_surface.A;
     const bool use_depth = regs.clear_surface.Z;
     const bool use_stencil = regs.clear_surface.S;
+    if (VideoCommon::Nx2TargetTrace::g_enabled) [[unlikely]] {
+        TargetTraceClear(use_color, use_depth, use_stencil);
+    }
     if (!use_color && !use_depth && !use_stencil) {
         return;
     }
@@ -1738,6 +1775,9 @@ void RasterizerVulkan::DispatchCompute() {
     }()};
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
+        TargetTraceComputeDrop(kepler_compute->regs.code_loc.Address() +
+                                   kepler_compute->launch_description.program_start,
+                               "no pipeline (program address)");
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
@@ -1749,9 +1789,18 @@ void RasterizerVulkan::DispatchCompute() {
             texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
         }
     };
+    if (VideoCommon::Nx2TargetTrace::g_enabled &&
+        target_trace_compute_seen.insert(pipeline->ShaderHash()).second &&
+        VideoCommon::Nx2TargetTrace::TakeLine()) [[unlikely]] {
+        // When each compute program first runs, against the draws to the traced targets.
+        LOG_INFO(Render_Vulkan, "NX2 target compute first frame={} draw={} shader={:#016x}",
+                 VideoCommon::Nx2TargetTrace::g_frame.load(std::memory_order_relaxed),
+                 target_trace_draw_index, pipeline->ShaderHash());
+    }
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
+        TargetTraceComputeDrop(pipeline->ShaderHash(), "configure failed");
         return;
     }
     SCOPE_EXIT {
@@ -1799,6 +1848,7 @@ void RasterizerVulkan::DispatchCompute() {
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
+                TargetTraceComputeDrop(pipeline->ShaderHash(), "pipeline failed to build");
                 return;
             }
             scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, {}, [&] {
@@ -1811,6 +1861,7 @@ void RasterizerVulkan::DispatchCompute() {
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
+        TargetTraceComputeDrop(pipeline->ShaderHash(), "grid over the device limit");
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -1825,6 +1876,7 @@ void RasterizerVulkan::DispatchCompute() {
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
+            TargetTraceComputeDrop(pipeline->ShaderHash(), "pipeline failed to build");
             return;
         }
         if (byte_addressed_shadow) {
@@ -2285,8 +2337,165 @@ void RasterizerVulkan::FlushCommands() {
     }
 }
 
+namespace {
+std::string DescribeTargetHit(const VideoCommon::Nx2TargetTrace::Hit& hit) {
+    return fmt::format("{}{} {:#x} {}x{} fmt={:#x}", hit.depth ? "depth" : "rt",
+                       hit.depth ? std::string{} : std::to_string(hit.slot), hit.address, hit.width,
+                       hit.height, hit.format);
+}
+
+u64 ProgramAddress(const Maxwell& regs, size_t slot) {
+    return (u64{regs.pipelines[slot].reserved[0] & 0xff} << 32) | regs.pipelines[slot].reserved[1];
+}
+} // namespace
+
+void RasterizerVulkan::TargetTraceDraw(bool is_indexed, bool is_indirect) {
+    namespace TT = VideoCommon::Nx2TargetTrace;
+    target_trace_active = false;
+    buffer_cache.nx2_indirect_note_on = false;
+    const auto& regs = maxwell3d->regs;
+    const auto hit = TT::MatchTargets<Maxwell>(regs.reg_array.data());
+    if (!hit) {
+        return;
+    }
+    const u64 frame = TT::g_frame.load(std::memory_order_relaxed);
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+    const bool configured = std::string_view{target_trace_outcome} == "configured";
+    GraphicsPipeline* const pipeline = target_trace_pipeline;
+    std::string outcome;
+    if (!configured) {
+        outcome = fmt::format("DROPPED({}{}{})", target_trace_outcome,
+                              target_trace_failure.empty() ? "" : ": ", target_trace_failure);
+    } else if (!target_trace_failure.empty()) {
+        outcome = fmt::format("DROPPED({})", target_trace_failure);
+    } else if (!is_indirect && count == 0) {
+        outcome = "ZERO-COUNT";
+    } else {
+        outcome = "recorded";
+        frame_dump.TriggerTarget();
+    }
+    if (configured) {
+        const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+        if (framebuffer != target_trace_framebuffer || frame != target_trace_pass_frame) {
+            target_trace_framebuffer = framebuffer;
+            target_trace_pass_frame = frame;
+            if (TT::TakeLine()) {
+                const VkExtent2D area = framebuffer ? framebuffer->RenderArea() : VkExtent2D{};
+                LOG_INFO(Render_Vulkan,
+                         "NX2 target pass frame={} draw={} target={} framebuffer={} area={}x{}",
+                         frame, target_trace_draw_index, DescribeTargetHit(*hit),
+                         fmt::ptr(framebuffer), area.width, area.height);
+            }
+        }
+    }
+    if (!TT::TakeLine()) {
+        return;
+    }
+    const auto& note = buffer_cache.nx2_indirect_note;
+    const std::string indirect_pointers =
+        note.slots == 0
+            ? std::string{"none"}
+            : fmt::format("slots={} no_record={} guest={} never_gpu_written={} cached={} "
+                          "speculated={} waited={} null={} bound={} dropped={}",
+                          note.slots, note.no_record, note.guest, note.never_written, note.cached,
+                          note.speculated, note.waited, note.null_pointers, note.bound,
+                          note.dropped);
+    std::string counts;
+    if (is_indirect) {
+        const auto& params = maxwell3d->draw_manager.indirect_state;
+        std::array<u32, 5> args{};
+        if (params.indirect_start_address != 0) {
+            gpu_memory->ReadBlockUnsafe(params.indirect_start_address, args.data(), sizeof(args));
+        }
+        counts = fmt::format("indirect_args={:#x} [{}] count_address={:#x} max_draws={} "
+                             "include_count={}",
+                             params.indirect_start_address, fmt::join(args, ","),
+                             params.count_start_address, params.max_draw_counts,
+                             params.include_count);
+    } else {
+        counts = fmt::format("count={} first={} instances={}", count,
+                             is_indexed ? draw_state.index_buffer.first
+                                        : draw_state.vertex_buffer.first,
+                             draw_state.instance_count);
+    }
+    LOG_INFO(Render_Vulkan,
+             "NX2 target draw frame={} draw={} target={} {} mesh={} indirect={} indexed={} "
+             "path={} programs={:#x},{:#x},{:#x} hashes={:016x} {} indirect_pointers=[{}] "
+             "compute_drops={}",
+             frame, target_trace_draw_index, DescribeTargetHit(*hit), outcome,
+             pipeline ? (pipeline->IsMeshPipeline() ? "1" : "0") : "?", is_indirect, is_indexed,
+             target_trace_path, ProgramAddress(regs, 1), ProgramAddress(regs, 3),
+             ProgramAddress(regs, 5),
+             fmt::join(pipeline ? pipeline->ShaderHashes() : std::array<u64, 6>{}, ","), counts,
+             indirect_pointers, target_trace_compute_drops.load(std::memory_order_relaxed));
+}
+
+void RasterizerVulkan::TargetTraceEarlyDrop(bool is_indexed, std::string_view reason) {
+    namespace TT = VideoCommon::Nx2TargetTrace;
+    if (!TT::g_enabled) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto hit = TT::MatchTargets<Maxwell>(regs.reg_array.data());
+    if (!hit || !TT::TakeLine()) {
+        return;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    LOG_INFO(Render_Vulkan,
+             "NX2 target draw frame={} draw={}+ target={} DROPPED(before prepare: {}) "
+             "programs={:#x},{:#x},{:#x} count={} instances={}",
+             TT::g_frame.load(std::memory_order_relaxed), target_trace_draw_index,
+             DescribeTargetHit(*hit), reason, ProgramAddress(regs, 1), ProgramAddress(regs, 3),
+             ProgramAddress(regs, 5),
+             is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count,
+             draw_state.instance_count);
+}
+
+void RasterizerVulkan::TargetTraceClear(bool color, bool depth, bool stencil) {
+    namespace TT = VideoCommon::Nx2TargetTrace;
+    const auto& regs = maxwell3d->regs;
+    std::optional<TT::Hit> hit;
+    if (depth || stencil) {
+        hit = TT::MatchTargets<Maxwell>(regs.reg_array.data(), true, false);
+    }
+    const u32 slot = regs.clear_surface.RT;
+    if (!hit && color && slot < regs.rt.size()) {
+        const auto& rt = regs.rt[slot];
+        if (TT::Matches(rt.Address(), rt.width, rt.height)) {
+            hit = TT::Hit{false, slot, rt.Address(), rt.width, rt.height,
+                          static_cast<u32>(rt.format)};
+        }
+    }
+    if (!hit || !TT::TakeLine()) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "NX2 target clear frame={} draw={} target={} color={} depth={} stencil={} "
+             "depth_value={} stencil_value={} layer={}",
+             TT::g_frame.load(std::memory_order_relaxed), target_trace_draw_index,
+             DescribeTargetHit(*hit), color, depth, stencil, regs.clear_depth, regs.clear_stencil,
+             regs.clear_surface.layer.Value());
+}
+
+void RasterizerVulkan::TargetTraceComputeDrop(u64 shader, std::string_view reason) {
+    namespace TT = VideoCommon::Nx2TargetTrace;
+    if (!TT::g_enabled) {
+        return;
+    }
+    const u32 drops = target_trace_compute_drops.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!TT::TakeLine()) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "NX2 target compute dropped frame={} shader={:#016x} {} (drops so far {})",
+             TT::g_frame.load(std::memory_order_relaxed), shader, reason, drops);
+}
+
 void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
                                         const Framebuffer* framebuffer) {
+    if (target_trace_active) [[unlikely]] {
+        target_trace_outcome = outcome;
+    }
     if (!VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
         return;
     }
@@ -2524,6 +2733,10 @@ void RasterizerVulkan::TickFrame() {
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;
+    if (VideoCommon::Nx2TargetTrace::g_enabled) [[unlikely]] {
+        VideoCommon::Nx2TargetTrace::g_frame.fetch_add(1, std::memory_order_relaxed);
+        target_trace_draw_index = 0;
+    }
     if (Common::DkbFrameTrace::Enabled()) {
         CollectIndirectTrace();
         const auto now = std::chrono::steady_clock::now();

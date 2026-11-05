@@ -1041,6 +1041,8 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
     burst_count = configured_count;
     if (at == "file") {
         trigger_file = std::move(trigger_file_);
+    } else if (at == "target") {
+        trigger_target = true;
     } else if (at.ends_with('f')) {
         trigger_frame = std::strtoull(std::string{at}.c_str(), nullptr, 10);
     } else {
@@ -1099,6 +1101,13 @@ FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
     burst_frame = 0;
     SetCapturing(true);
     return Step::Start;
+}
+
+void FrameDumpSchedule::TriggerTarget() {
+    if (trigger_target && enabled && !done && !capturing && !armed) {
+        trigger_target = false;
+        trigger_frame = 0;
+    }
 }
 
 void FrameDumpSchedule::Abort() {

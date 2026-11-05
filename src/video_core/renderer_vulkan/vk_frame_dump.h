@@ -51,6 +51,9 @@ public:
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
     void Abort();
+    /// EDEN_NX2_FRAME_DUMP_AT=target: capture the next frame (once, EDEN_NX2_TARGET_TRACE's first
+    /// recorded draw to a traced target asks).
+    void TriggerTarget();
 
     [[nodiscard]] bool Capturing() const noexcept {
         return capturing;
@@ -93,6 +96,7 @@ private:
     bool capturing{};
     bool done{};
     std::filesystem::path trigger_file;
+    bool trigger_target{};
     u64 trigger_frame{~0ULL};
     double trigger_seconds{std::numeric_limits<double>::infinity()};
     u64 frame{};
@@ -213,6 +217,10 @@ public:
     /// server, which is told `id` once the last manifest is complete. Works without
     /// EDEN_NX2_FRAME_DUMP.
     void Arm(std::filesystem::path directory, bool sampled, u64 id, u32 count = 1);
+    /// FrameDumpSchedule::TriggerTarget
+    void TriggerTarget() {
+        schedule.TriggerTarget();
+    }
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };

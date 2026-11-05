@@ -337,6 +337,26 @@ public:
                                             std::span<const Shader::NativeIndirectSlot> slots,
                                             std::span<u64> bases);
 
+    /// EDEN_NX2_TARGET_TRACE: how the native indirect pointers of the draws configured since
+    /// the rasterizer last cleared it resolved (record slots read; slots whose record pointer in
+    /// the constant buffer was null; words read from guest memory, the ones of those on pages
+    /// no GPU work ever wrote; cached words, used while GPU work may have rewritten them, read
+    /// back with a wait; pointers that came out null; bindings made and left out).
+    struct Nx2IndirectNote {
+        u32 slots;
+        u32 no_record;
+        u32 guest;
+        u32 never_written;
+        u32 cached;
+        u32 speculated;
+        u32 waited;
+        u32 null_pointers;
+        u32 bound;
+        u32 dropped;
+    };
+    bool nx2_indirect_note_on{};
+    Nx2IndirectNote nx2_indirect_note{};
+
     void UnbindComputeTextureBuffers();
 
     void BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_addr, u32 size, PixelFormat format,

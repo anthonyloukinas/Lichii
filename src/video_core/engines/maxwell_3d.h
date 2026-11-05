@@ -3420,6 +3420,8 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_TARGET_TRACE: a split-front macro writes `value` to vertex_buffer.count.
+    void TargetTraceFrontCount(const FrontState& state, u32 start, u32 value);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
@@ -3432,6 +3434,9 @@ private:
                          bool from_macro);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
+    /// EDEN_NX2_TARGET_TRACE: the pushbuffer word the front's macro call took its first
+    /// parameter from, and how the entry was fetched.
+    VideoCommon::Nx2MeshCountTrace::PushSource target_trace_param_source{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {

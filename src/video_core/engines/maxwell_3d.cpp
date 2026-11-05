@@ -26,6 +26,7 @@
 #include "video_core/nx2_draw_runs.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_target_trace.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
@@ -1297,6 +1298,9 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
             VideoCommon::Nx2MeshCountTrace::NoteParameters(mesh_count_trace,
                                                            fs.parameters.empty(), source, 1);
         }
+        if (VideoCommon::Nx2TargetTrace::g_enabled && fs.parameters.empty()) [[unlikely]] {
+            target_trace_param_source = source;
+        }
         fs.parameters.push_back(argument);
         if (is_last_call) {
             FrontRunMacro(system, split, fs);
@@ -1318,6 +1322,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
             VideoCommon::Nx2MeshCountTrace::NoteParameters(mesh_count_trace,
                                                            fs.parameters.empty(), source, amount);
+        }
+        if (VideoCommon::Nx2TargetTrace::g_enabled && fs.parameters.empty()) [[unlikely]] {
+            target_trace_param_source = source;
         }
         fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
         if (amount == methods_pending) {
@@ -1415,6 +1422,31 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     }
 }
 
+void Maxwell3D::TargetTraceFrontCount(const FrontState& fs, u32 start, u32 value) {
+    namespace TT = VideoCommon::Nx2TargetTrace;
+    const auto hit = TT::MatchTargets<Regs>(fs.regs.data());
+    if (!hit || !TT::TakeLine()) {
+        return;
+    }
+    // Where the count came from: the macro's first parameter (macro 0x24b copies it), fetched
+    // from this pushbuffer word, possibly a record GPU work writes.
+    const auto& source = target_trace_param_source;
+    const std::optional<DAddr> device = source.va != 0 ? memory_manager.GpuToCpuAddress(source.va)
+                                                        : std::nullopt;
+    const size_t program = MAXWELL3D_REG_INDEX(pipelines) + sizeof(Regs::Pipeline) / 4 +
+                           offsetof(Regs::Pipeline, reserved) / 4;
+    LOG_INFO(HW_GPU,
+             "NX2 target front count back_frame={} target={} {:#x} {}x{} macro={:#x} count={} "
+             "param0={} params={} param_va={:#x} entry={} param_page_gpu_written={} "
+             "program1={:#x}",
+             TT::g_frame.load(std::memory_order_relaxed), hit->depth ? "depth" : "rt",
+             hit->address, hit->width, hit->height, start, value,
+             fs.parameters.empty() ? 0U : fs.parameters[0], fs.parameters.size(), source.va,
+             VideoCommon::Nx2MeshCountTrace::EntryPathName(source.path),
+             device ? (Tegra::Nx2IsGpuWritten(*device) ? "yes" : "never") : "unmapped",
+             (u64{fs.regs[program] & 0xff} << 32) | fs.regs[program + 1]);
+}
+
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
     const u32 method = fs.executing_macro;
@@ -1444,6 +1476,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             if (trace) {
                 Trace::NoteEmit(mesh_count_trace, address, value);
+            }
+            if (VideoCommon::Nx2TargetTrace::g_enabled &&
+                address == MAXWELL3D_REG_INDEX(vertex_buffer.count)) [[unlikely]] {
+                TargetTraceFrontCount(fs, start, value);
             }
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).

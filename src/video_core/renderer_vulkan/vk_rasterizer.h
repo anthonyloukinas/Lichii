@@ -7,9 +7,11 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
 
@@ -196,6 +198,13 @@ private:
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
+    /// EDEN_NX2_TARGET_TRACE (nx2_target_trace.h): the draw being prepared, logged as it ends.
+    void TargetTraceDraw(bool is_indexed, bool is_indirect);
+    /// EDEN_NX2_TARGET_TRACE: a draw dropped before PrepareDraw, a clear, a dropped dispatch.
+    void TargetTraceEarlyDrop(bool is_indexed, std::string_view reason);
+    void TargetTraceClear(bool color, bool depth, bool stencil);
+    void TargetTraceComputeDrop(u64 shader, std::string_view reason);
+
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
@@ -288,6 +297,19 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+
+    /// EDEN_NX2_TARGET_TRACE: draws prepared this frame, and the draw being prepared when it
+    /// renders to a traced target.
+    u32 target_trace_draw_index = 0;
+    bool target_trace_active{};
+    const char* target_trace_outcome{};
+    std::string_view target_trace_failure{};
+    GraphicsPipeline* target_trace_pipeline{};
+    const char* target_trace_path{};
+    const void* target_trace_framebuffer{};
+    u64 target_trace_pass_frame{~u64{0}};
+    std::atomic<u32> target_trace_compute_drops{0};
+    std::unordered_set<u64> target_trace_compute_seen;
 
     /// EDEN_NX2_FAST_DRAW: what the last fully resolved draw left bound (nx2_fast_draw.h).
     struct ReusableDraw {

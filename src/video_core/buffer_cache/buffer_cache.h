@@ -17,6 +17,7 @@
 #include <fmt/ranges.h>
 
 #include "common/range_sets.inc"
+#include "common/scope_exit.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
@@ -1024,6 +1025,10 @@ void BufferCache<P>::BindGraphicsIndirectStorageBuffers(
         slots, cbuf_address, std::span<const Binding>{bindings}.first(first_index),
         std::span{bindings}.subspan(first_index, bases.size()), bases, true);
     Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_gfx_draws, 1);
+    if (nx2_indirect_note_on) [[unlikely]] {
+        nx2_indirect_note.bound += static_cast<u32>(resolved.bound);
+        nx2_indirect_note.dropped += static_cast<u32>(resolved.dropped);
+    }
     if (resolved.dropped != 0) {
         Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_gfx_dropped,
                         resolved.dropped);
@@ -1106,9 +1111,24 @@ void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
     if (!native_indirect_verifies.empty()) {
         RetireNativeIndirectVerifies();
     }
+    const bool note = graphics && nx2_indirect_note_on;
+    SCOPE_EXIT {
+        if (note) [[unlikely]] {
+            for (size_t i = 0; i < addrs.size(); ++i) {
+                nx2_indirect_note.null_pointers += addrs[i] != 0 && out[i] == 0 ? 1 : 0;
+            }
+            nx2_indirect_note.cached += static_cast<u32>(cache_hits);
+            nx2_indirect_note.speculated += static_cast<u32>(speculated);
+            nx2_indirect_note.waited += static_cast<u32>(host_reads.size());
+        }
+    };
     for (size_t i = 0; i < addrs.size(); ++i) {
         out[i] = 0;
         const GPUVAddr addr = addrs[i];
+        if (note) [[unlikely]] {
+            ++nx2_indirect_note.slots;
+            nx2_indirect_note.no_record += addr == 0 ? 1 : 0;
+        }
         if (addr == 0 || !gpu_memory->IsWithinGPUAddressRange(addr) ||
             !gpu_memory->IsFullyMappedRange(addr, sizeof(u64))) {
             continue;
@@ -1119,6 +1139,11 @@ void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
         }
         const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(addr);
         if (!device_addr || !IsRegionGpuModified(*device_addr, sizeof(u64))) {
+            if (note) [[unlikely]] {
+                ++nx2_indirect_note.guest;
+                nx2_indirect_note.never_written +=
+                    device_addr && !Tegra::Nx2IsGpuWritten(*device_addr) ? 1 : 0;
+            }
             continue;
         }
         const auto cached = std::ranges::find(native_indirect_cache, *device_addr,

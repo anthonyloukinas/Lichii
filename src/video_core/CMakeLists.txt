@@ -117,6 +117,7 @@ add_library(video_core STATIC
     nx2_cmdpage_diag.h
     nx2_draw_runs.h
     nx2_mesh_count_trace.h
+    nx2_target_trace.h
     nx2_clean_pages.h
     nx2_fast_draw.h
     nx2_debug_control.cpp
