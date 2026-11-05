@@ -852,13 +852,12 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     channel_state->enabled_compute_storage_buffers = 0;
     channel_state->written_compute_storage_buffers = 0;
     channel_state->native_compute_storage_buffers = 0;
-    channel_state->dynamic_slot_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
 
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                              bool is_written, bool native_dynamic_slot) {
+                                              bool is_written) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -898,12 +897,150 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     channel_state->native_compute_storage_buffers =
         (channel_state->native_compute_storage_buffers & ~(1U << ssbo_index)) |
         ((native_pointer ? 1U : 0U) << ssbo_index);
-    const bool dynamic_slot = native_pointer && native_dynamic_slot;
-    channel_state->dynamic_slot_compute_storage_buffers =
-        (channel_state->dynamic_slot_compute_storage_buffers & ~(1U << ssbo_index)) |
-        ((dynamic_slot ? 1U : 0U) << ssbo_index);
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer, dynamic_slot);
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer);
+}
+
+template <class P>
+void BufferCache<P>::BindComputeIndirectStorageBuffers(
+    size_t first_index, std::span<const Shader::NativeIndirectSlot> slots, std::span<u64> bases) {
+    // Read-only bindings for a native program's pointers loaded from records: the pointer at each
+    // record's constant buffer slot gives the record, the word at deref_offset in it the storage
+    // pointer. Records are tried in order; null, unmapped and repeated pointers and pointers the
+    // program's other bindings already cover are skipped. The shader takes each binding's base
+    // address from `bases` (0 for an unused one) and picks the binding at run time.
+    std::ranges::fill(bases, u64{0});
+    for (size_t k = 0; k < bases.size(); ++k) {
+        const size_t ssbo_index = first_index + k;
+        if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
+            LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
+                      ssbo_index);
+            return;
+        }
+        channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
+        channel_state->written_compute_storage_buffers &= ~(1U << ssbo_index);
+        channel_state->native_compute_storage_buffers |= 1U << ssbo_index;
+        channel_state->compute_storage_buffers[ssbo_index] = NULL_BINDING;
+    }
+    const auto& launch_desc = kepler_compute->launch_description;
+    const auto& cbufs = launch_desc.const_buffer_config;
+    std::array<GPUVAddr, Shader::Info::MAX_NATIVE_INDIRECT_SLOTS> pointer_addrs{};
+    std::array<u64, Shader::Info::MAX_NATIVE_INDIRECT_SLOTS> pointers{};
+    const size_t num_slots = (std::min)(slots.size(), pointer_addrs.size());
+    for (size_t i = 0; i < num_slots; ++i) {
+        const Shader::NativeIndirectSlot& slot = slots[i];
+        if (slot.cbuf_index >= cbufs.size() ||
+            ((launch_desc.const_buffer_enable_mask >> slot.cbuf_index) & 1) == 0) {
+            continue;
+        }
+        const GPUVAddr record =
+            gpu_memory->Read<u64>(cbufs[slot.cbuf_index].Address() + slot.cbuf_offset);
+        if (record != 0) {
+            pointer_addrs[i] = record + slot.deref_offset;
+        }
+    }
+    ReadNativeIndirectPointers(std::span{pointer_addrs}.first(num_slots),
+                               std::span{pointers}.first(num_slots));
+    const auto covered = [&](GPUVAddr pointer, size_t end) {
+        for (size_t index = 0; index < end; ++index) {
+            const Binding& binding = channel_state->compute_storage_buffers[index];
+            if (binding.size != 0 && pointer >= binding.gpu_addr &&
+                pointer < binding.gpu_addr + binding.size) {
+                return true;
+            }
+        }
+        return false;
+    };
+    size_t next = 0;
+    u32 skipped_full = 0;
+    for (size_t i = 0; i < num_slots; ++i) {
+        const GPUVAddr pointer = pointers[i];
+        if (pointer_addrs[i] == 0 || pointer == 0 ||
+            !gpu_memory->IsWithinGPUAddressRange(pointer) ||
+            !gpu_memory->IsFullyMappedRange(pointer, 1) || covered(pointer, first_index + next)) {
+            continue;
+        }
+        if (next == bases.size()) {
+            ++skipped_full;
+            continue;
+        }
+        const Binding binding =
+            StorageBufferBindingAt(pointer, pointer_addrs[i], slots[i].cbuf_index, false, true);
+        if (binding.size == 0) {
+            continue;
+        }
+        channel_state->compute_storage_buffers[first_index + next] = binding;
+        bases[next] = binding.gpu_addr;
+        ++next;
+    }
+    if (skipped_full != 0) {
+        Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_dropped, skipped_full);
+    }
+    Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_bound, next);
+}
+
+template <class P>
+void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
+                                                std::span<u64> out) {
+    // Guest memory, except where GPU work wrote the pointer's bytes (or a binding over them was
+    // marked written): guest memory can be stale there, so those words come from the buffers'
+    // host copies, all in one copy back and one wait.
+    struct HostRead {
+        size_t index;
+        BufferId buffer_id;
+        u64 offset;
+    };
+    boost::container::small_vector<HostRead, Shader::Info::MAX_NATIVE_INDIRECT_SLOTS> host_reads;
+    for (size_t i = 0; i < addrs.size(); ++i) {
+        out[i] = 0;
+        const GPUVAddr addr = addrs[i];
+        if (addr == 0 || !gpu_memory->IsWithinGPUAddressRange(addr) ||
+            !gpu_memory->IsFullyMappedRange(addr, sizeof(u64))) {
+            continue;
+        }
+        out[i] = gpu_memory->Read<u64>(addr);
+        if (Tegra::g_nx2_indirect_guest_reads) {
+            continue;
+        }
+        const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(addr);
+        if (!device_addr || !IsRegionGpuModified(*device_addr, sizeof(u64))) {
+            continue;
+        }
+        const u64 page = *device_addr >> CACHING_PAGEBITS;
+        const BufferId buffer_id = page < page_table.size() ? page_table[page] : BufferId{};
+        if (!buffer_id || !slot_buffers[buffer_id].IsInBounds(*device_addr, sizeof(u64))) {
+            continue;
+        }
+        host_reads.push_back({i, buffer_id, *device_addr - slot_buffers[buffer_id].CpuAddr()});
+    }
+    if (host_reads.empty()) {
+        return;
+    }
+    Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_host_reads, host_reads.size());
+    if constexpr (USE_MEMORY_MAPS) {
+        auto staging = runtime.DownloadStagingBuffer(host_reads.size() * sizeof(u64));
+        for (size_t k = 0; k < host_reads.size(); ++k) {
+            const HostRead& read = host_reads[k];
+            Buffer& buffer = slot_buffers[read.buffer_id];
+            const std::array copies{BufferCopy{
+                .src_offset = read.offset,
+                .dst_offset = staging.offset + k * sizeof(u64),
+                .size = sizeof(u64),
+            }};
+            buffer.MarkUsage(read.offset, sizeof(u64));
+            runtime.CopyBuffer(staging.buffer, buffer, copies, true);
+        }
+        runtime.Finish();
+        for (size_t k = 0; k < host_reads.size(); ++k) {
+            std::memcpy(&out[host_reads[k].index], staging.mapped_span.data() + k * sizeof(u64),
+                        sizeof(u64));
+        }
+    } else {
+        for (const HostRead& read : host_reads) {
+            slot_buffers[read.buffer_id].ImmediateDownload(
+                read.offset, std::span{reinterpret_cast<u8*>(&out[read.index]), sizeof(u64)});
+        }
+    }
 }
 
 template <class P>
@@ -1795,12 +1932,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         // written; the binding keeps its size so the shader can still read all of it.
         const bool native =
             ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
-        // A dynamic pointer slot's writes can land anywhere in its binding, far past the
-        // pointer, so it is marked whole.
-        const bool dynamic_slot =
-            ((channel_state->dynamic_slot_compute_storage_buffers >> index) & 1) != 0;
-        const u64 write_mark_limit =
-            native && !dynamic_slot ? Tegra::g_nx2_compute_write_mark : ~u64{0};
+        const u64 write_mark_limit = native ? Tegra::g_nx2_compute_write_mark : ~u64{0};
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
@@ -3074,10 +3206,15 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                             bool is_written, bool native_pointer,
-                                             bool native_dynamic_slot) const {
-    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+                                             bool is_written, bool native_pointer) const {
+    return StorageBufferBindingAt(gpu_memory->Read<u64>(ssbo_addr), ssbo_addr, cbuf_index,
+                                  is_written, native_pointer);
+}
 
+template <class P>
+Binding BufferCache<P>::StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_addr,
+                                               u32 cbuf_index, bool is_written,
+                                               bool native_pointer) const {
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
@@ -3089,14 +3226,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
         if (native_pointer) {
-            // A slot of a pointer table read at a dynamic offset: the program can reach past the
-            // pointer's own mapping, so take at least 4 MiB of what is mapped from it. Only one
-            // device range: a written binding is bound as one, and writes past it would land in
-            // other allocations.
-            const u32 floor = native_dynamic_slot
-                                  ? static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, 4_MiB))
-                                  : 0U;
-            return (std::min)((std::max)(memory_layout_size, floor), static_cast<u32>(8_MiB));
+            return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
         }
         const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);

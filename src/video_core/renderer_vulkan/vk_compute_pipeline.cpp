@@ -338,17 +338,28 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 TextureCacheRuntime& texture_runtime,
                                 std::optional<ByteAddressedShadow>& shadow) {
     shadow.reset();
-    guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
-
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
     buffer_cache.UnbindComputeStorageBuffers();
     size_t ssbo_index{};
+    size_t num_indirect{};
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
+        if (desc.native_indirect) {
+            // After the others (GlobalMemoryToStorageBufferPass), bound below
+            ++num_indirect;
+            continue;
+        }
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written, desc.native_dynamic_slot);
+                                              desc.is_written);
         ++ssbo_index;
     }
+    std::array<u64, Shader::Info::MAX_NATIVE_INDIRECT_BINDINGS> indirect_bases{};
+    if (num_indirect != 0) {
+        buffer_cache.BindComputeIndirectStorageBuffers(
+            ssbo_index, info.native_indirect_slots, std::span{indirect_bases}.first(num_indirect));
+    }
+    // After the storage buffers: binding loaded pointers can wait for the GPU (a host read back).
+    guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     texture_cache.SynchronizeDescriptors(true);
 
@@ -629,8 +640,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
-                      descriptor_buffer_chunk, bind_descriptor_buffer,
-                      rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+                      descriptor_buffer_chunk, bind_descriptor_buffer, num_indirect,
+                      indirect_bases, rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -647,6 +658,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                  RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
                                  rescaling_data.data());
+        }
+        if (num_indirect != 0) {
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                 Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET,
+                                 static_cast<u32>(sizeof(indirect_bases)), indirect_bases.data());
         }
         if (uses_descriptor_buffer) {
             const u32 buffer_index{};

@@ -733,6 +733,17 @@ int main(int argc, char** argv) {
                 {"dyn_slots", stats.dyn_slots},
                 {"dyn_slots_dropped", stats.dyn_slots_dropped},
                 {"dyn_cbuf_mask", stats.dyn_cbuf_mask},
+                {"indirect_bound", stats.indirect_loads},
+                {"indirect_slots", stats.indirect_slots},
+                {"indirect_slots_dropped", stats.indirect_slots_dropped},
+                {"indirect_bindings", stats.indirect_bindings},
+                {"indirect_records", [&] {
+                     Json records = Json::array();
+                     for (const auto& slot : program.info.native_indirect_slots) {
+                         records.push_back({slot.cbuf_index, slot.cbuf_offset, slot.deref_offset});
+                     }
+                     return records;
+                 }()},
                 {"storage_buffers", program.info.storage_buffers_descriptors.size()},
             };
         }

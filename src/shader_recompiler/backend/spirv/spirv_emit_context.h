@@ -314,6 +314,12 @@ public:
     Id mesh_draw_base_push_constant{};
     u32 mesh_draw_base_member_index{};
 
+    Id native_indirect_bases_push_constant{};
+    u32 native_indirect_bases_member_index{};
+    /// OpAccessChain results PatchArrayLengths turns into OpArrayLength, and their index operand
+    Id array_length_marker{};
+    std::vector<u32> array_length_results;
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -430,10 +436,17 @@ private:
     void DefineWriteStorageCasLoopFunction(const Info& info);
     void DefineGlobalMemoryFunctions(const IR::Program& program);
     void DefineRescalingInput(const Info& info);
-    void DefineRescalingInputPushConstant();
+    void DefineRescalingInputPushConstant(const Info& info);
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
     void DefineMeshDrawBase();
+    void DefineNativeIndirectBases(const Info& info);
+    [[nodiscard]] bool UsesNativeIndirectBases(const Info& info) const;
+    [[nodiscard]] Id NativeIndirectBasesType();
+    /// Base address of the index-th native_indirect storage buffer, from the push constants
+    [[nodiscard]] Id NativeIndirectBase(u32 index);
+    /// Length of a storage buffer's runtime array (in its elements), as a 32-bit unsigned value
+    [[nodiscard]] Id ArrayLength(Id ssbo);
     [[nodiscard]] bool UsesMeshDrawBase() const;
     [[nodiscard]] u32 MeshDrawBaseOffset() const;
 

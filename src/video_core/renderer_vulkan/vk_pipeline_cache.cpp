@@ -343,7 +343,9 @@ size_t GetTotalPipelineWorkers() {
 
 // EDEN_NX2_UNTRACKED_GLOBAL_LOG=1 (or EDEN_NX2_MESH_COUNT_TRACE=1): one line per native program
 // with global accesses no storage buffer covers, or covered only by binding a dynamically indexed
-// constant buffer's pointers (GlobalMemoryToStorageBufferPass).
+// constant buffer's pointers or the targets of pointers loaded from records
+// (GlobalMemoryToStorageBufferPass). Loads through a loaded pointer that stay unbound are
+// loaded-ptr:l; indirect-bound:l are the ones bound per dispatch.
 void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info) {
     static const bool enabled = [] {
         const auto set = [](const char* name) {
@@ -376,15 +378,20 @@ void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info)
     LOG_INFO(Render_Vulkan,
              "NX2 untracked global: hash={:016x} stage={} writes={} loads={} "
              "reason=dyn-cbuf(idx={}):w{}/l{},loaded-ptr:w{}/l{},other:w{}/l{} "
-             "dyn-bound:w{}/l{} dyn-slots={} dyn-dropped={} ssbos={} dyn_cbuf_pointers={}",
+             "dyn-bound:w{}/l{} dyn-slots={} dyn-dropped={} indirect-bound:l{} "
+             "indirect-records={} indirect-dropped={} indirect-ssbos={} ssbos={} "
+             "dyn_cbuf_pointers={} indirect_pointers={}",
              hash, stage_index < stage_names.size() ? stage_names[stage_index] : "?",
              stats.dyn_cbuf_writes + stats.loaded_ptr_writes + stats.other_writes,
              stats.dyn_cbuf_loads + stats.loaded_ptr_loads + stats.other_loads,
              cbufs.empty() ? "-" : cbufs, stats.dyn_cbuf_writes, stats.dyn_cbuf_loads,
              stats.loaded_ptr_writes, stats.loaded_ptr_loads, stats.other_writes,
              stats.other_loads, stats.dyn_bound_writes, stats.dyn_bound_loads, stats.dyn_slots,
-             stats.dyn_slots_dropped, info.storage_buffers_descriptors.size(),
-             Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0);
+             stats.dyn_slots_dropped, stats.indirect_loads, stats.indirect_slots,
+             stats.indirect_slots_dropped, stats.indirect_bindings,
+             info.storage_buffers_descriptors.size(),
+             Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0,
+             Shader::Optimization::NativeIndirectPointers() ? 1 : 0);
 }
 
 } // Anonymous namespace
@@ -724,11 +731,13 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
     translation_cache_verify = verify != nullptr && verify[0] == '1';
     // Device values the translation and MakeRuntimeInfo read besides the profile and host info.
     const std::string device_id =
-        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}", CACHE_VERSION, device.GetModelName(),
+        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}|indirect{}", CACHE_VERSION,
+                    device.GetModelName(),
                     static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
                     device.GetMaxComputeSharedMemorySize(), device.IsGeometryShaderSupported(),
                     device.IsExtMeshShaderSupported(),
-                    Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0);
+                    Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0,
+                    Shader::Optimization::NativeIndirectPointers() ? 1 : 0);
     translation_config = TC::MakeConfigDigest(
         profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
     translation_cache.Open(filename, translation_config);

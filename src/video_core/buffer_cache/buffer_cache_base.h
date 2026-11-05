@@ -155,8 +155,6 @@ public:
     u32 written_compute_storage_buffers = 0;
     // Bound by a native (Switch 2) compute program, whose pointers carry no size.
     u32 native_compute_storage_buffers = 0;
-    // Native pointer slots bound for a pointer table read at a dynamic offset.
-    u32 dynamic_slot_compute_storage_buffers = 0;
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -317,7 +315,14 @@ public:
     void UnbindComputeStorageBuffers();
 
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written, bool native_dynamic_slot = false);
+                                  bool is_written);
+
+    /// Binds a native program's read-only storage buffers for pointers loaded from records
+    /// (Shader::Info::native_indirect_slots) at first_index on, one per element of `bases`, and
+    /// writes the base address the shader sees for each (0 when unused).
+    void BindComputeIndirectStorageBuffers(size_t first_index,
+                                           std::span<const Shader::NativeIndirectSlot> slots,
+                                           std::span<u64> bases);
 
     void UnbindComputeTextureBuffers();
 
@@ -612,8 +617,16 @@ private:
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written, bool native_pointer = false,
-                                               bool native_dynamic_slot = false) const;
+                                               bool is_written, bool native_pointer = false) const;
+
+    /// StorageBufferBinding for the pointer gpu_addr read from ssbo_addr
+    [[nodiscard]] Binding StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_addr,
+                                                 u32 cbuf_index, bool is_written,
+                                                 bool native_pointer) const;
+
+    /// The 64-bit pointers at addrs (0 for a null or unmapped address), from the buffers' host
+    /// copies where GPU work wrote them
+    void ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs, std::span<u64> out);
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);

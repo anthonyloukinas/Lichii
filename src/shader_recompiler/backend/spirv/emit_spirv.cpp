@@ -598,6 +598,30 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
     }
 }
 
+// Turns the OpAccessChain(U32, ssbo, marker) results of EmitContext::ArrayLength into
+// OpArrayLength(U32, ssbo, 0), which Sirit cannot emit. Both take five words.
+void PatchArrayLengths(std::vector<u32>& code, const EmitContext& ctx) {
+    if (ctx.array_length_results.empty()) {
+        return;
+    }
+    size_t offset = 5;
+    while (offset + 4 < code.size()) {
+        const u32 word_count{code[offset] >> 16};
+        if (word_count == 0) {
+            return;
+        }
+        const auto opcode{static_cast<spv::Op>(code[offset] & 0xFFFFu)};
+        if (opcode == spv::Op::OpAccessChain && word_count == 5 &&
+            code[offset + 4] == ctx.array_length_marker.value &&
+            std::ranges::find(ctx.array_length_results, code[offset + 2]) !=
+                ctx.array_length_results.end()) {
+            code[offset] = (word_count << 16) | static_cast<u32>(spv::Op::OpArrayLength);
+            code[offset + 4] = 0;
+        }
+        offset += word_count;
+    }
+}
+
 // Replaces the OpStore markers of the mesh instructions Sirit cannot emit: OpStore(vertices,
 // primitives) becomes OpSetMeshOutputsEXT, and OpStore(x, y), OpStore(z, payload), OpReturn
 // becomes the OpEmitMeshTasksEXT terminator.
@@ -659,6 +683,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     PatchPhiNodes(program, ctx);
     std::vector<u32> code{ctx.Assemble()};
     RewriteOpcodes(code, ctx.opcode_rewrites);
+    PatchArrayLengths(code, ctx);
     PatchMeshInstructions(code, ctx);
     return code;
 }

@@ -39,6 +39,8 @@ bool HasBrokenPattern(const IR::Program& program);
 /// EDEN_NX2_DYN_CBUF_POINTERS (default on, read once): native global accesses whose base pointer
 /// is read from a constant buffer at a dynamic offset bind every pointer of that buffer.
 bool NativeDynamicCbufPointers();
+/// EDEN_NX2_INDIRECT_POINTERS=0: native loads through a pointer loaded from a record stay unbound
+bool NativeIndirectPointers();
 
 // Dual Vertex
 void VertexATransformPass(IR::Program& program);

@@ -124,13 +124,18 @@ void AddNVNStorageBuffers(IR::Program& program) {
         }
         const u32 offset{base + index * descriptor_size};
         const auto it{std::ranges::find_if(descs, [=](const StorageBufferDescriptor& desc) {
-            return desc.cbuf_index == driver_cbuf && desc.cbuf_offset == offset;
+            return !desc.native_indirect && desc.cbuf_index == driver_cbuf &&
+                   desc.cbuf_offset == offset;
         })};
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
             continue;
         }
-        descs.push_back({
+        // Native read-only bindings for loaded pointers stay last (the compute pipeline binds
+        // them after the others).
+        const auto indirect{std::ranges::find_if(
+            descs, [](const StorageBufferDescriptor& desc) { return desc.native_indirect; })};
+        descs.insert(indirect, {
             .cbuf_index = driver_cbuf,
             .cbuf_offset = offset,
             .count = 1,
