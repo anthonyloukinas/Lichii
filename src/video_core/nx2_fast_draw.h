@@ -238,4 +238,16 @@ inline void NoteInvalidation() {
     }
 }
 
+/// EDEN_NX2_HOT_PAGES: pages the guest writes without a trap were marked written again. Delta
+/// draws resolve the stage and vertex buffers again (a reused draw would keep stale uploads).
+/// The delta is the back's: other threads break.
+inline void NoteHotWrite(bool on_back) {
+    if (g_delta_enabled && on_back) {
+        g_delta.invalidated = true;
+        g_delta.vertex_buffers = true;
+    } else {
+        Break(Reason::Invalidation);
+    }
+}
+
 } // namespace VideoCommon::Nx2FastDraw

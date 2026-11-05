@@ -9,6 +9,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/nx2_profile.h"
@@ -24,6 +25,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_hot_pages.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -197,6 +199,8 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
+        // EDEN_NX2_HOT_PAGES: the CPU may have written what follows before its release.
+        VideoCommon::Nx2HotPages::BumpEpoch();
     }
     return true;
 }
@@ -291,6 +295,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                  regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence,
                  dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress()));
     }
+    // EDEN_NX2_HOT_PAGES: an acquire met here (or failed, then met at its resume, which bumps
+    // again) follows the release; the CPU may have written what comes next before releasing.
+    SCOPE_EXIT {
+        if (op != GpuSemaphoreOperation::WriteLong) {
+            VideoCommon::Nx2HotPages::BumpEpoch();
+        }
+    };
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
@@ -394,6 +405,7 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
         regs.acquire_mode = false;
         regs.acquire_source = false;
     }
+    VideoCommon::Nx2HotPages::BumpEpoch(); // EDEN_NX2_HOT_PAGES: as in the trigger method
 }
 
 // Ampere SEM_EXECUTE (method 0x1B): operation in bits 2:0 on the semaphore at
@@ -414,6 +426,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     DrainBack();
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+    VideoCommon::Nx2HotPages::BumpEpoch(); // EDEN_NX2_HOT_PAGES: as in the trigger method
     const bool ready = operation == 0   ? word == payload
                        : operation == 2 ? word >= payload
                        : operation == 3 ? static_cast<s32>(word - payload) >= 0

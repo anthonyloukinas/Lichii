@@ -18,6 +18,8 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_hot_pages.h"
 
 namespace VideoCommon {
 
@@ -31,6 +33,9 @@ enum class Type {
     CachedCPU,
     Untracked,
     Preflushable,
+    Hot,      ///< EDEN_NX2_HOT_PAGES: left writable by uploads (always also Untracked)
+    Refault0, ///< EDEN_NX2_HOT_PAGES: times the protection came off (2-bit saturating count)
+    Refault1,
     Max
 };
 
@@ -120,7 +125,17 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         std::vector<std::pair<VAddr, u64>> ranges;
+        std::vector<std::pair<VAddr, u64>> cooled_ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            if (type == Type::GPU && enable) {
+                CoolHotPages(index, mask, cooled_ranges);
+            }
+            if (type == Type::CPU && enable) {
+                NoteRefaults(index, ~untracked_words[index] & mask);
+            }
+            if (type == Type::CPU && !enable) {
+                ForgetHotPages(index, mask);
+            }
             if (type == Type::CPU || type == Type::CachedCPU) {
                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
             }
@@ -140,6 +155,9 @@ struct WordManager {
         });
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, (!enable) ? 1 : -1);
+        }
+        if (!cooled_ranges.empty()) {
+            ApplyCollectedRanges(cooled_ranges, 1);
         }
     }
 
@@ -165,17 +183,21 @@ struct WordManager {
                  (pending_pointer - pending_offset) * BYTES_PER_PAGE);
         };
         std::vector<std::pair<VAddr, u64>> ranges;
+        u64 kept_pages = 0;
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
             if (clear) {
+                // EDEN_NX2_HOT_PAGES: hot pages are uploaded but stay writable (Untracked).
+                const u64 keep = type == Type::CPU ? HotKeep(index, mask) : 0;
+                kept_pages += static_cast<u64>(std::popcount(keep));
                 if (type == Type::CPU || type == Type::CachedCPU) {
-                    CollectChangedRanges(true, index, untracked_words[index], mask, ranges);
+                    CollectChangedRanges(true, index, untracked_words[index] & ~keep, mask, ranges);
                 }
                 state_words[index] &= ~mask;
                 if (type == Type::CPU || type == Type::CachedCPU)
-                    untracked_words[index] &= ~mask;
+                    untracked_words[index] &= ~(mask & ~keep);
                 if (type == Type::CPU)
                     cached_words[index] &= ~word;
             }
@@ -200,6 +222,51 @@ struct WordManager {
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, 1);
         }
+        if (kept_pages != 0) {
+            Nx2HotPages::Count(Nx2HotPages::g_counters.kept, kept_pages);
+        }
+    }
+
+    /// EDEN_NX2_HOT_PAGES: marks a hot page CPU-modified (the guest may have written it without
+    /// a fault). False if the page isn't hot.
+    bool MarkHotWritten(u64 offset) noexcept {
+        const auto [index, page] = GetWordPage(offset);
+        const u64 bit = u64{1} << page;
+        if ((Span(Type::Hot)[index] & bit) == 0) {
+            return false;
+        }
+        Span(Type::CPU)[index] |= bit;
+        Span(Type::Untracked)[index] |= bit;
+        Span(Type::CachedCPU)[index] &= ~bit;
+        return true;
+    }
+
+    /// EDEN_NX2_HOT_PAGES: ends a hot page; it stays CPU-modified, so the next upload sends it and
+    /// protects it. False if the page isn't hot.
+    bool DemoteHot(u64 offset) noexcept {
+        const auto [index, page] = GetWordPage(offset);
+        const u64 bit = u64{1} << page;
+        if ((Span(Type::Hot)[index] & bit) == 0) {
+            return false;
+        }
+        Span(Type::Hot)[index] &= ~bit;
+        Span(Type::Refault0)[index] &= ~bit;
+        Span(Type::Refault1)[index] &= ~bit;
+        Span(Type::CPU)[index] |= bit;
+        Span(Type::Untracked)[index] |= bit;
+        Span(Type::CachedCPU)[index] &= ~bit;
+        return true;
+    }
+
+    [[nodiscard]] bool IsHot(u64 offset) const noexcept {
+        const auto [index, page] = GetWordPage(offset);
+        return ((Span(Type::Hot)[index] >> page) & 1) != 0;
+    }
+
+    /// EDEN_NX2_HOT_PAGES: forgets how often pages lost their protection.
+    void DecayRefaults() noexcept {
+        std::ranges::fill(Span(Type::Refault0), u64{0});
+        std::ranges::fill(Span(Type::Refault1), u64{0});
     }
 
     /// @brief Returns true when a region has been modified
@@ -258,6 +325,77 @@ struct WordManager {
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, -1);
         }
+    }
+
+    /// EDEN_NX2_HOT_PAGES: the pages of `mask` an upload leaves writable.
+    u64 HotKeep(size_t index, u64 mask) const noexcept {
+        return Span(Type::Hot)[index] & Span(Type::Untracked)[index] & ~Span(Type::GPU)[index] &
+               mask;
+    }
+
+    /// EDEN_NX2_HOT_PAGES: `bits` (not GPU-modified, protected until now) take a CPU write.
+    void NoteRefaults(size_t index, u64 bits) noexcept {
+        if (!Nx2HotPages::g_enabled || hot_list == nullptr) {
+            return;
+        }
+        u64& hot = Span(Type::Hot)[index];
+        bits &= ~hot & ~Span(Type::GPU)[index];
+        if (bits == 0) {
+            return;
+        }
+        u64& count0 = Span(Type::Refault0)[index];
+        u64& count1 = Span(Type::Refault1)[index];
+        const u64 increment = bits & ~(count0 & count1);
+        const u64 carry = count0 & increment;
+        count0 ^= increment;
+        count1 |= carry;
+        static_assert(Nx2HotPages::PromoteAfter == 3);
+        for (u64 promote = bits & count0 & count1; promote != 0; promote &= promote - 1) {
+            const u64 page = static_cast<u64>(std::countr_zero(promote));
+            const VAddr address = cpu_addr + (index * PAGES_PER_WORD + page) * BYTES_PER_PAGE;
+            // GPU-written pages (ever, Switch 2) and full lists stay protected.
+            if (hot_list->pages.size() >= Nx2HotPages::MaxPages ||
+                Tegra::Nx2IsGpuWritten(address)) {
+                continue;
+            }
+            hot |= u64{1} << page;
+            hot_list->pages.push_back(address);
+            hot_list->size.store(hot_list->pages.size(), std::memory_order_relaxed);
+            Nx2HotPages::Count(Nx2HotPages::g_counters.promoted, 1);
+        }
+    }
+
+    /// EDEN_NX2_HOT_PAGES: GPU work is about to write hot pages of `mask`. GPU-modified state
+    /// counts only on protected pages: protect them now. They stay CPU-modified (the guest may
+    /// have written them since their last upload); uploads skip GPU-written bytes.
+    void CoolHotPages(size_t index, u64 mask, std::vector<std::pair<VAddr, u64>>& protect) {
+        u64& hot = Span(Type::Hot)[index];
+        const u64 cool = hot & mask;
+        if (cool == 0) {
+            return;
+        }
+        hot &= ~cool;
+        Span(Type::Refault0)[index] &= ~cool;
+        Span(Type::Refault1)[index] &= ~cool;
+        u64& untracked = Span(Type::Untracked)[index];
+        CollectChangedRanges(true, index, untracked, cool, protect);
+        untracked &= ~cool;
+        Span(Type::CPU)[index] |= cool;
+        Span(Type::CachedCPU)[index] &= ~cool;
+        Nx2HotPages::Count(Nx2HotPages::g_counters.cooled, static_cast<u64>(std::popcount(cool)));
+    }
+
+    /// EDEN_NX2_HOT_PAGES: pages unmarked as CPU-modified are protected again: not hot.
+    void ForgetHotPages(size_t index, u64 mask) noexcept {
+        u64& hot = Span(Type::Hot)[index];
+        if ((hot & mask) == 0) {
+            return;
+        }
+        Nx2HotPages::Count(Nx2HotPages::g_counters.cooled,
+                           static_cast<u64>(std::popcount(hot & mask)));
+        hot &= ~mask;
+        Span(Type::Refault0)[index] &= ~mask;
+        Span(Type::Refault1)[index] &= ~mask;
     }
 
     /// @brief Notify tracker about changes in the CPU tracking state of a word in the buffer
@@ -321,6 +459,7 @@ struct WordManager {
 
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
     DeviceTracker* tracker = nullptr;
+    Nx2HotPages::HotList* hot_list = nullptr; ///< EDEN_NX2_HOT_PAGES (the memory tracker's)
     VAddr cpu_addr = 0;
 };
 

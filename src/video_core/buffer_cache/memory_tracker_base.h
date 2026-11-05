@@ -190,6 +190,87 @@ public:
         });
     }
 
+    /// EDEN_NX2_HOT_PAGES: whether any page is (or recently was) hot. May be read without the lock.
+    [[nodiscard]] bool HasHotPages() const noexcept {
+        return hot_list.size.load(std::memory_order_relaxed) != 0;
+    }
+
+    /// EDEN_NX2_HOT_PAGES: marks every hot page CPU-modified and calls func(address, size) for
+    /// each run of them. Returns the pages marked.
+    template <typename Func>
+    u64 MarkHotPagesWritten(Func&& func) {
+        u64 marked = 0;
+        VAddr run_begin = 0;
+        VAddr run_end = 0;
+        for (const VAddr page : hot_list.pages) {
+            Manager* const manager = top_tier[page >> HIGHER_PAGE_BITS];
+            if (manager == nullptr || !manager->MarkHotWritten(page - manager->cpu_addr)) {
+                continue;
+            }
+            ++marked;
+            if (page == run_end) {
+                run_end += BYTES_PER_PAGE;
+                continue;
+            }
+            if (run_end != run_begin) {
+                func(run_begin, run_end - run_begin);
+            }
+            run_begin = page;
+            run_end = page + BYTES_PER_PAGE;
+        }
+        if (run_end != run_begin) {
+            func(run_begin, run_end - run_begin);
+        }
+        if (marked != 0) {
+            synchronized_mask = 0;
+        }
+        return marked;
+    }
+
+    /// EDEN_NX2_HOT_PAGES, once a frame: drops cooled pages from the list, and every
+    /// DemoteFrames frames ends every hot page (each stays CPU-modified: its next upload
+    /// protects it). Every DecayFrames frames the protection loss counts start over.
+    void TickHotPages() {
+        ++hot_frames;
+        if (hot_frames % Nx2HotPages::DecayFrames == 0) {
+            for (auto& pool : manager_pool) {
+                for (Manager& manager : pool) {
+                    manager.DecayRefaults();
+                }
+            }
+        }
+        if (hot_list.pages.empty()) {
+            return;
+        }
+        auto& pages = hot_list.pages;
+        const auto is_hot = [&](VAddr page) {
+            Manager* const manager = top_tier[page >> HIGHER_PAGE_BITS];
+            return manager != nullptr && manager->IsHot(page - manager->cpu_addr);
+        };
+        if (hot_frames % Nx2HotPages::DemoteFrames == 0) {
+            u64 demoted = 0;
+            for (const VAddr page : pages) {
+                Manager* const manager = top_tier[page >> HIGHER_PAGE_BITS];
+                if (manager != nullptr && manager->DemoteHot(page - manager->cpu_addr)) {
+                    ++demoted;
+                }
+            }
+            pages.clear();
+            synchronized_mask = 0;
+            Nx2HotPages::Count(Nx2HotPages::g_counters.demoted, demoted);
+        } else {
+            std::erase_if(pages, [&](VAddr page) { return !is_hot(page); });
+            std::ranges::sort(pages);
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        }
+        hot_list.size.store(pages.size(), std::memory_order_relaxed);
+    }
+
+    /// EDEN_NX2_HOT_PAGES: pages hot now (list entries, which may include cooled ones).
+    [[nodiscard]] size_t HotPageCount() const noexcept {
+        return hot_list.size.load(std::memory_order_relaxed);
+    }
+
 private:
     /// The tracker marks whole pages: a write next to a range on one of its pages reaches it.
     void ForgetSynchronized(VAddr cpu_addr, u64 size) noexcept {
@@ -294,6 +375,7 @@ private:
         }
         Manager* new_manager = free_managers.front();
         new_manager->cpu_addr = base_cpu_address;
+        new_manager->hot_list = &hot_list;
         free_managers.pop_front();
         return new_manager;
     }
@@ -304,6 +386,8 @@ private:
     ::Common::unordered_set<u32> cached_pages;
     std::array<std::pair<VAddr, VAddr>, 32> synchronized_ranges{};
     u32 synchronized_mask{};
+    Nx2HotPages::HotList hot_list;
+    u64 hot_frames{};
     DeviceTracker* device_tracker = nullptr;
 };
 
