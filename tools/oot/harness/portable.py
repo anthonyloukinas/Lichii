@@ -124,8 +124,9 @@ def player0_mapping(guid):
     }
 
 
-def prepare_run(profile: Path, guid, keep_save=False, extra_pins=(), log=print):
-    """Copy the seed config/save into user/, then patch the copies for an unattended run."""
+def prepare_run(profile: Path, guid, keep_save=False, extra_pins=(), qt_extra=(), log=print):
+    """Copy the seed config/save into user/, then patch the copies for an unattended run.
+    qt_extra: more (section, key, value) for the profile's qt-config.ini (e.g. the gdb stub)."""
     profile = Path(profile).resolve()
     user = profile / "user"
     cfg = user / "config"
@@ -153,6 +154,8 @@ def prepare_run(profile: Path, guid, keep_save=False, extra_pins=(), log=print):
     s = _set(s, "UI", "Screenshots\\enable_screenshot_save_as", "false")  # hotkey saves silently
     s = _set(s, "UI", "Screenshots\\screenshot_path", str(user / "screenshots"))
     s = _set(s, "Miscellaneous", "log_filter", '"*:Info"')
+    for sec, k, v in qt_extra:
+        s = _set(s, sec, k, v)
     qt.write_text(s)
 
     gi = cfg / "custom" / TITLE_INI

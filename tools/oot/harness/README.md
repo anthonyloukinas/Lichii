@@ -54,6 +54,30 @@ before and after and records any change in `run.json` (`live_files_changed`).
   check the log for "Emulation cleanup completed"; SIGKILL after `--shutdown-timeout`. Core dumps
   of the emulator are disabled unless `--keep-cores`.
 
+## gdb stub and SVC trace (opt-in)
+
+    python3 -I tools/oot/harness/run.py --headless --gdb                          # stub + in-game probes
+    python3 -I tools/oot/harness/run.py --headless --gdb --svc-trace 4800:4870    # + SVC window
+
+- `--gdb` sets `use_gdbstub=true` / `gdbstub_port` (`--gdb-port`, default 6543) in the profile's
+  `user/config/qt-config.ini` only; without `--gdb` the profile pins `use_gdbstub=false`, since the
+  stub holds the guest at boot until a client continues it. At launch the harness waits for the
+  log's "Starting server on port" line and continues the guest; in game it runs `threads`,
+  `delta` (20 s), `pcs` (60 s) and `count-frames` (60 frames) into `threads.txt`, `delta.txt/.csv`,
+  `pcs.txt/.csv`, `count-frames.txt`, each as a `gdb-*` phase so summary.md has guest fps over it,
+  then a "gdb stub" section (delta distinct values, top-10 main-thread PCs as Ghidra addresses,
+  mean kick/join per frame). The heading measurement runs afterwards, unperturbed by stops.
+- The probe scripts are a **private kit outside this repository** (`--kit`, default
+  `~/Downloads/OOT/ghidra/runtime`: `rsp_probe.py`, `svc_trace_parse.py`), run with `python3 -I`.
+  Without it the guest is still continued (a built-in two-line client in `gdbkit.py`) and the
+  measurements are skipped with a message.
+- **The stub listens on 0.0.0.0** (`src/core/debugger/debugger.cpp:146`), unauthenticated, while
+  the run is up. The preflight refuses if the port is already bound (it bind-tests rather than
+  connects, because connecting to a live stub pauses that emulator).
+- `--svc-trace FIRST:LAST` adds `EDEN_NX2_SVC_TRACE=FIRST:LAST` to the run's environment and, after
+  shutdown, runs the kit's `svc_trace_parse.py` on `eden_log.txt` (with `--threads threads.txt`
+  when `--gdb` captured the names) into `svc-trace.md`.
+
 ## Output: `~/Downloads/OOT/harness-runs/<stamp>/`
 
 `screenshots/` (title, file-select, load-confirm, in-game, spawn, after-walk, heading<q>-c<cycle>),

@@ -5,12 +5,22 @@ emulator log and screenshots, then a clean shutdown and summary.json / summary.m
 
     python3 -I tools/oot/harness/run.py [--binary PATH] [--duration 120] [--headless]
                                         [--refresh-profile] [--env EDEN_NX2_X=1 ...]
+                                        [--gdb] [--svc-trace FIRST:LAST]
 
 Never touches the live ~/.config/eden, ~/.local/share/eden or ~/.cache/eden: the emulator runs
 with its working directory in the harness profile, whose user/ directory puts it in portable mode
 (see portable.py). Output: ~/Downloads/OOT/harness-runs/<stamp>/. Exit 0 = full run, 2 = a step
 failed (the run stops at the last reliable state; see run.json "failed_step" and the screenshots),
 3 = refused to start (another instance, low memory).
+
+--gdb turns the emulator's gdb stub on in the PROFILE's qt-config.ini only (never ~/.config/eden),
+continues the guest at boot (the stub holds it until a client sends `c`) and, once in game, runs
+the private runtime kit's rsp_probe.py (delta / pcs / count-frames) into the run folder; see
+gdbkit.py. The stub listens on 0.0.0.0:<port> (all interfaces, debugger.cpp:146), with no
+authentication, for as long as the run is up: anyone who can reach the port can read and write
+guest memory. Firewall the port or keep such runs off untrusted networks.
+--svc-trace FIRST:LAST sets EDEN_NX2_SVC_TRACE for the run and parses the log into svc-trace.md
+with the kit's svc_trace_parse.py (thread names from the stub when --gdb is on).
 """
 import argparse
 import datetime as dt
@@ -30,6 +40,7 @@ sys.dont_write_bytecode = True  # keep __pycache__ out of the worktree
 sys.path.insert(0, str(HERE))  # -I drops the script dir; these are the harness's own modules
 
 import analyze  # noqa: E402
+import gdbkit  # noqa: E402
 import pad as padmod  # noqa: E402
 import portable as prof  # noqa: E402
 import states  # noqa: E402
@@ -133,6 +144,17 @@ def last_log_ts(path):
     return None
 
 
+def port_free(port):
+    """Bind test only: connecting to a live gdb stub would pause that emulator's guest."""
+    import socket
+    with socket.socket() as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
 def live_fingerprint():
     """mtimes of the live emulator files the harness must never write (checked after the run)."""
     fp = {}
@@ -161,6 +183,7 @@ class Run:
         self.n_shot = 0
         self.info = {"stamp": self.stamp, "binary": str(a.binary), "game": str(a.game),
                      "profile": str(a.profile), "headless": a.headless}
+        self.kit = gdbkit.kit_tools(a.kit)
 
     # -- bookkeeping
     def say(self, msg):
@@ -236,6 +259,8 @@ class Run:
             why = f"MemAvailable {mem:.1f} GiB < {self.a.min_mem_gib} GiB"
         elif not Path(self.a.binary).exists():
             why = f"binary not found: {self.a.binary}"
+        elif self.a.gdb and not port_free(self.a.gdb_port):
+            why = f"gdb port {self.a.gdb_port} is already bound (another stub?); pick --gdb-port"
         if why:
             self.say("refusing to start: " + why)
             shutil.rmtree(self.dir, ignore_errors=True)
@@ -245,8 +270,10 @@ class Run:
         a = self.a
         if a.refresh_profile or not prof.exists(a.profile):
             prof.refresh(a.profile, log=self.say)
+        qt_extra = [("Debugging", "use_gdbstub", "true"), ("Debugging", "gdbstub_port", str(a.gdb_port))] \
+            if a.gdb else [("Debugging", "use_gdbstub", "false")]
         self.user = prof.prepare_run(a.profile, padmod.sdl_guid(), keep_save=a.keep_save,
-                                     extra_pins=a.pin, log=self.say)
+                                     extra_pins=a.pin, qt_extra=qt_extra, log=self.say)
         if self.emu_log.exists():
             self.emu_log.unlink()
         self.refs = states.load_refs()
@@ -333,6 +360,75 @@ class Run:
                         (" (gamescope exited; see gamescope.txt)" if self.gs.poll() is not None else ""))
         if not sock:
             raise Abort("could not read GAMESCOPE_WAYLAND_DISPLAY from the emulator's environment")
+        if a.gdb:
+            self.gdb_boot()
+
+    # -- gdb stub (--gdb)
+    def gdb_boot(self):
+        """The stub holds the guest at boot until a client continues it: wait for the server line,
+        then send `c` (through the kit's rsp_probe.py, or the kit-less fallback)."""
+        a = self.a
+        alive = lambda: Path(f"/proc/{self.emu_pid}").exists()
+        m = gdbkit.wait_log(self.emu_log, gdbkit.SERVER_LINE, 90, alive)
+        if not m:
+            raise Abort("gdb stub: no 'Starting server on port' line in the log within 90 s")
+        if int(m.group(1)) != a.gdb_port:
+            self.say(f"gdb stub: log says port {m.group(1)}, expected {a.gdb_port}; using the log's")
+            a.gdb_port = int(m.group(1))
+        self.say(f"gdb stub listening on 0.0.0.0:{a.gdb_port} (all interfaces) for this run")
+        if self.kit["rsp_probe"]:
+            rc, secs = gdbkit.probe(a.kit, a.gdb_port, None, ["resume"], self.dir / "gdb-boot.txt", 90)
+            err = None if rc == 0 else f"rsp_probe resume exit {rc} (gdb-boot.txt)"
+        else:
+            err = gdbkit.raw_continue(a.gdb_port)
+        self.step("gdb-continue", "fail" if err else "ok",
+                  err or ("rsp_probe resume" if self.kit["rsp_probe"] else
+                          f"kit missing at {a.kit}: continued with the built-in client; measurements will be skipped"))
+        if err:
+            raise Abort("gdb stub: could not continue the guest: " + err)
+
+    def gdb_experiments(self):
+        """In game: threads, delta read, pc sampler, fork-join count; each into the run folder and
+        as a phase (kind "gdb") so the summary has guest fps over it."""
+        a = self.a
+        g = self.info.setdefault("gdb", {"port": a.gdb_port, "kit": str(a.kit), "steps": {}})
+        if not self.kit["rsp_probe"]:
+            g["skipped"] = (f"rsp_probe.py not found in {a.kit} (the private runtime kit is not part of "
+                            "this repository); the guest was continued, nothing was measured")
+            self.step("gdb-experiments", "skipped", g["skipped"])
+            return
+        m = gdbkit.MAIN_LINE.search(self.emu_log.read_text(errors="replace"))
+        if not m:
+            g["skipped"] = "no 'Module main loaded at' line in the log; main base unknown"
+            self.step("gdb-experiments", "skipped", g["skipped"])
+            return
+        base = g["main_base"] = m.group(1)
+        d = self.dir
+        plan = [
+            ("threads", None, ["threads", "--out", str(d / "threads.txt")], "threads-stub.txt", 60),
+            ("delta", "gdb-delta", ["delta", "--seconds", str(a.gdb_delta_seconds), "--out", str(d / "delta.csv")],
+             "delta.txt", a.gdb_delta_seconds + 90),
+            ("pcs", "gdb-pcs", ["pcs", "--seconds", str(a.gdb_pcs_seconds), "--top", "10", "--out", str(d / "pcs.csv")],
+             "pcs.txt", a.gdb_pcs_seconds + 120),
+            ("count", "gdb-count", ["count-frames", "--frames", str(a.gdb_frames), "--max-seconds", "300"],
+             "count-frames.txt", 400),
+        ]
+        for key, phase, args, fname, timeout in plan:
+            if not Path(f"/proc/{self.emu_pid}").exists():
+                raise Abort(f"emulator exited before gdb {key}")
+            self.sync_clock()
+            start = time.time()
+            rc, secs = gdbkit.probe(a.kit, a.gdb_port, base, args, d / fname, timeout)
+            self.sync_clock()
+            if phase:
+                self.phases.append({"name": phase, "kind": "gdb", "start": start, "end": time.time()})
+            g["steps"][key] = {"rc": rc, "seconds": secs, "file": fname}
+            self.step(f"gdb-{key}", "ok" if rc == 0 else "fail", f"exit {rc}, {secs}s -> {fname}")
+        # Whatever happened above, leave the guest running for the rest of the run.
+        gdbkit.probe(a.kit, a.gdb_port, base, ["resume"], d / "gdb-resume.txt", 60)
+        g["delta"] = gdbkit.summarize_delta(d / "delta.csv")
+        g["pcs"] = gdbkit.summarize_pcs(d / "pcs.csv")
+        g["count"] = gdbkit.summarize_count(d / "count-frames.txt")
 
     def check_input(self):
         """The SDL driver logs controller lines at boot; record what it saw."""
@@ -419,6 +515,7 @@ class Run:
 
     def measure(self):
         a = self.a
+        first = len(self.phases)  # phases before this (e.g. --gdb's) are not part of "in-game"
         self.mangohud(True)
         t_end = time.time() + a.duration
         self.phase("idle-spawn", min(a.heading_seconds, a.duration / 4))
@@ -450,7 +547,7 @@ class Run:
             self.phase("tail", rest)
         self.mangohud(False)
         self.phases.insert(0, {"name": "in-game", "kind": "phase",
-                               "start": self.phases[0]["start"], "end": self.phases[-1]["end"]})
+                               "start": self.phases[first]["start"], "end": self.phases[-1]["end"]})
 
     def rotation_probe(self):
         """Calibration: turn the camera in small right-stick steps with a screenshot after each, so
@@ -535,7 +632,7 @@ class Run:
         (self.dir / "run.json").write_text(json.dumps(self.info, indent=2))
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--binary", type=Path, default=DEF_BIN)
     ap.add_argument("--game", type=Path, default=DEF_GAME)
@@ -570,7 +667,32 @@ def main():
     ap.add_argument("--min-mem-gib", type=float, default=40)
     ap.add_argument("--keep-cores", action="store_true", help="allow core dumps of the emulator")
     ap.add_argument("--keep-poll-shots", action="store_true")
+    g = ap.add_argument_group("gdb stub / SVC trace (opt-in; the measurement scripts are a private kit outside this repo)")
+    g.add_argument("--gdb", action="store_true",
+                   help="enable the gdb stub in the profile's qt-config.ini, continue the guest at boot, and run "
+                        "delta / pcs / count-frames in game. The stub binds 0.0.0.0 (all interfaces), "
+                        "unauthenticated, while the run is up")
+    g.add_argument("--gdb-port", type=int, default=6543)
+    g.add_argument("--kit", type=Path, default=gdbkit.DEF_KIT,
+                   help="private runtime kit dir with rsp_probe.py / svc_trace_parse.py (missing -> the guest is "
+                        "still continued, the measurements are skipped with a message)")
+    g.add_argument("--gdb-delta-seconds", type=float, default=20)
+    g.add_argument("--gdb-pcs-seconds", type=float, default=60)
+    g.add_argument("--gdb-frames", type=int, default=60, help="frames for count-frames")
+    g.add_argument("--svc-trace", metavar="FIRST:LAST",
+                   help="EDEN_NX2_SVC_TRACE=FIRST:LAST (present-counter window) for the run, then "
+                        "svc_trace_parse.py on the log -> svc-trace.md")
+    return ap
+
+
+def main():
+    ap = build_parser()
     a = ap.parse_args()
+    if a.svc_trace:
+        if not re.fullmatch(r"\d+:\d+", a.svc_trace):
+            ap.error("--svc-trace wants FIRST:LAST present numbers, e.g. 4800:4870")
+        a.env.append(f"EDEN_NX2_SVC_TRACE={a.svc_trace}")
+    a.kit = a.kit.expanduser()
     a.binary, a.game, a.profile = a.binary.resolve(), a.game.resolve(), a.profile.resolve()
     os.nice(5)
 
@@ -588,6 +710,8 @@ def main():
     try:
         run.launch()
         run.boot_to_game()
+        if a.gdb:
+            run.gdb_experiments()
         if a.probe_steps:
             run.rotation_probe()
         else:
@@ -608,6 +732,12 @@ def main():
         run.info["live_files_changed"] = changed[:20]
         if changed:
             run.say(f"WARNING: live emulator files changed during the run (another instance?): {changed[:5]}")
+        if a.svc_trace and (run.dir / "eden_log.txt").exists():
+            rc = gdbkit.svc_trace(a.kit, run.dir / "eden_log.txt", run.dir / "threads.txt", run.dir / "svc-trace.md")
+            run.info["svc_trace"] = {"window": a.svc_trace, "parse_exit": rc,
+                                     "threads": (run.dir / "threads.txt").exists()}
+            run.say(f"svc-trace.md written (parser exit {rc}"
+                    + ("" if (run.dir / "threads.txt").exists() else "; no thread names: run with --gdb for them") + ")")
         run.write_run_json(result, failed, sd)
     s = analyze.analyze(run.dir)
     print((run.dir / "summary.md").read_text())
