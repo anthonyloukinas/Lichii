@@ -1565,19 +1565,30 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (buffer_cache.FlushesOnCpuRead()) {
+        // The core skips the flush of later reads inside the returned area, so the buffer cache
+        // answers for all of it (marks its GPU-written pages there Preflushable or ends their
+        // traps), and the area is preemptive only if both caches say so.
+        const DAddr start = texture_area ? texture_area->start_address : addr;
+        const DAddr end = texture_area ? texture_area->end_address : addr + size;
+        std::scoped_lock lock{buffer_cache.mutex};
+        auto area = buffer_cache.GetFlushArea(start, end - start);
+        if (area && texture_area) {
+            area->start_address = (std::min)(area->start_address, texture_area->start_address);
+            area->end_address = (std::max)(area->end_address, texture_area->end_address);
+            area->preemtive &= texture_area->preemtive;
+        }
         if (area) {
             return *area;
         }
     }
-    if (buffer_cache.FlushesOnCpuRead()) {
-        std::scoped_lock lock{buffer_cache.mutex};
-        auto area = buffer_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+    if (texture_area) {
+        return *texture_area;
     }
     VideoCore::RasterizerDownloadArea new_area{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),

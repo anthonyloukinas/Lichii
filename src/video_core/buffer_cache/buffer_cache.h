@@ -253,7 +253,19 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
-    if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+    // With exact preflush only Preflushable pages are downloaded at fences: a read that also
+    // covers a trapped page must flush it, so the shortcut needs every page Preflushable.
+    bool preflushable = false;
+    if (!AsyncBufferDownloads() && ExactPreflush()) {
+        u64 preflushable_bytes = 0;
+        memory_tracker.ForEachPreflushableRange(
+            device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
+            [&](DAddr, u64 range_size) { preflushable_bytes += range_size; });
+        preflushable = preflushable_bytes == device_addr_end_aligned - device_addr_start_aligned;
+    } else {
+        preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
+    }
+    if (preflushable) {
         area->preemtive = true;
         return area;
     };
@@ -1861,6 +1873,28 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);
     }
+}
+
+template <class P>
+bool BufferCache<P>::ExactPreflush() const {
+    static const bool wanted = [] {
+        const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    // The pages left out of the fence download are only correct if a CPU read of them reaches
+    // GetFlushArea. Without that (NCE, EDEN_NX2_READ_TRAPS=0, EDEN_NX2_NO_REACTIVE=1) they
+    // would stay stale, so whole writes are queued then.
+    const bool traps = device_memory.ReadTrapsActive();
+    const bool enabled = wanted && traps;
+    static std::atomic<u32> logged{};
+    const u32 decision = 1U << ((wanted ? 2 : 0) + (traps ? 1 : 0));
+    if ((logged.fetch_or(decision, std::memory_order_relaxed) & decision) == 0) {
+        LOG_INFO(HW_GPU, "Fence downloads of GPU writes: {} ({}{})",
+                 enabled ? "Preflushable pages only" : "whole writes",
+                 wanted ? "exact preflush" : "EDEN_NX2_EXACT_PREFLUSH=0",
+                 wanted && !traps ? ", but CPU reads of GPU writes are not trapped" : "");
+    }
+    return enabled;
 }
 
 template <class P>

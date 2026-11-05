@@ -742,15 +742,16 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+bool DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;
     u64 run_pages = 0;
+    bool all_armed = true;
     const auto release_run = [&] {
         if (run_pages > 0 && run_inter != nullptr) {
-            MarkRegionReadTrap(run_inter, run_begin << Memory::YUZU_PAGEBITS,
-                               run_pages << Memory::YUZU_PAGEBITS);
+            all_armed &= MarkRegionReadTrap(run_inter, run_begin << Memory::YUZU_PAGEBITS,
+                                            run_pages << Memory::YUZU_PAGEBITS);
         }
         run_pages = 0;
     };
@@ -771,6 +772,12 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
         ++run_pages;
     }
     release_run();
+    return all_armed;
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::ReadTrapsActive() const {
+    return DeviceMethods::ReadTrapsActive();
 }
 
 } // namespace Core

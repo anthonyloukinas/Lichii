@@ -654,19 +654,19 @@ private:
         return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
     }
 
+    /// Whether QueueFenceDownload queues only the Preflushable pages of a write
+    /// (EDEN_NX2_EXACT_PREFLUSH). Needs active read traps for the rest of the write.
+    bool ExactPreflush() const;
+
     /// Queues a GPU write for download at the next fence where DownloadsAtFence holds. With only
     /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
     /// of a large buffer would otherwise copy the whole buffer back at every fence.
     void QueueFenceDownload(DAddr device_addr, u64 size) {
-        static const bool exact = [] {
-            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
-            return value == nullptr || value[0] != '0';
-        }();
         if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
-        if (!exact) {
+        if (!ExactPreflush()) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
             } else {
@@ -701,8 +701,11 @@ private:
         if (armed_bytes == end - begin) {
             return;
         }
-        read_trapped_ranges.Add(begin, end - begin);
-        device_memory.ArmReadTraps(begin, end - begin);
+        // A page the core could not arm (not rasterizer cached yet) must not be skipped by the
+        // early return above, so a range is only recorded when all of it was armed.
+        if (device_memory.ArmReadTraps(begin, end - begin)) {
+            read_trapped_ranges.Add(begin, end - begin);
+        }
     }
 
     Common::RangeSet<DAddr> read_trapped_ranges;

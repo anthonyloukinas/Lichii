@@ -137,7 +137,11 @@ public:
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
-    void ArmReadTraps(DAddr addr, size_t size);
+    /// Returns false when a CPU-backed page could not be armed (not rasterizer cached).
+    bool ArmReadTraps(DAddr addr, size_t size);
+
+    /// Whether a guest CPU read of a page given to ArmReadTraps reaches the reactive flush.
+    bool ReadTrapsActive() const;
 
 private:
     struct TranslationEntry {
