@@ -118,6 +118,7 @@ void BufferCache<P>::TickFrame() {
     runtime.TickFrame(slot_buffers);
     memory_tracker.TickHotPages();
     ReportPageProtection();
+    ReportSsboCache();
     if (Nx2FastDraw::g_buffer_skip) [[unlikely]] {
         const u64 now = Nx2Profile::Now();
         if (skip_stats.window_start == 0) {
@@ -3559,16 +3560,122 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
 }
 
 template <class P>
+typename BufferCache<P>::SsboTranslation BufferCache<P>::LookUpSsbo(GPUVAddr gpu_addr,
+                                                                     bool native_pointer) const {
+    // The serial is read first: a change during the lookups leaves a stale serial, not a stale
+    // answer under the new one.
+    SsboTranslation translation{
+        .owner = gpu_memory->GetID() + 1,
+        .gpu_addr = gpu_addr,
+        .serial = gpu_memory->MapSerial(),
+    };
+    translation.layout_size = static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+    const u32 alignment = runtime.GetStorageBufferAlignment();
+    translation.aligned_device_addr =
+        gpu_memory->GpuToCpuAddress(Common::AlignDown(gpu_addr, alignment));
+    translation.device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (native_pointer) {
+        const u32 size = (std::min)(translation.layout_size, static_cast<u32>(8_MiB));
+        translation.native_size =
+            size == 0 ? 0 : static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+        translation.has_native_size = true;
+    }
+    return translation;
+}
+
+template <class P>
+const typename BufferCache<P>::SsboTranslation& BufferCache<P>::TranslateSsbo(
+    GPUVAddr gpu_addr, bool native_pointer) const {
+    // Every storage binding of every draw and dispatch looks its pointer up: thousands of
+    // pointers, the same ones frame after frame. Kept per thread (the split's front and back
+    // both bind), 4096 slots by address.
+    thread_local std::array<SsboTranslation, 4096> cache{};
+    SsboTranslation& entry = cache[(gpu_addr * 0x9E3779B97F4A7C15ULL) >> 52];
+    if (entry.owner == gpu_memory->GetID() + 1 && entry.gpu_addr == gpu_addr &&
+        entry.serial == gpu_memory->MapSerial()) {
+        if (native_pointer && !entry.has_native_size) {
+            const u64 serial = gpu_memory->MapSerial();
+            const u32 size = (std::min)(entry.layout_size, static_cast<u32>(8_MiB));
+            entry.native_size =
+                size == 0 ? 0 : static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+            entry.has_native_size = true;
+            if (serial != entry.serial) {
+                entry.owner = 0; // the table changed meanwhile: don't keep it
+            }
+        }
+        ssbo_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        return entry;
+    }
+    ssbo_cache_misses.fetch_add(1, std::memory_order_relaxed);
+    entry = LookUpSsbo(gpu_addr, native_pointer);
+    return entry;
+}
+
+template <class P>
 Binding BufferCache<P>::StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_addr,
                                                u32 cbuf_index, bool is_written,
                                                bool native_pointer) const {
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_SSBO_BIND_CACHE");
+        return value == nullptr ? 1 : value[0] - '0';
+    }();
+    if (mode == 0) {
+        return SsboBinding(LookUpSsbo(gpu_addr, native_pointer), ssbo_addr, cbuf_index,
+                           is_written, native_pointer);
+    }
+    const Binding binding = SsboBinding(TranslateSsbo(gpu_addr, native_pointer), ssbo_addr,
+                                        cbuf_index, is_written, native_pointer);
+    if (mode == 2) [[unlikely]] {
+        const Binding expected = SsboBinding(LookUpSsbo(gpu_addr, native_pointer), ssbo_addr,
+                                             cbuf_index, is_written, native_pointer);
+        if (expected.device_addr != binding.device_addr || expected.gpu_addr != binding.gpu_addr ||
+            expected.size != binding.size) {
+            if (ssbo_cache_mismatches.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_ERROR(HW_GPU,
+                          "SSBO binding cache: {:#x} (native {}) cached {:#x}+{:#x}, looked up "
+                          "{:#x}+{:#x}",
+                          gpu_addr, native_pointer, binding.device_addr, binding.size,
+                          expected.device_addr, expected.size);
+            }
+            return expected;
+        }
+    }
+    return binding;
+}
 
+template <class P>
+void BufferCache<P>::ReportSsboCache() {
+    const u64 now = Nx2Profile::Now();
+    if (ssbo_report_start == 0) {
+        ssbo_report_start = now;
+        return;
+    }
+    if (now - ssbo_report_start < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - ssbo_report_start) / 1e9;
+    ssbo_report_start = now;
+    const u64 hits = ssbo_cache_hits.exchange(0, std::memory_order_relaxed);
+    const u64 misses = ssbo_cache_misses.exchange(0, std::memory_order_relaxed);
+    if (hits + misses == 0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "SSBO binding lookups per second: {:.0f} cached, {:.0f} looked up (mismatches total "
+             "{})",
+             static_cast<double>(hits) / seconds, static_cast<double>(misses) / seconds,
+             ssbo_cache_mismatches.load(std::memory_order_relaxed));
+}
+
+template <class P>
+Binding BufferCache<P>::SsboBinding(const SsboTranslation& translation, GPUVAddr ssbo_addr,
+                                    u32 cbuf_index, bool is_written, bool native_pointer) const {
+    const GPUVAddr gpu_addr = translation.gpu_addr;
     u32 size = [&]() {
-        const u32 memory_layout_size =
-            static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+        const u32 memory_layout_size = translation.layout_size;
         // A native (Switch 2) compute program's pointer is bare: the word after it is another
         // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
@@ -3587,8 +3694,9 @@ Binding BufferCache<P>::StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_
     }();
     if (native_pointer && size != 0) {
         // Stop where the mapping or its device range does: the binding is one device range, and
-        // a written one isn't split into separate ranges without sparse sources.
-        size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
+        // a written one isn't split into separate ranges without sparse sources. (The
+        // translation's walk covers min(layout size, 8 MiB), which is the size here.)
+        size = translation.native_size;
     }
 
     // Alignment only applies to the offset of the buffer
@@ -3596,12 +3704,12 @@ Binding BufferCache<P>::StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_
     const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
     const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
 
-    const std::optional<DAddr> aligned_device_addr = gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
+    const std::optional<DAddr>& aligned_device_addr = translation.aligned_device_addr;
     if (!aligned_device_addr || size == 0) {
         LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
         return NULL_BINDING;
     }
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    const std::optional<DAddr>& device_addr = translation.device_addr;
     ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
                cbuf_index);
     // The end address used for size calculation does not need to be aligned
