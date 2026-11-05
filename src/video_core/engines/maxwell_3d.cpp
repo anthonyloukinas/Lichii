@@ -445,6 +445,13 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(vertex_id_base):
     case MAXWELL3D_REG_INDEX(render_enable.address_high):
     case MAXWELL3D_REG_INDEX(render_enable.address_low):
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_high):
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_low):
+    case MAXWELL3D_REG_INDEX(report_semaphore.payload):
+    // SET_MME_MEM_ADDRESS_A/B and the data RAM address: read only by macro DMA reads.
+    case 0x154:
+    case 0x155:
+    case 0x156:
         return VideoCommon::Nx2FastDraw::g_neutral;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
@@ -455,8 +462,11 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
 bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
     // Query state only: the draw re-applies the ZPass counter, and a host conditional resolve
     // runs a compute pass outside the render pass (TakeReusableDraw checks the render pass).
+    // A report writes guest memory (now or from a fence/sync operation) and touches no bound
+    // state; a query pool reset or submit it causes shows as a render pass or tick change.
     return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
-           method == MAXWELL3D_REG_INDEX(render_enable.mode);
+           method == MAXWELL3D_REG_INDEX(render_enable.mode) ||
+           method == MAXWELL3D_REG_INDEX(report_semaphore.query);
 }
 
 bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
