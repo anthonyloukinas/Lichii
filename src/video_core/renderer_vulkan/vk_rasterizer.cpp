@@ -1930,13 +1930,23 @@ void RasterizerVulkan::TickFrame() {
         const u64 applied_ranges = take(c.applied_ranges);
         const u64 applied_bytes = take(c.applied_bytes);
         const u64 applied_pool_bytes = take(c.applied_pool_bytes);
+        const u64 sync_calls = take(c.sync_download_calls);
+        const auto down = [&](size_t sync) {
+            return fmt::format("{}/{}/{}", take(c.download_ranges[sync]),
+                               take(c.download_bytes[sync]), take(c.download_pool_bytes[sync]));
+        };
+        const std::string fence_downloads = down(0);
+        const std::string sync_downloads = down(1);
         LOG_INFO(Render_Vulkan,
                  "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
                  "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
-                 "applied_ranges={} applied_bytes={} applied_pool_bytes={} write_mark={}",
+                 "applied_ranges={} applied_bytes={} applied_pool_bytes={} "
+                 "fence_downloads(ranges/bytes/pool_bytes)={} sync_downloads={} "
+                 "sync_download_calls={} write_mark={}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
                  Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
-                 applied_ranges, applied_bytes, applied_pool_bytes,
+                 applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
+                 sync_downloads, sync_calls,
                  Tegra::g_nx2_compute_write_mark == ~u64{0}
                      ? std::string{"full"}
                      : std::to_string(Tegra::g_nx2_compute_write_mark));
