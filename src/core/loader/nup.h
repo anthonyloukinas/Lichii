@@ -52,11 +52,16 @@ public:
     ResultStatus ReadNSOModules(Modules& modules) override;
 
 private:
+    /// Base RomFS with the best update package overlaid, as an unpacked tree.
+    FileSys::VirtualDir GetMergedRomFSDir() const;
+
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<AppLoader> secondary_loader;
 
     std::unique_ptr<FileSys::NACP> nacp_file;
     FileSys::VirtualFile icon_file;
+    /// RomFS with LayeredFS mods applied, built by Load(); null when no mod applies.
+    FileSys::VirtualFile patched_romfs;
     u64 base_title_id{};
     std::string display_title;
     std::string display_version;
