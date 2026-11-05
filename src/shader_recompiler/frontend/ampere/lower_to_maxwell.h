@@ -1129,7 +1129,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0xab9: case 0xabb: { // ULDC, direct or indexed.
             const u32 uniform_dest = insn.Bits(16, 8), index_reg = insn.Bits(24, 8);
             const u32 width = insn.Bits(73, 3);
-            const bool subword_load = opcode == 0xab9 && (width == 0 || width == 2);
+            // U8 and U16, direct or indexed (Ocarina's culling programs read per-object bytes
+            // with ULDC.U8 UR, c[bank][UR+imm]); Maxwell LDC.U8/U16 takes the same register-plus-
+            // offset address, and its offset is signed, hence the bound.
+            const bool subword_load = width == 0 || width == 2;
             const u32 offset = insn.Bits(38, 16);
             const u32 alignment = width == 0 ? 1U : width == 2 ? 2U : 4U;
             const u32 target = uniform_register(uniform_dest);

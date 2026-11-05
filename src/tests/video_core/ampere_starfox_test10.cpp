@@ -327,10 +327,16 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
         CHECK_FALSE(lowered);
         CHECK(lowered.instructions.empty());
     }
+    // The indexed form lowers to LDC.U16 with the index's mapped register (UR0 -> R216); a
+    // direct-form control word on it is still rejected.
     auto indexed = CapturedUniformLoad;
     SetBits(indexed, 0, 12, 0xabb);
-    SetBits(indexed, 91, 1, 1);
     CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
+    SetBits(indexed, 91, 1, 1);
+    const auto lowered = LowerToMaxwell(std::array{indexed, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    CHECK(lowered.instructions.front() == (0xef9200600207ffdcULL & ~(u64{0xff} << 8) | (u64{216} << 8)));
 }
 
 TEST_CASE("Star Fox Test10 uniform U16 conversion reaches the real translator",
