@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <optional>
 #include <string_view>
 
@@ -345,6 +346,8 @@ private:
         /// StateChanged draws by the reason of the last break, and by its 3D method.
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        /// StateChanged draws by the set of distinct breaks before them (g_track_breaks).
+        std::map<std::array<u32, 5>, u64> break_sets;
         u64 window_start{};
     };
     struct ReusableTake {

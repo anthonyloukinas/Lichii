@@ -272,6 +272,8 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     ReusableDraw& draw = reusable_draw;
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
+    const std::array<u32, 5> break_set =
+        FastDraw::g_track_breaks ? FastDraw::TakeIntervalBreaks() : std::array<u32, 5>{};
     const auto full = [&](FullDraw reason) -> ReusableTake {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
         draw.pipeline = nullptr;
@@ -291,6 +293,9 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
         ++fast_draw_stats.breaks[last_break & 0xff];
         if (const u32 method = last_break >> 8; method < Maxwell::NUM_REGS) {
             ++fast_draw_stats.break_methods[method];
+        }
+        if (FastDraw::g_track_breaks) {
+            ++fast_draw_stats.break_sets[break_set];
         }
         return full(FullDraw::StateChanged);
     }
@@ -333,6 +338,10 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
 void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
                                         bool is_indirect) {
     reusable_draw.pipeline = nullptr;
+    if (VideoCommon::Nx2FastDraw::g_track_breaks) {
+        // Breaks while this draw resolved don't reach the next one (its serial is taken below).
+        VideoCommon::Nx2FastDraw::TakeIntervalBreaks();
+    }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto topology = draw_state.topology;
     const auto ineligible = [&]() -> std::optional<Ineligible> {
@@ -496,6 +505,39 @@ void RasterizerVulkan::ReportFastDraws() {
     }
     LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
              breaks, top);
+    if (VideoCommon::Nx2FastDraw::g_track_breaks && !stats.break_sets.empty()) {
+        const auto code_name = [](u32 code) {
+            const u32 reason = code & 0xff;
+            const u32 method = code >> 8;
+            const auto register_or_method = static_cast<u32>(VideoCommon::Nx2FastDraw::Reason::Method);
+            if ((reason == 0 || reason == register_or_method) && method != 0) {
+                return fmt::format("{}{:#x}", reason == 0 ? "r" : "m", method);
+            }
+            return std::string{reason < VideoCommon::Nx2FastDraw::reason_names.size()
+                                   ? VideoCommon::Nx2FastDraw::reason_names[reason]
+                                   : "?"};
+        };
+        std::vector<std::pair<u64, std::array<u32, 5>>> sets;
+        for (const auto& [set, count] : stats.break_sets) {
+            sets.emplace_back(count, set);
+        }
+        const size_t shown_sets = std::min<size_t>(sets.size(), 16);
+        std::partial_sort(sets.begin(), sets.begin() + shown_sets, sets.end(), std::greater{});
+        std::string text;
+        for (size_t i = 0; i < shown_sets; ++i) {
+            const auto& set = sets[i].second;
+            text += ' ';
+            for (u32 k = 0; k < std::min<u32>(set[4], 4); ++k) {
+                text += (k != 0 ? "+" : "") + code_name(set[k]);
+            }
+            text += fmt::format("{}:{:.0f}", set[4] > 4 ? "+more" : "",
+                                static_cast<double>(sets[i].first) / seconds);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw state changes per second by every break since the last draw "
+                 "(r register, m method):{}",
+                 text);
+    }
     stats = FastDrawStats{.window_start = now};
 }
 

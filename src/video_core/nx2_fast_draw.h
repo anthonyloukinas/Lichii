@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -89,15 +90,64 @@ inline const bool g_dynamic_skip = [] {
     return value != nullptr && value[0] == '1';
 }();
 
+/// EDEN_NX2_FAST_DRAW_NEUTRAL=0 restores the breaks for what can't change a draw's bindings:
+/// vertex_id_base (nothing on the host reads it), counter resets and render enable writes (query
+/// state; the conditional resolve runs outside the render pass, which ends reuse), and the
+/// constant data range overflow (the last range widens to cover the write instead).
+inline bool g_neutral = [] {
+    const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_NEUTRAL");
+    return value == nullptr || value[0] != '0';
+}();
+
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
 
+/// EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_BREAKS=1: the distinct breaks since the last draw
+/// (up to 4; a count of 5 means more), so the log can show which breaks a draw had alone.
+inline const bool g_track_breaks = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr ||
+                                   std::getenv("EDEN_NX2_FAST_DRAW_BREAKS") != nullptr;
+inline std::array<std::atomic<u32>, 4> g_interval_breaks{};
+inline std::atomic<u32> g_interval_count{};
+
+inline void NoteIntervalBreak(u32 code) {
+    const u32 count = g_interval_count.load(std::memory_order_relaxed);
+    if (count > g_interval_breaks.size()) {
+        return;
+    }
+    for (u32 i = 0; i < count && i < g_interval_breaks.size(); ++i) {
+        if (g_interval_breaks[i].load(std::memory_order_relaxed) == code) {
+            return;
+        }
+    }
+    if (count < g_interval_breaks.size()) {
+        g_interval_breaks[count].store(code, std::memory_order_relaxed);
+    }
+    g_interval_count.store(count + 1, std::memory_order_relaxed);
+}
+
 inline void Break(Reason reason, u32 method = 0) {
     if (g_enabled) {
+        const u32 code = static_cast<u32>(reason) | (method << 8);
         g_serial.fetch_add(1, std::memory_order_relaxed);
-        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+        g_last_break.store(code, std::memory_order_relaxed);
+        if (g_track_breaks) {
+            NoteIntervalBreak(code);
+        }
     }
+}
+
+/// The distinct breaks since the last call: sorted codes, then their count (5: more than 4).
+inline std::array<u32, 5> TakeIntervalBreaks() {
+    std::array<u32, 5> set{};
+    const u32 count = g_interval_count.exchange(0, std::memory_order_relaxed);
+    const u32 stored = count < 4 ? count : 4;
+    for (u32 i = 0; i < stored; ++i) {
+        set[i] = g_interval_breaks[i].load(std::memory_order_relaxed);
+    }
+    std::sort(set.begin(), set.begin() + stored);
+    set[4] = count;
+    return set;
 }
 
 inline u64 Serial() {
@@ -162,7 +212,15 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
         return;
     }
     if (delta.num_writes == Delta::MaxWrites) {
-        Break(Reason::DeltaOverflow);
+        if (!g_neutral) {
+            Break(Reason::DeltaOverflow);
+            return;
+        }
+        // Only overlap checks read the ranges: a wider one is conservative.
+        GPUVAddr& last_begin = delta.write_begin[Delta::MaxWrites - 1];
+        GPUVAddr& last_end = delta.write_end[Delta::MaxWrites - 1];
+        last_begin = (std::min)(last_begin, begin);
+        last_end = (std::max)(last_end, end);
         return;
     }
     delta.write_begin[delta.num_writes] = begin;

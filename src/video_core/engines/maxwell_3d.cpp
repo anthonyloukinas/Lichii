@@ -442,9 +442,21 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(global_base_vertex_index):
     case MAXWELL3D_REG_INDEX(global_base_instance_index):
         return true;
+    case MAXWELL3D_REG_INDEX(vertex_id_base):
+    case MAXWELL3D_REG_INDEX(render_enable.address_high):
+    case MAXWELL3D_REG_INDEX(render_enable.address_low):
+        return VideoCommon::Nx2FastDraw::g_neutral;
     default:
-        return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method);
+        return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
+               (VideoCommon::Nx2FastDraw::g_neutral && IsFastDrawNeutralMethod(method));
     }
+}
+
+bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
+    // Query state only: the draw re-applies the ZPass counter, and a host conditional resolve
+    // runs a compute pass outside the render pass (TakeReusableDraw checks the render pass).
+    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+           method == MAXWELL3D_REG_INDEX(render_enable.mode);
 }
 
 bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
@@ -480,7 +492,8 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
     if (!DrawManager::IsInstanceLoopMethod(method) &&
-        !(VideoCommon::Nx2FastDraw::g_delta_enabled && IsFastDrawDeltaMethod(method))) {
+        !(VideoCommon::Nx2FastDraw::g_delta_enabled && IsFastDrawDeltaMethod(method)) &&
+        !(VideoCommon::Nx2FastDraw::g_neutral && IsFastDrawNeutralMethod(method))) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {

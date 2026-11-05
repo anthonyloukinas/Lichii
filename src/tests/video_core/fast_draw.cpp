@@ -250,13 +250,67 @@ TEST_CASE("Fast draw delta mode still breaks on state, texture headers and overf
         f.SetConstantBuffer(0x40000, 0x1000, 0x100); // just past the headers
         f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), 1);
     }));
-    CHECK(breaks([&] {
+    const auto overflow = [&] {
         f.SetConstantBuffer(0x60000, 0x1000, 0);
         for (u32 i = 0; i <= FastDraw::Delta::MaxWrites; ++i) {
             f.Write(MAXWELL3D_REG_INDEX(const_buffer.offset), i * 0x20);
             f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), i);
         }
-    }));
+    };
+    const bool neutral = FastDraw::g_neutral;
+    FastDraw::g_neutral = false;
+    CHECK(breaks(overflow));
+    FastDraw::g_neutral = true;
+    // The last range widens to cover the writes past the limit instead.
+    CHECK_FALSE(breaks(overflow));
+    REQUIRE(FastDraw::g_delta.num_writes == FastDraw::Delta::MaxWrites);
+    CHECK(FastDraw::g_delta.write_begin[FastDraw::Delta::MaxWrites - 1] ==
+          0x60000 + (FastDraw::Delta::MaxWrites - 1) * 0x20);
+    CHECK(FastDraw::g_delta.write_end[FastDraw::Delta::MaxWrites - 1] ==
+          0x60000 + FastDraw::Delta::MaxWrites * 0x20 + 4);
+    FastDraw::g_neutral = neutral;
+}
+
+TEST_CASE("Fast draw keeps reuse across vertex_id_base, counter resets and render enable",
+          "[fast_draw]") {
+    FastDrawFixture f;
+    const bool neutral = FastDraw::g_neutral;
+    const auto writes = [&] {
+        f.Write(MAXWELL3D_REG_INDEX(vertex_id_base), f.Reg(MAXWELL3D_REG_INDEX(vertex_id_base)) + 9);
+        f.Write(MAXWELL3D_REG_INDEX(clear_report_value),
+                f.Reg(MAXWELL3D_REG_INDEX(clear_report_value)) ^ 1);
+        f.Write(MAXWELL3D_REG_INDEX(render_enable.address_low),
+                f.Reg(MAXWELL3D_REG_INDEX(render_enable.address_low)) + 0x10);
+        f.Write(MAXWELL3D_REG_INDEX(render_enable.mode), 1); // True
+    };
+    FastDraw::g_neutral = true;
+    f.DrawArrays(0, 3);
+    writes();
+    f.DrawArrays(3, 3);
+    CHECK(f.Reusable());
+    FastDraw::g_neutral = false;
+    writes();
+    f.DrawArrays(6, 3);
+    CHECK_FALSE(f.Reusable());
+    FastDraw::g_neutral = neutral;
+}
+
+TEST_CASE("Fast draw break sets list each distinct break once", "[fast_draw]") {
+    FastDrawFixture f;
+    FastDraw::TakeIntervalBreaks();
+    FastDraw::NoteIntervalBreak(static_cast<u32>(FastDraw::Reason::Invalidation));
+    FastDraw::NoteIntervalBreak(0x446U << 8);
+    FastDraw::NoteIntervalBreak(static_cast<u32>(FastDraw::Reason::Invalidation));
+    auto set = FastDraw::TakeIntervalBreaks();
+    CHECK(set[4] == 2);
+    CHECK(set[0] == static_cast<u32>(FastDraw::Reason::Invalidation));
+    CHECK(set[1] == 0x446U << 8);
+    for (u32 i = 1; i <= 6; ++i) {
+        FastDraw::NoteIntervalBreak(i << 8);
+    }
+    set = FastDraw::TakeIntervalBreaks();
+    CHECK(set[4] == 5);
+    CHECK(FastDraw::TakeIntervalBreaks()[4] == 0);
 }
 
 TEST_CASE("Fast draw mode 1 breaks on what delta mode records", "[fast_draw]") {
