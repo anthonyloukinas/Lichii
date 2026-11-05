@@ -1100,7 +1100,12 @@ void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
         DAddr device_addr;
     };
     boost::container::small_vector<HostRead, Shader::Info::MAX_NATIVE_INDIRECT_SLOTS> host_reads;
+    boost::container::small_vector<HostRead, Shader::Info::MAX_NATIVE_INDIRECT_SLOTS> verifies;
     u64 cache_hits = 0;
+    u64 speculated = 0;
+    if (!native_indirect_verifies.empty()) {
+        RetireNativeIndirectVerifies();
+    }
     for (size_t i = 0; i < addrs.size(); ++i) {
         out[i] = 0;
         const GPUVAddr addr = addrs[i];
@@ -1118,14 +1123,28 @@ void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
         }
         const auto cached = std::ranges::find(native_indirect_cache, *device_addr,
                                               &NativeIndirectCachedPointer::device_addr);
-        if (cached != native_indirect_cache.end()) {
-            out[i] = cached->value;
-            ++cache_hits;
-            continue;
-        }
         const u64 page = *device_addr >> CACHING_PAGEBITS;
         const BufferId buffer_id = page < page_table.size() ? page_table[page] : BufferId{};
-        if (!buffer_id || !slot_buffers[buffer_id].IsInBounds(*device_addr, sizeof(u64))) {
+        const bool in_buffer =
+            buffer_id && slot_buffers[buffer_id].IsInBounds(*device_addr, sizeof(u64));
+        if (cached != native_indirect_cache.end()) {
+            out[i] = cached->value;
+            if (!cached->written) {
+                ++cache_hits;
+                continue;
+            }
+            // Written since it was read: keep using it, and check it without a wait.
+            ++speculated;
+            if (!cached->verifying && in_buffer) {
+                cached->verifying = true;
+                cached->rewritten = false;
+                cached->verify_serial = ++native_indirect_verify_serial;
+                verifies.push_back(
+                    {i, buffer_id, *device_addr - slot_buffers[buffer_id].CpuAddr(), *device_addr});
+            }
+            continue;
+        }
+        if (!in_buffer) {
             continue;
         }
         host_reads.push_back(
@@ -1133,6 +1152,33 @@ void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
     }
     if (cache_hits != 0) {
         Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_cache_hits, cache_hits);
+    }
+    if (speculated != 0) {
+        Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_speculated, speculated);
+    }
+    if constexpr (!IS_OPENGL) {
+        if (!verifies.empty()) {
+            // Recorded after the work that marked the words written, read once that tick is done.
+            auto staging = runtime.DownloadStagingBuffer(verifies.size() * sizeof(u64), true);
+            NativeIndirectVerify verify{.staging = staging, .tick = 0, .entries = {}};
+            for (size_t k = 0; k < verifies.size(); ++k) {
+                const HostRead& read = verifies[k];
+                Buffer& buffer = slot_buffers[read.buffer_id];
+                const std::array copies{BufferCopy{
+                    .src_offset = read.offset,
+                    .dst_offset = staging.offset + k * sizeof(u64),
+                    .size = sizeof(u64),
+                }};
+                buffer.MarkUsage(read.offset, sizeof(u64));
+                runtime.CopyBuffer(staging.buffer, buffer, copies, true);
+                // The loop above numbered the entries in order, the last one with the counter.
+                verify.entries.emplace_back(read.device_addr, native_indirect_verify_serial -
+                                                                  (verifies.size() - 1 - k));
+            }
+            verify.tick = runtime.CurrentTick();
+            native_indirect_verifies.push_back(std::move(verify));
+            Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_verifies, verifies.size());
+        }
     }
     if (host_reads.empty()) {
         return;
@@ -1172,6 +1218,83 @@ void BufferCache<P>::ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs,
     }
     for (const HostRead& read : host_reads) {
         native_indirect_cache.push_back({read.device_addr, out[read.index]});
+    }
+}
+
+template <class P>
+void BufferCache<P>::MarkNativeIndirectCacheWritten(DAddr device_addr, u64 size) {
+    if (native_indirect_cache.empty()) [[likely]] {
+        return;
+    }
+    if (IS_OPENGL || !Tegra::g_nx2_indirect_speculate || native_indirect_speculation_off) {
+        InvalidateNativeIndirectCache(device_addr, size);
+        return;
+    }
+    const auto overlaps = [&](DAddr addr) {
+        return addr < device_addr + size && device_addr < addr + sizeof(u64);
+    };
+    const auto removed = std::ranges::remove_if(
+        native_indirect_cache, [&](const NativeIndirectCachedPointer& entry) {
+            return overlaps(entry.device_addr) &&
+                   std::ranges::find(native_indirect_volatile, entry.device_addr) !=
+                       native_indirect_volatile.end();
+        });
+    native_indirect_cache.erase(removed.begin(), removed.end());
+    for (NativeIndirectCachedPointer& entry : native_indirect_cache) {
+        if (overlaps(entry.device_addr)) {
+            entry.rewritten = entry.verifying;
+            entry.written = true;
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::RetireNativeIndirectVerifies() {
+    if constexpr (!IS_OPENGL) {
+        size_t retired = 0;
+        for (NativeIndirectVerify& verify : native_indirect_verifies) {
+            if (!runtime.IsFree(verify.tick)) {
+                break;
+            }
+            ++retired;
+            for (size_t k = 0; k < verify.entries.size(); ++k) {
+                const auto [device_addr, serial] = verify.entries[k];
+                const auto entry = std::ranges::find(native_indirect_cache, device_addr,
+                                                     &NativeIndirectCachedPointer::device_addr);
+                if (entry == native_indirect_cache.end() || !entry->verifying ||
+                    entry->verify_serial != serial) {
+                    continue;
+                }
+                u64 value;
+                std::memcpy(&value, verify.staging.mapped_span.data() + k * sizeof(u64),
+                            sizeof(u64));
+                entry->verifying = false;
+                entry->written = entry->rewritten;
+                entry->rewritten = false;
+                if (value == entry->value) {
+                    continue;
+                }
+                // Draws and dispatches since used the old pointer; from now on this word waits.
+                Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_indirect_mispredicts, 1);
+                entry->value = value;
+                if (native_indirect_volatile.size() == native_indirect_volatile.static_capacity) {
+                    native_indirect_speculation_off = true;
+                    LOG_WARNING(HW_GPU, "Native pointer records keep changing: speculation off");
+                    // Written entries are re-read with a wait (the later checks find none).
+                    const auto written = std::ranges::remove_if(
+                        native_indirect_cache,
+                        [](const NativeIndirectCachedPointer& e) { return e.written; });
+                    native_indirect_cache.erase(written.begin(), written.end());
+                    break;
+                } else {
+                    native_indirect_volatile.push_back(entry->device_addr);
+                }
+            }
+            runtime.FreeDeferredStagingBuffer(verify.staging);
+        }
+        native_indirect_verifies.erase(native_indirect_verifies.begin(),
+                                       native_indirect_verifies.begin() +
+                                           static_cast<std::ptrdiff_t>(retired));
     }
 }
 
@@ -2456,7 +2579,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    InvalidateNativeIndirectCache(device_addr, size);
+    MarkNativeIndirectCacheWritten(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     QueueFenceDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {

@@ -2487,6 +2487,9 @@ void RasterizerVulkan::TickFrame() {
         const u64 indirect_gfx_waits = take(c.native_indirect_gfx_waits);
         const u64 indirect_gfx_draws = take(c.native_indirect_gfx_draws);
         const u64 indirect_cache_hits = take(c.native_indirect_cache_hits);
+        const u64 indirect_speculated = take(c.native_indirect_speculated);
+        const u64 indirect_verifies = take(c.native_indirect_verifies);
+        const u64 indirect_mispredicts = take(c.native_indirect_mispredicts);
         LOG_INFO(Render_Vulkan,
                  "NX2 deferred writes frame={} collected_writes={} collected_bytes={} "
                  "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
@@ -2500,7 +2503,8 @@ void RasterizerVulkan::TickFrame() {
                  "write_mark={} write_mark_cap={} "
                  "native_indirect(bound/dropped/host_reads/waits)={}/{}/{}/{} "
                  "native_indirect_gfx(draws/bound/dropped/host_reads/waits)={}/{}/{}/{}/{} "
-                 "native_indirect_cache_hits={}",
+                 "native_indirect_cache_hits={} "
+                 "native_indirect_speculated(used/verified/changed)={}/{}/{}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
                  Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
                  applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
@@ -2514,7 +2518,8 @@ void RasterizerVulkan::TickFrame() {
                      : std::to_string(Tegra::g_nx2_compute_write_mark),
                  indirect_bound, indirect_dropped, indirect_host_reads, indirect_waits,
                  indirect_gfx_draws, indirect_gfx_bound, indirect_gfx_dropped,
-                 indirect_gfx_host_reads, indirect_gfx_waits, indirect_cache_hits);
+                 indirect_gfx_host_reads, indirect_gfx_waits, indirect_cache_hits,
+                 indirect_speculated, indirect_verifies, indirect_mispredicts);
     }
     ++render_trace_frame;
     render_trace_draws = 0;
