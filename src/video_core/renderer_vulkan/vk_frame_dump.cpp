@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -16,6 +18,7 @@
 #include "common/settings.h"
 #include "common/stb.h"
 #include "common/zstd_compression.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -30,6 +33,8 @@ namespace {
 using VideoCore::Surface::PixelFormat;
 
 constexpr size_t SIZE_CAP = size_t{2} << 30;
+/// RecordingSampledTextures: a sampled capture is running.
+std::atomic<bool> recording_sampled{};
 constexpr size_t STAGING_BUDGET = size_t{256} << 20;
 
 template <typename T>
@@ -233,30 +238,26 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     if (!dir || *dir == '\0') {
         return;
     }
-    enabled = true;
     const char* const sampled_value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-    sampled = sampled_value && *sampled_value != '\0' && *sampled_value != '0';
     directory = dir;
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
-    if (value == "file") {
-        // Captures once <dir>/capture.now exists, so a frame can be picked while playing.
-        trigger_file = directory / "capture.now";
-        trigger_seconds = std::numeric_limits<double>::infinity();
-    } else if (value.ends_with('f')) {
-        trigger_frame = std::strtoull(value.data(), nullptr, 10);
-        trigger_seconds = std::numeric_limits<double>::infinity();
-    } else {
-        trigger_seconds = std::strtod(value.data(), nullptr);
+    u32 count = 1;
+    if (const char* const count_value = std::getenv("EDEN_NX2_FRAME_DUMP_COUNT")) {
+        count = static_cast<u32>(std::clamp(std::strtol(count_value, nullptr, 10), 1L, 8L));
     }
-    if (const char* const count = std::getenv("EDEN_NX2_FRAME_DUMP_COUNT")) {
-        burst_count = static_cast<u32>(std::clamp(std::strtol(count, nullptr, 10), 1L, 8L));
-    }
+    // "file" captures once <dir>/capture.now exists, so a frame can be picked while playing.
+    schedule.Configure(value, directory / "capture.now",
+                       sampled_value && *sampled_value != '\0' && *sampled_value != '0', count);
     LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
 }
 
 FrameDump::~FrameDump() {
+    StopWriter();
+}
+
+void FrameDump::StopWriter() {
     if (!writer.joinable()) {
         return;
     }
@@ -266,6 +267,20 @@ FrameDump::~FrameDump() {
     }
     queue_ready.notify_one();
     writer.join();
+    stop_writer = false;
+}
+
+void FrameDump::Arm(std::filesystem::path directory_, bool sampled, u64 id, u32 count) {
+    if (!schedule.Arm(sampled, id, count)) {
+        VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
+        return;
+    }
+    StopWriter();
+    // BeginFrame resets the per-frame state and the writer's begin job its own.
+    request_directory = std::move(directory_);
+    if (start == std::chrono::steady_clock::time_point{}) {
+        start = std::chrono::steady_clock::now();
+    }
 }
 
 std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
@@ -767,6 +782,9 @@ void FrameDump::WriterLoop() {
                      job.tags, written_bytes >> 20, frame_directory.string(),
                      job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
                                    : "");
+            if (job.capture_id != 0) {
+                VideoCore::Nx2Debug::FinishCapture(job.capture_id, {});
+            }
             continue;
         }
         if (job.begin) {
@@ -892,80 +910,77 @@ void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
 }
 
 void FrameDump::TickFrame() {
-    if (!enabled || done) {
-        return;
-    }
-    ++frame;
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (capturing) {
-        EndPass();
-        Drain();
-        if (!probes.empty()) {
-            scheduler.Finish();
-            // Clipping invocations, clipping primitives and fragment shader invocations.
-            std::vector<std::array<u64, 3>> counts(probes.size());
-            const VkResult result = device.GetLogical().GetQueryResults(
-                *probe_pool, 0, static_cast<u32>(probes.size()), counts.size() * sizeof(counts[0]),
-                counts.data(), sizeof(counts[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-            for (size_t index = 0; result == VK_SUCCESS && index < probes.size(); ++index) {
-                const Probe& probe = probes[index];
-                Enqueue({.tags = fmt::format(
-                             R"({{"kind":"draw","draw":{},"primitives_in":{},"primitives":{},"fragments":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}}})",
-                             probe.draw, counts[index][0], counts[index][1], counts[index][2],
-                             probe.mesh, probe.indirect, probe.first,
-                             probe.elements, probe.instances, probe.alpha_test, probe.alpha_ref,
-                             probe.alpha_to_coverage, probe.host_alpha_to_coverage, probe.color0,
-                             probe.kill, probe.zero_handles)});
-            }
-            if (result != VK_SUCCESS) {
-                LOG_ERROR(Render_Vulkan, "Frame dump: reading the draw probes failed ({})",
-                          static_cast<int>(result));
-            }
-        }
-        Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index,
-                                     draws, dispatches),
-                 .summary = true,
-                 .truncated = truncated});
-        capturing = false;
-        if (++burst_frame < burst_count) {
-            BeginFrame(elapsed);
-        } else if (trigger_file.empty()) {
-            done = true;
-        } else {
+    switch (schedule.Tick(elapsed)) {
+    case FrameDumpSchedule::Step::None:
+        return;
+    case FrameDumpSchedule::Step::Finish:
+        EndFrame(true);
+        if (schedule.Rearms() && schedule.CaptureId() == 0) {
             LOG_INFO(Render_Vulkan, "Frame dump: re-armed, touch {} for another burst",
-                     trigger_file.string());
+                     (directory / "capture.now").string());
         }
         return;
+    case FrameDumpSchedule::Step::Next:
+        EndFrame(false);
+        break;
+    case FrameDumpSchedule::Step::Start:
+        break;
     }
-    std::error_code error;
-    if (frame < trigger_frame && elapsed < trigger_seconds &&
-        (trigger_file.empty() || frame % 30 != 0 ||
-         !std::filesystem::exists(trigger_file, error))) {
-        return;
+    if (!BeginFrame(elapsed)) {
+        schedule.Abort();
     }
-    if (!trigger_file.empty()) {
-        std::filesystem::remove(trigger_file, error);
-    }
-    ++bursts;
-    burst_frame = 0;
-    BeginFrame(elapsed);
 }
 
-void FrameDump::BeginFrame(double elapsed) {
-    std::filesystem::path path = directory;
-    if (bursts > 1) {
-        path /= fmt::format("burst-{}", bursts);
+void FrameDump::EndFrame(bool last) {
+    EndPass();
+    Drain();
+    if (!probes.empty()) {
+        scheduler.Finish();
+        // Clipping invocations, clipping primitives and fragment shader invocations.
+        std::vector<std::array<u64, 3>> counts(probes.size());
+        const VkResult result = device.GetLogical().GetQueryResults(
+            *probe_pool, 0, static_cast<u32>(probes.size()), counts.size() * sizeof(counts[0]),
+            counts.data(), sizeof(counts[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        for (size_t index = 0; result == VK_SUCCESS && index < probes.size(); ++index) {
+            const Probe& probe = probes[index];
+            Enqueue({.tags = fmt::format(
+                         R"({{"kind":"draw","draw":{},"primitives_in":{},"primitives":{},"fragments":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}}})",
+                         probe.draw, counts[index][0], counts[index][1], counts[index][2],
+                         probe.mesh, probe.indirect, probe.first,
+                         probe.elements, probe.instances, probe.alpha_test, probe.alpha_ref,
+                         probe.alpha_to_coverage, probe.host_alpha_to_coverage, probe.color0,
+                         probe.kill, probe.zero_handles)});
+        }
+        if (result != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Frame dump: reading the draw probes failed ({})",
+                      static_cast<int>(result));
+        }
     }
-    if (burst_count > 1) {
-        path /= fmt::format("frame-{}", burst_frame + 1);
+    Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index, draws,
+                                 dispatches),
+             .summary = true,
+             .truncated = truncated,
+             .capture_id = last ? schedule.CaptureId() : 0});
+}
+
+bool FrameDump::BeginFrame(double elapsed) {
+    const u64 id = schedule.CaptureId();
+    std::filesystem::path path = id != 0 ? request_directory : directory;
+    if (const auto subdirectory = schedule.FrameSubdirectory(); !subdirectory.empty()) {
+        path /= subdirectory;
     }
     std::error_code error;
     std::filesystem::create_directories(path, error);
-    if (error) {
+    // The writer thread opens the manifest; checking here reports the failure to the caller.
+    if (!std::ofstream{path / "manifest.jsonl", std::ios::trunc}) {
         LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", path.string());
-        done = true;
-        return;
+        if (id != 0) {
+            VideoCore::Nx2Debug::FinishCapture(
+                id, {.error = fmt::format("cannot write {}", path.generic_string())});
+        }
+        return false;
     }
     truncated = false;
     recorded_bytes = 0;
@@ -979,6 +994,7 @@ void FrameDump::BeginFrame(double elapsed) {
     recorded_blocks.clear();
     seen_buffers.clear();
     probes.clear();
+    const u64 frame = schedule.Frame();
     Enqueue({.name = path.string(),
              .tags = fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame,
                                  elapsed),
@@ -986,6 +1002,7 @@ void FrameDump::BeginFrame(double elapsed) {
     if (!writer.joinable()) {
         writer = std::thread{[this] { WriterLoop(); }};
     }
+    const bool sampled = schedule.Sampled();
     if (sampled && !device.IsPipelineStatisticsQuerySupported()) {
         LOG_WARNING(Render_Vulkan, "Frame dump: no pipelineStatisticsQuery, draws are not probed");
     } else if (sampled) {
@@ -1007,12 +1024,107 @@ void FrameDump::BeginFrame(double elapsed) {
             cmdbuf.ResetQueryPool(pool, 0, MAX_PROBES);
         });
     }
-    capturing = true;
-    if (burst_count > 1) {
-        LOG_INFO(Render_Vulkan, "Frame dump: burst {}/{}", burst_frame + 1, burst_count);
+    if (schedule.BurstCount() > 1) {
+        LOG_INFO(Render_Vulkan, "Frame dump: burst {}/{}", schedule.BurstFrame() + 1,
+                 schedule.BurstCount());
     }
-    LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot) into {}", frame,
-             elapsed, path.string());
+    LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
+             elapsed, sampled ? " with sampled textures" : "", path.string());
+    return true;
+}
+
+void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
+                                  bool sampled_, u32 count) {
+    enabled = true;
+    sampled = sampled_;
+    configured_count = std::clamp<u32>(count, 1, 8);
+    burst_count = configured_count;
+    if (at == "file") {
+        trigger_file = std::move(trigger_file_);
+    } else if (at.ends_with('f')) {
+        trigger_frame = std::strtoull(std::string{at}.c_str(), nullptr, 10);
+    } else {
+        trigger_seconds = std::strtod(std::string{at}.c_str(), nullptr);
+    }
+}
+
+bool FrameDumpSchedule::Arm(bool sampled_, u64 id, u32 count) {
+    if (capturing) {
+        return false;
+    }
+    enabled = true;
+    done = false;
+    sampled = sampled_;
+    trigger_frame = 0;
+    capture_id = id;
+    armed = true;
+    burst_count = std::clamp<u32>(count, 1, 8);
+    return true;
+}
+
+FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
+    if (!enabled || done) {
+        return Step::None;
+    }
+    ++frame;
+    if (capturing) {
+        if (++burst_frame < burst_count) {
+            return Step::Next;
+        }
+        SetCapturing(false);
+        if (trigger_file.empty()) {
+            done = true;
+        } else {
+            // "file" re-arms: wait for the trigger file again (also after a debug server capture).
+            trigger_frame = ~0ULL;
+        }
+        return Step::Finish;
+    }
+    std::error_code error;
+    if (frame < trigger_frame && elapsed_seconds < trigger_seconds &&
+        (trigger_file.empty() || frame % 30 != 0 ||
+         !std::filesystem::exists(trigger_file, error))) {
+        return Step::None;
+    }
+    if (!armed) {
+        // An EDEN_NX2_FRAME_DUMP trigger, not a debug server request.
+        capture_id = 0;
+        burst_count = configured_count;
+        ++bursts;
+        if (!trigger_file.empty()) {
+            std::filesystem::remove(trigger_file, error);
+        }
+    }
+    armed = false;
+    burst_frame = 0;
+    SetCapturing(true);
+    return Step::Start;
+}
+
+void FrameDumpSchedule::Abort() {
+    SetCapturing(false);
+    armed = false;
+    done = true;
+}
+
+std::filesystem::path FrameDumpSchedule::FrameSubdirectory() const {
+    std::filesystem::path path;
+    if (capture_id == 0 && bursts > 1) {
+        path /= fmt::format("burst-{}", bursts);
+    }
+    if (burst_count > 1) {
+        path /= fmt::format("frame-{}", burst_frame + 1);
+    }
+    return path;
+}
+
+void FrameDumpSchedule::SetCapturing(bool value) {
+    capturing = value;
+    recording_sampled.store(value && sampled, std::memory_order_relaxed);
+}
+
+bool RecordingSampledTextures() noexcept {
+    return recording_sampled.load(std::memory_order_relaxed);
 }
 
 } // namespace Vulkan

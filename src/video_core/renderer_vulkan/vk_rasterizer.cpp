@@ -60,6 +60,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -1922,6 +1923,16 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (VideoCore::Nx2Debug::HasRequests()) {
+        if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->id,
+                           capture->count);
+        }
+        if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
+            pipeline_cache.RefreshDebugRejections(change->unrejected);
+            VideoCore::Nx2Debug::NoteRejectApplied(change->generation);
+        }
+    }
     frame_dump.TickFrame();
     if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
         // EDEN_NX2_DEFERRED_WRITE_LOG (docs/oot-white-petals.md): totals since the previous line.

@@ -14,7 +14,7 @@ NVIDIA. Upstream's default branch is `nx2`; ours mirrors it and carries nothing 
 | `fix/pipeline-eviction-setting` | "Evict unused pipelines" setting + `EDEN_NX2_PIPELINE_EVICT=0`; eviction re-translates pipelines and shows as cycling pop-in |
 | `feat/shader-translation-cache` | per-stage translated-SPIR-V cache ("Cache translated shaders", on by default): boot preload 2.1 s → 0.13 s, evicted-pipeline rebuild 12 ms → 0.4 ms; see `docs/shader-translation-cache.md` |
 | `fix/compute-storage-write-mark` | `EDEN_NX2_COMPUTE_WRITE_MARK=<bytes>` clamps how much of a native compute storage binding is marked GPU-written (upstream marks 8 MiB); `EDEN_NX2_DEFERRED_WRITE_LOG=1` per-frame traffic counters; see `docs/oot-white-petals.md` |
-| `feat/frame-dump-burst` | `EDEN_NX2_FRAME_DUMP_COUNT=N` captures N consecutive frames; file-mode trigger re-arms |
+| `feat/frame-dump-burst` | `EDEN_NX2_FRAME_DUMP_COUNT=N` captures N consecutive frames; file-mode trigger re-arms. Since the merge of upstream #111 it lives in `FrameDumpSchedule` (`Step::Next`, tested in `frame_dump_schedule.cpp`) and the debug server's `capture_frame` takes `count` |
 | `feat/frame-dump-buffer-cap` | `EDEN_NX2_FRAME_DUMP_BUFFER_CAP=<bytes>` caps host-buffer readbacks in a frame dump (the 2 GiB budget otherwise goes to 8 MiB storage bindings) |
 | `test/oot-local` | integration of the above plus upstream `fix/oot-fog`, on top of `nx2`, for play builds |
 
