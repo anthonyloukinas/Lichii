@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <span>
 #include <vector>
 
+#include "common/scope_exit.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -463,18 +465,57 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     if (master.IsFree(tick)) {
         return;
     }
+    namespace Profile = VideoCommon::Nx2Profile;
+    const bool profile = Profile::Enabled();
+    const u64 start = profile ? Profile::Now() : 0;
+    Profile::Add(Profile::Counter::ListWaits, 1);
+    SCOPE_EXIT {
+        if (profile) {
+            Profile::Add(Profile::Counter::ListWaitNs, Profile::Now() - start);
+        }
+    };
     // The copy's submission may be deferred (Scheduler::DeferFlush): the split's front asks the
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
-        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
+        Profile::Add(Profile::Counter::ListWaitUnsubmitted, 1);
+        Profile::Scope scope{Profile::Zone::ListSubmitWait};
         if (!scheduler.WaitSubmitted(tick)) {
             scheduler.Wait(tick);
             return;
         }
     }
-    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListGpuWait};
+    Profile::Scope scope{Profile::Zone::ListGpuWait};
+    // EDEN_NX2_LIST_WAIT_SPIN_US (default 300, 0 = off): poll the timeline semaphore for this
+    // long before blocking in vkWaitSemaphores, whose sleep adds latency to a copy that usually
+    // lands within a few hundred microseconds (the front has nothing else to do meanwhile).
+    static const s64 spin_us = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_WAIT_SPIN_US");
+        return value == nullptr || value[0] == '\0' ? s64{300}
+                                                    : static_cast<s64>(std::atoll(value));
+    }();
+    if (spin_us > 0) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::microseconds{spin_us};
+        for (u32 polls = 0;; ++polls) {
+            master.Refresh();
+            if (master.IsFree(tick)) {
+                Profile::Add(Profile::Counter::ListWaitSpinMet, 1);
+                return;
+            }
+            if ((polls & 15) == 15 && std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            for (int i = 0; i < 32; ++i) {
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                asm volatile("yield");
+#endif
+            }
+        }
+    }
     master.Wait(tick);
 }
 

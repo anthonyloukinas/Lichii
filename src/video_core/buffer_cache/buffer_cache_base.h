@@ -34,6 +34,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/buffer_cache/gpu_modified_set.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -421,6 +422,10 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+    /// Any thread, without the mutex: false when IsRegionGpuModified is surely false.
+    [[nodiscard]] bool MayBeRegionGpuModified(DAddr addr, size_t size) const {
+        return gpu_modified_ranges.MayIntersect(addr, size);
+    }
 
     /// EDEN_NX2_MESH_COUNT_TRACE: fills `out` with the host bytes of the cached buffer holding
     /// [device_addr, device_addr + out.size()), waiting for the host GPU. False when no buffer
@@ -888,7 +893,8 @@ private:
     Common::RangeSet<DAddr> read_trapped_ranges;
     /// Ranges ArmReadTraps could not arm all of this frame (cleared by TickFrame).
     Common::RangeSet<DAddr> unarmed_read_trap_ranges;
-    Common::RangeSet<DAddr> gpu_modified_ranges;
+    /// Its bitmap answers MustFlushRegion without the mutex (GpuModifiedRangeSet::MayIntersect).
+    GpuModifiedRangeSet gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers
