@@ -49,5 +49,6 @@ TEST_CASE("Six axis IPC payload remains trivial with unchanged layout", "[hid][s
     auto left = DefaultSixAxisSensorIcInformation();
     const auto right = DefaultSixAxisSensorIcInformation();
     left.angular_rate = 1000.0f;
+    REQUIRE(left.angular_rate == 1000.0f);
     REQUIRE(right.angular_rate == 2000.0f);
 }
