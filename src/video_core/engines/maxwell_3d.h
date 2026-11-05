@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3205,10 +3206,13 @@ public:
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
+    /// `source` is where the pushbuffer had the argument (EDEN_NX2_MESH_COUNT_TRACE only).
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                         u32 argument, bool is_last_call);
+                         u32 argument, bool is_last_call,
+                         VideoCommon::Nx2MeshCountTrace::PushSource source);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                              const u32* base_start, u32 amount, u32 methods_pending);
+                              const u32* base_start, u32 amount, u32 methods_pending,
+                              VideoCommon::Nx2MeshCountTrace::PushSource source);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3232,6 +3236,9 @@ public:
     } dirty;
 
     DrawManager draw_manager;
+
+    /// EDEN_NX2_MESH_COUNT_TRACE: the last macro DMA read and the running macro.
+    VideoCommon::Nx2MeshCountTrace::EngineState mesh_count_trace;
 
     GPUVAddr GetMacroAddress(size_t index) const {
         size_t base = 0;
@@ -3264,6 +3271,17 @@ public:
 
     /// Handles a write to the CB_BIND register.
     void ProcessCBBind(size_t stage_index);
+
+    /// EDEN_NX2_DRAW_RUNS: a register write about to be applied on the back.
+    void NoteDrawRunsWrite(u32 method, u32 argument);
+
+    /// EDEN_NX2_FAST_DRAW: registers that only parameterize the next draw or the next constant
+    /// buffer bind, or that ProcessMethodCall handles, so writing them doesn't end draw reuse.
+    static bool IsFastDrawParameter(u32 method);
+    /// Methods EDEN_NX2_FAST_DRAW=2 records as light changes (constant buffer data and binds).
+    static bool IsFastDrawDeltaMethod(u32 method);
+    static bool IsFastDrawVertexBuffer(u32 method);
+    void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
 
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
@@ -3392,6 +3410,13 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// EDEN_NX2_MESH_COUNT_TRACE: `value` is written to vertex_buffer.count with `reg_array`
+    /// holding the registers; `split` is set on the split's front.
+    void TraceMeshCount(VideoCommon::GpuSplit* split, const u32* reg_array, u32 value,
+                        bool from_macro);
+    /// EDEN_NX2_MESH_COUNT_TRACE, split front: a register write (count writes, report ops).
+    void TraceFrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value,
+                         bool from_macro);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

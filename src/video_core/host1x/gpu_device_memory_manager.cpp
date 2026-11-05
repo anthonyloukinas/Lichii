@@ -13,9 +13,13 @@ struct MaxwellDeviceMethods {
         interface->RasterizerMarkRegionCached(address, size, caching);
     }
 
-    static inline void MarkRegionReadTrap(Core::Memory::Memory* interface, VAddr address,
+    static inline bool MarkRegionReadTrap(Core::Memory::Memory* interface, VAddr address,
                                           size_t size) {
-        interface->RasterizerArmReadTraps(address, size);
+        return interface->RasterizerArmReadTraps(address, size);
+    }
+
+    static inline bool ReadTrapsActive() {
+        return Core::Memory::Memory::RasterizerReadTrapsActive();
     }
 };
 

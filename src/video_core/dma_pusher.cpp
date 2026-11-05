@@ -8,6 +8,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <string_view>
+#include <vector>
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -25,6 +27,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -99,6 +102,7 @@ bool DmaPusher::Step() {
 
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
+        nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Prefetch);
         command_resume_offset +=
             ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         if (puller.HasPendingAcquire()) {
@@ -144,7 +148,7 @@ bool DmaPusher::Step() {
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
                         engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
-                    });
+                    }, VideoCommon::GpuSplit::FastDrawNeutral);
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
@@ -209,18 +213,21 @@ bool DmaPusher::Step() {
                 header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Submitted);
             command_resume_offset += ProcessCommands(commands, 0);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Copy);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
@@ -229,6 +236,7 @@ bool DmaPusher::Step() {
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
+            nx2_entry_path = static_cast<u8>(VideoCommon::Nx2MeshCountTrace::EntryPath::Slow);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
@@ -432,6 +440,12 @@ void DmaPusher::WatchArgument(u32 method, u32 argument) const {
     }
 }
 
+// EDEN_NX2_MESH_COUNT_TRACE: where a macro parameter word came from.
+static VideoCommon::Nx2MeshCountTrace::PushSource PushSource(GPUVAddr segment, u8 entry_path) {
+    return {.va = segment,
+            .path = static_cast<VideoCommon::Nx2MeshCountTrace::EntryPath>(entry_path)};
+}
+
 bool DmaPusher::WantsSegment() const {
     // Only macro parameters and compute uploads read the engine's current_dma_segment.
     const auto engine = subchannel_type[dma_state.subchannel];
@@ -474,7 +488,8 @@ void DmaPusher::CallMethod(u32 argument) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
                         maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
-                                                   dma_state.is_last_call);
+                                                   dma_state.is_last_call,
+                                                   PushSource(segment, nx2_entry_path));
                         return;
                     }
                 } else if (type == Engines::EngineTypes::KeplerCompute) {
@@ -533,7 +548,8 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
                         maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
-                                                        num_methods, dma_state.method_count);
+                                                        num_methods, dma_state.method_count,
+                                                        PushSource(segment, nx2_entry_path));
                         return;
                     }
                 } else if (type == Engines::EngineTypes::KeplerCompute) {
@@ -664,7 +680,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
                         split.Defer([page, begin = static_cast<u32>(*device - page),
                                      end = static_cast<u32>(*device - page + part.size())] {
                             Nx2CmdPageDiag::CheckMissedWrite(page, begin, end);
-                        });
+                        }, VideoCommon::GpuSplit::FastDrawNeutral);
                     }
                 } else {
                     diag.reads_unknown.fetch_add(1, std::memory_order_relaxed);
@@ -708,7 +724,26 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     const bool dirty = memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                                     VideoCommon::CacheType::BufferCache);
-    if (dirty) {
+    // The other pages draws wrote since their last flush go along in the same GPU round trip:
+    // their next lists then read guest memory instead of draining and flushing again.
+    // EDEN_NX2_CMDPAGE_BATCH=0 flushes this entry's pages only, as before.
+    static const bool batch = [] {
+        const char* value = std::getenv("EDEN_NX2_CMDPAGE_BATCH");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    if (batch && rasterizer != nullptr) {
+        std::vector<DAddr> pages;
+        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+                pages.push_back(*device);
+            }
+        }
+        VideoCommon::GpuSplit::Get().Run(
+            [rasterizer = rasterizer, pages = &pages] {
+                rasterizer->FlushGpuWrittenCommandListPages(*pages);
+            },
+            VideoCommon::DrainSite::ListFlush);
+    } else if (dirty) {
         VideoCommon::GpuSplit::Get().Run(
             [memory = &memory_manager, first_page, size = end_page - first_page] {
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);

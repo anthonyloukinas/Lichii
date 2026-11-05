@@ -194,6 +194,8 @@ private:
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
+    /// How the entry being processed was fetched (Nx2MeshCountTrace::EntryPath).
+    u8 nx2_entry_path{};
 
     void SetState(const CommandHeader& command_header);
 

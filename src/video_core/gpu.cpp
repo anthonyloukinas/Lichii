@@ -29,6 +29,8 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
@@ -112,6 +114,9 @@ struct GPU::Impl {
             if (g_nx2_deferred_write_log) [[unlikely]] {
                 Nx2NoteAppliedWrite(address, size);
             }
+            if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+                VideoCommon::Nx2MeshCountTrace::NoteApplied(address, size);
+            }
             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
         });
         if (g_nx2_deferred_write_log) [[unlikely]] {
@@ -158,6 +163,7 @@ struct GPU::Impl {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
             sync_request_mutex.lock();

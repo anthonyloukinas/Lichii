@@ -263,7 +263,21 @@ public:
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
-    std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+    /// DownloadMemory for each range, waiting for the GPU once.
+    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
+
+    /// The area a guest CPU read of [device_addr, device_addr + size) flushes and the core then
+    /// skips later reads in.
+    std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size) {
+        return GetFlushArea(device_addr, size, device_addr, device_addr + size);
+    }
+
+    /// GetFlushArea for a read whose flush covers [area_begin, area_end) as well (the texture
+    /// cache's area). Only the read's pages are marked Preflushable; the rest of the area ends
+    /// its read traps, and the area is preemptive only if none of it is GPU-modified.
+    std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size,
+                                                                  DAddr area_begin,
+                                                                  DAddr area_end);
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -308,6 +322,13 @@ public:
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written,
                                   const Shader::StorageWriteExtent& write_extent = {});
+
+    /// Binds a native program's read-only storage buffers for pointers loaded from records
+    /// (Shader::Info::native_indirect_slots) at first_index on, one per element of `bases`, and
+    /// writes the base address the shader sees for each (0 when unused).
+    void BindComputeIndirectStorageBuffers(size_t first_index,
+                                           std::span<const Shader::NativeIndirectSlot> slots,
+                                           std::span<u64> bases);
 
     void UnbindComputeTextureBuffers();
 
@@ -363,12 +384,21 @@ public:
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
+    /// The split's back, the front waiting on it: downloads `pages` and every page draws wrote
+    /// since it was last flushed with one GPU wait, and notes the latter synced. Each page's next
+    /// lists then read guest memory instead of draining and flushing one page at a time.
+    void Nx2FlushListPages(std::span<const DAddr> pages);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+
+    /// EDEN_NX2_MESH_COUNT_TRACE: fills `out` with the host bytes of the cached buffer holding
+    /// [device_addr, device_addr + out.size()), waiting for the host GPU. False when no buffer
+    /// holds the range (none is created).
+    [[nodiscard]] bool Nx2ReadHostBytes(DAddr device_addr, std::span<u8> out);
 
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
     /// host buffer holding each range, if one does, for EDEN_NX2_FRAME_DUMP_SAMPLED. Nothing is
@@ -435,6 +465,18 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
+
+    /// EDEN_NX2_FAST_DRAW: updates and binds only the index buffer for a reused indexed draw.
+    /// False when that created or deleted buffers, so the draw needs a full resolve.
+    [[nodiscard]] bool RebindIndexBuffer();
+    /// Updates and binds the vertex buffers whose registers changed; false when that created or
+    /// deleted buffers.
+    [[nodiscard]] bool RebindVertexBuffers();
+    /// Resolves the graphics uniform, storage and texture buffers bound since the last draw;
+    /// false when that created or deleted buffers.
+    [[nodiscard]] bool UpdateGraphicsStageBuffers();
+    /// EDEN_NX2_FAST_DRAW_VERIFY: a hash of the bindings a reused or delta draw keeps.
+    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
     template <typename Func>
     void BufferOperations(Func&& func) {
@@ -583,6 +625,15 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                                bool is_written, bool native_pointer = false) const;
 
+    /// StorageBufferBinding for the pointer gpu_addr read from ssbo_addr
+    [[nodiscard]] Binding StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_addr,
+                                                 u32 cbuf_index, bool is_written,
+                                                 bool native_pointer) const;
+
+    /// The 64-bit pointers at addrs (0 for a null or unmapped address), from the buffers' host
+    /// copies where GPU work wrote them
+    void ReadNativeIndirectPointers(std::span<const GPUVAddr> addrs, std::span<u64> out);
+
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
 
@@ -601,6 +652,11 @@ private:
     /// Flags the vertex buffers overlapping a written range so host copies derived from them are
     /// rebuilt.
     void MarkVertexBuffersStale(DAddr device_addr, u64 size);
+
+    /// Whether the range overlaps a bound vertex buffer or, unless `vertex_only`, a uniform,
+    /// storage or texture buffer the bound graphics pipeline uses.
+    [[nodiscard]] bool OverlapsGraphicsBindings(DAddr device_addr, u64 size,
+                                                bool vertex_only) const;
 
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
@@ -626,6 +682,27 @@ private:
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
+
+    /// EDEN_NX2_BUFFER_SKIP: the inputs and result of each vertex stream's last lookup.
+    struct VertexLookup {
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        const void* owner{};
+        u64 map_serial{};
+        u64 deletions{};
+        Binding binding{};
+        bool valid{};
+    };
+    std::array<VertexLookup, NUM_VERTEX_BUFFERS> vertex_lookups{};
+    u64 buffer_deletions = 0;
+    struct SkipStats {
+        u64 window_start{};
+        u64 lookups{};
+        u64 lookups_kept{};
+        u64 syncs{};
+        u64 syncs_skipped{};
+        u64 verify_mismatches{};
+    } skip_stats;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
     // EDEN_NX2_DEFERRED_WRITE_LOG: set while SynchronizeBuffer runs for a native compute storage
@@ -660,23 +737,30 @@ private:
         return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
     }
 
+    /// Whether QueueFenceDownload queues only the Preflushable pages of a write
+    /// (EDEN_NX2_EXACT_PREFLUSH). Needs active read traps for the rest of the write.
+    bool ExactPreflush() const {
+        return exact_preflush;
+    }
+
+    /// Decides ExactPreflush again: at construction and each frame, as the settings it reads can
+    /// change from the GUI.
+    void UpdateExactPreflush();
+
+    bool exact_preflush = false;
+
     /// Queues a GPU write for download at the next fence where DownloadsAtFence holds. With only
     /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
     /// of a large buffer would otherwise copy the whole buffer back at every fence.
     void QueueFenceDownload(DAddr device_addr, u64 size) {
-        static const bool exact = [] {
-            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
-            return value == nullptr || value[0] != '0';
-        }();
         if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
-        if (!exact) {
-            if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+        if (!ExactPreflush()) {
+            if (memory_tracker.IsRegionPreflushable(device_addr, size) ||
+                !ArmReadTraps(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
-            } else {
-                ArmReadTraps(device_addr, size);
             }
             return;
         }
@@ -690,14 +774,17 @@ private:
                 queued += upper - lower;
             }
         });
-        if (queued < size) {
-            ArmReadTraps(device_addr, size);
+        // A page that could not be trapped is downloaded at the fence with the rest of the write.
+        if (queued < size && !ArmReadTraps(device_addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
         }
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
     /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
-    void ArmReadTraps(DAddr device_addr, u64 size) {
+    /// Returns false when a page could not be trapped: the caller downloads the write at the
+    /// fence instead.
+    bool ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
         u64 armed_bytes = 0;
@@ -705,13 +792,26 @@ private:
             armed_bytes += upper - lower;
         });
         if (armed_bytes == end - begin) {
-            return;
+            return true;
+        }
+        // Each call into the core takes its trap lock and ends every core's cached read area:
+        // a range it could not arm is not asked about again before the next frame.
+        if (unarmed_read_trap_ranges.Intersects(begin, end - begin)) {
+            return false;
+        }
+        // A page the core could not arm (not rasterizer cached yet) must not be skipped by the
+        // early return above, so a range is only recorded when all of it was armed.
+        if (!device_memory.ArmReadTraps(begin, end - begin)) {
+            unarmed_read_trap_ranges.Add(begin, end - begin);
+            return false;
         }
         read_trapped_ranges.Add(begin, end - begin);
-        device_memory.ArmReadTraps(begin, end - begin);
+        return true;
     }
 
     Common::RangeSet<DAddr> read_trapped_ranges;
+    /// Ranges ArmReadTraps could not arm all of this frame (cleared by TickFrame).
+    Common::RangeSet<DAddr> unarmed_read_trap_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 

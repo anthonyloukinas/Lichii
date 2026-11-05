@@ -37,6 +37,9 @@
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra {
@@ -1424,6 +1427,14 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     // from a culling dispatch) and still be only in host buffers: flush them first,
                     // or the macro draws with an older frame's arguments (objects pop in and out).
                     const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
+                    std::optional<VideoCommon::Nx2MeshCountTrace::DmaReadScope> trace;
+                    if (VideoCommon::Nx2MeshCountTrace::g_enabled) {
+                        const auto device = memory.GpuToCpuAddress(source);
+                        trace.emplace(maxwell3d.mesh_count_trace, source, device.value_or(0),
+                                      std::min<u32>(value, 0x1000), address == DmaReadFifoed,
+                                      device && Tegra::Nx2IsGpuWritten(*device));
+                        trace->Waited();
+                    }
                     if (VideoCommon::Nx2Profile::Enabled()) {
                         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
                         for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
@@ -1432,12 +1443,16 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                             }
                         }
                     }
-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                    const bool dirty = memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                    if (dirty) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
                         if (++flushes % 2000 == 1) {
                             LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
                         }
+                    }
+                    if (trace) {
+                        trace->Checked(dirty);
                     }
                     static u32 dma_logs{};
                     if (dma_logs < 400) {
@@ -1450,6 +1465,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     const u32 word_count = std::min<u32>(value, 0x1000);
                     std::array<u32, 0x1000> dma_words;
                     memory.ReadWordsUnsafe(source, dma_words.data(), word_count);
+                    if (trace) {
+                        trace->Words(std::span{dma_words.data(), std::min<size_t>(word_count, 8)});
+                    }
                     for (u32 i = 0; i < word_count; ++i) {
                         const u32 word = dma_words[i];
                         if (address == DmaReadFifoed) {
@@ -1593,8 +1611,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
 
         UNREACHABLE();
     };
+    // HLE programs write registers directly, without the 3D engine's fast draw breaks.
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
     if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
+        FastDraw::Break(FastDraw::Reason::Method, method);
         execute_variant(it->second.program);
+        FastDraw::Break(FastDraw::Reason::Method, method);
         return;
     }
 
@@ -1635,7 +1657,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         ci.program = Compile(system, maxwell3d, code);
     }
 
+    FastDraw::Break(FastDraw::Reason::Method, method);
     execute_variant(ci.program);
+    FastDraw::Break(FastDraw::Reason::Method, method);
     if (Settings::values.dump_macros) {
         Dump(ci.hash, code, !std::holds_alternative<std::monostate>(ci.program));
     }

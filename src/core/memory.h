@@ -488,8 +488,20 @@ public:
     /**
      * Makes the next guest read of each rasterizer cached page in the range take the slow path
      * (fastmem only), so that the read reaches the GPU's reactive flush once.
+     *
+     * @returns false when a page was left unarmed because it is not rasterizer cached: a later
+     *          call can still arm it. True otherwise, also when read traps are off.
      */
-    void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
+    bool RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
+
+    /**
+     * Whether the next guest read of a page given to RasterizerArmReadTraps reaches the GPU's
+     * reactive flush: through its read trap, through reactive flushing's protection of every
+     * cached page, or because without fastmem every cached page read takes the slow path.
+     * False under NCE, and with fastmem: with EDEN_NX2_READ_TRAPS=0 when reactive flushing is
+     * off, with EDEN_NX2_NO_REACTIVE=1 (Switch 2 programs) when it is on.
+     */
+    static bool RasterizerReadTrapsActive();
 
     /**
      * Marks each page within the specified address range as debug or non-debug.

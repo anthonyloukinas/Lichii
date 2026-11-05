@@ -752,6 +752,29 @@ int main(int argc, char** argv) {
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
+        if (const auto& stats = program.info.native_global_stats; stats.Any()) {
+            diagnostic["native_global"] = {
+                {"untracked_dyn_cbuf", {stats.dyn_cbuf_writes, stats.dyn_cbuf_loads}},
+                {"untracked_loaded_ptr", {stats.loaded_ptr_writes, stats.loaded_ptr_loads}},
+                {"untracked_other", {stats.other_writes, stats.other_loads}},
+                {"dyn_bound", {stats.dyn_bound_writes, stats.dyn_bound_loads}},
+                {"dyn_slots", stats.dyn_slots},
+                {"dyn_slots_dropped", stats.dyn_slots_dropped},
+                {"dyn_cbuf_mask", stats.dyn_cbuf_mask},
+                {"indirect_bound", stats.indirect_loads},
+                {"indirect_slots", stats.indirect_slots},
+                {"indirect_slots_dropped", stats.indirect_slots_dropped},
+                {"indirect_bindings", stats.indirect_bindings},
+                {"indirect_records", [&] {
+                     Json records = Json::array();
+                     for (const auto& slot : program.info.native_indirect_slots) {
+                         records.push_back({slot.cbuf_index, slot.cbuf_offset, slot.deref_offset});
+                     }
+                     return records;
+                 }()},
+                {"storage_buffers", program.info.storage_buffers_descriptors.size()},
+            };
+        }
         if (env.IsNativeProgram()) {
             // The key the emulator's frame dumps and logs use for a native program
             // (shader_environment.cpp NativeShaderHash)
@@ -770,6 +793,7 @@ int main(int argc, char** argv) {
                 {"cbuf_index", descriptor.cbuf_index},
                 {"cbuf_offset", descriptor.cbuf_offset},
                 {"is_written", descriptor.is_written},
+                {"native_indirect", descriptor.native_indirect},
                 {"bounded", extent.bounded},
                 {"const_end", extent.const_end},
                 {"local_stride", extent.local_stride},

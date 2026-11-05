@@ -40,6 +40,14 @@ struct MeshDrawBaseLayout {
     u32 task;
     u32 mesh;
 };
+// Base addresses (u64) of a native compute program's native_indirect storage buffers, after the
+// rescaling and render area words.
+constexpr u32 NATIVE_INDIRECT_BASES_OFFSET = 64;
+constexpr u32 NATIVE_INDIRECT_BASES_SIZE = 8 * sizeof(u64);
+static_assert(NATIVE_INDIRECT_BASES_OFFSET >= sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
+// Within the 128 bytes of push constants every Vulkan device supports
+static_assert(NATIVE_INDIRECT_BASES_OFFSET + NATIVE_INDIRECT_BASES_SIZE <= 128);
+
 constexpr u32 MESH_DRAW_BASE_OFFSET = sizeof(RescalingLayout);
 static_assert(MESH_DRAW_BASE_OFFSET + sizeof(MeshDrawBaseLayout) <=
               sizeof(RescalingLayout) + sizeof(RenderAreaLayout));

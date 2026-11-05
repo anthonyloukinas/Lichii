@@ -511,19 +511,26 @@ bool RasterizerOpenGL::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (buffer_cache.FlushesOnCpuRead()) {
+        // As in RasterizerVulkan::GetFlushArea: the buffer cache answers for the whole area.
+        const DAddr start = texture_area ? texture_area->start_address : addr;
+        const DAddr end = texture_area ? texture_area->end_address : addr + size;
+        std::scoped_lock lock{buffer_cache.mutex};
+        auto area = buffer_cache.GetFlushArea(addr, size, start, end);
+        if (area && texture_area) {
+            area->preemtive &= texture_area->preemtive;
+        }
         if (area) {
             return *area;
         }
     }
-    {
-        std::scoped_lock lock{buffer_cache.mutex};
-        auto area = buffer_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+    if (texture_area) {
+        return *texture_area;
     }
     VideoCore::RasterizerDownloadArea new_area{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),

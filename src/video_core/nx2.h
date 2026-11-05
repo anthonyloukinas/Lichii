@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <string_view>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -79,6 +80,11 @@ struct Nx2DeferredWriteCounters {
     std::atomic<u64> native_storage_bindings{0};
     std::atomic<u64> native_storage_bytes{0};
     std::atomic<u64> native_marked_bytes{0};
+    // Read-only bindings for pointers native programs load from records: bound, left out by the
+    // binding cap, and records read back from the host copy because GPU work wrote them.
+    std::atomic<u64> native_indirect_bound{0};
+    std::atomic<u64> native_indirect_dropped{0};
+    std::atomic<u64> native_indirect_host_reads{0};
     // Written native bindings whose mark the shader's store extent bounded this dispatch, and the
     // ones that kept the mode's full mark (unknown extent, Full, or the 64 KiB cap).
     std::atomic<u64> native_bounded_bindings{0};
@@ -140,6 +146,14 @@ inline const u64 g_nx2_compute_write_mark = [] {
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(value, &end, 0);
     return end == value ? ~u64{0} : static_cast<u64>(parsed);
+}();
+
+// EDEN_NX2_INDIRECT_POINTERS=guest (experiment): read native programs' pointer records from
+// guest memory only, even where the GPU wrote them (no host read back, no wait). Default: from
+// the buffer's host copy when the record's bytes are marked GPU-written.
+inline const bool g_nx2_indirect_guest_reads = [] {
+    const char* value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
+    return value != nullptr && std::string_view{value} == "guest";
 }();
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1

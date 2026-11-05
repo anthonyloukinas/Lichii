@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <deque>
+#include <numeric>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -18,6 +20,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/logging.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
@@ -60,6 +63,15 @@ using StorageInstVector = small_vector<StorageInst, 24>;
 using StorageWritesSet =
     flat_set<StorageBufferAddr, std::less<StorageBufferAddr>, small_vector<StorageBufferAddr, 16>>;
 
+/// Constant buffer pointers a native access's low address can be built from
+struct NativeCandidates {
+    small_vector<StorageBufferAddr, 4> fixed;
+    /// Pointer slots of a constant buffer the address reads at a dynamic offset
+    StorageBufferSet dynamic;
+    /// Constant buffers read at a dynamic offset on the way, pointers found or not
+    u32 dynamic_cbuf_mask{};
+};
+
 struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
@@ -73,9 +85,17 @@ struct StorageInfo {
     /// instructions (the IR does not change while storage buffers are collected).
     std::unordered_map<const IR::Inst*, std::optional<StorageBufferAddr>> biased_tracks;
     std::unordered_map<const IR::Inst*, std::optional<StorageBufferAddr>> unbiased_tracks;
-    std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
+    std::unordered_map<const IR::Inst*, NativeCandidates> native_candidates;
     /// A native access with several candidate pointers was left global.
     bool native_runtime_bounds{};
+    /// Pointer slots of constant buffers read at a dynamic offset, bound after the others as far
+    /// as the storage buffer limit allows.
+    StorageBufferSet dynamic_set;
+    StorageWritesSet dynamic_writes;
+    /// Records native loads take their pointer from, see IndirectRecordSlots
+    flat_set<NativeIndirectSlot> indirect_slots;
+    std::unordered_map<const IR::Inst*, small_vector<NativeIndirectSlot, 4>> record_slots;
+    NativeGlobalStats stats{};
     /// Buffers a store or atomic that stayed global may write to (at run time, at any offset)
     StorageBufferSet unbounded_writes;
     /// A store or atomic stayed global without a buffer: it may land in any written buffer
@@ -1011,12 +1031,93 @@ std::optional<StorageBufferAddr> TrackPointerAddend(const LowAddrInfo& addr,
     return tied || (!legacy_nearest && candidates.size() != 1) ? std::nullopt : result;
 }
 
+/// The byte offsets a dynamic constant buffer offset can take, as base + k * stride for k >= 0.
+/// Terms it does not follow can be anything (stride 1); a negative immediate drops the base.
+struct OffsetForm {
+    u32 base;
+    u32 stride;
+};
+
+OffsetForm DynamicOffsetForm(const IR::Value& value, u32& budget, u32 depth = 8) {
+    if (value.IsImmediate()) {
+        const u32 imm{value.U32()};
+        return imm < 0x10000 ? OffsetForm{imm, 0} : OffsetForm{0, 1};
+    }
+    const IR::Inst* const inst{value.InstRecursive()};
+    if (depth == 0 || budget == 0) {
+        return {0, 1};
+    }
+    --budget;
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32: {
+        const OffsetForm lhs{DynamicOffsetForm(inst->Arg(0), budget, depth - 1)};
+        const OffsetForm rhs{DynamicOffsetForm(inst->Arg(1), budget, depth - 1)};
+        return {lhs.base + rhs.base, std::gcd(lhs.stride, rhs.stride)};
+    }
+    case IR::Opcode::ShiftLeftLogical32:
+        if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() < 16) {
+            const OffsetForm form{DynamicOffsetForm(inst->Arg(0), budget, depth - 1)};
+            const u32 shift{inst->Arg(1).U32()};
+            return {form.base << shift, form.stride << shift};
+        }
+        break;
+    case IR::Opcode::IMul32:
+        for (size_t arg = 0; arg < 2; ++arg) {
+            if (inst->Arg(arg).IsImmediate() && inst->Arg(arg).U32() < 0x10000) {
+                const OffsetForm form{DynamicOffsetForm(inst->Arg(1 - arg), budget, depth - 1)};
+                const u32 factor{inst->Arg(arg).U32()};
+                return {form.base * factor, form.stride * factor};
+            }
+        }
+        break;
+    case IR::Opcode::Phi: {
+        // A table start picked per branch, as in (i << 4) + phi(0xe0, 0x1000).
+        OffsetForm result{~0U, 0};
+        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+            const OffsetForm form{DynamicOffsetForm(inst->Arg(arg), budget, depth - 1)};
+            if (result.base != ~0U) {
+                const u32 low{std::min(result.base, form.base)};
+                const u32 high{std::max(result.base, form.base)};
+                result.stride = std::gcd(std::gcd(result.stride, form.stride), high - low);
+                result.base = low;
+            } else {
+                result = form;
+            }
+        }
+        return result.base == ~0U ? OffsetForm{0, 1} : result;
+    }
+    default:
+        break;
+    }
+    return {0, 1};
+}
+
+/// How far into a constant buffer a dynamically indexed pointer table is searched: 128 slots of
+/// 16 bytes. Words past the bound size read 0 and are not pointers.
+constexpr u32 DYNAMIC_CBUF_SCAN_BYTES{0x800};
+
+/// Calls func with every 8-aligned slot of a constant buffer read at a dynamic offset that the
+/// offset can reach and that holds a mapped pointer.
+template <typename Func>
+void ForEachDynamicPointerSlot(u32 index, const IR::Value& offset, Environment& env, Func&& func) {
+    u32 budget{64};
+    const OffsetForm form{DynamicOffsetForm(offset, budget)};
+    const u32 step{form.stride == 0 ? 8U : form.stride};
+    for (u32 slot = Common::AlignUp(form.base, 8U); slot < DYNAMIC_CBUF_SCAN_BYTES; slot += 8) {
+        if ((slot - form.base) % step == 0 && env.IsCbufStorageBufferPointer(index, slot)) {
+            func(slot);
+        }
+    }
+}
+
 /// Native programs: every constant buffer pointer the low address can come from, following only
 /// additions, selects and phis. A predicated address assignment becomes a phi whose other input
-/// can point into a different buffer, so the search does not stop at the first pointer.
-small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_addr,
-                                                           Environment& env) {
-    small_vector<StorageBufferAddr, 4> candidates;
+/// can point into a different buffer, so the search does not stop at the first pointer. A pointer
+/// read at a dynamic offset (an array of per-object pointers) may be any pointer slot of its
+/// constant buffer that the offset can reach.
+NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& env) {
+    NativeCandidates result;
+    auto& candidates{result.fixed};
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
     const auto enqueue = [&](const IR::Value& value) {
@@ -1031,7 +1132,17 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
         case IR::Opcode::GetCbufU32x2: {
             const IR::Value index{inst->Arg(0)};
             const IR::Value offset{inst->Arg(1)};
-            if (!index.IsImmediate() || !offset.IsImmediate()) {
+            if (!index.IsImmediate() || index.U32() >= Info::MAX_CBUFS) {
+                break;
+            }
+            if (!offset.IsImmediate()) {
+                result.dynamic_cbuf_mask |= 1U << index.U32();
+                if (!NativeDynamicCbufPointers()) {
+                    break;
+                }
+                ForEachDynamicPointerSlot(index.U32(), offset, env, [&](u32 slot) {
+                    result.dynamic.insert({.index = index.U32(), .offset = slot});
+                });
                 break;
             }
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
@@ -1061,7 +1172,255 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             break;
         }
     }
-    return candidates;
+    return result;
+}
+
+enum class UntrackedReason {
+    DynamicCbuf,
+    LoadedPointer,
+    Other,
+};
+
+/// Why a native global access has no storage buffer: its address reads a constant buffer at a
+/// dynamic offset, or a value loaded from memory, or neither. The search first follows only the
+/// operands a pointer passes through, so an index or carry computed from another pointer does not
+/// decide it, then every operand.
+UntrackedReason ClassifyUntracked(const IR::Inst& inst, u32& dynamic_cbuf_mask) {
+    const IR::Value addr{inst.Arg(0)};
+    if (addr.IsImmediate()) {
+        return UntrackedReason::Other;
+    }
+    const auto search = [&](bool pointer_operands_only) {
+        small_vector<const IR::Inst*, 32> pending{addr.InstRecursive()};
+        std::unordered_set<const IR::Inst*> visited{pending.front()};
+        bool loaded{};
+        u32 dynamic_mask{};
+        const auto enqueue = [&](const IR::Value& operand) {
+            if (!operand.IsImmediate() && visited.insert(operand.InstRecursive()).second) {
+                pending.push_back(operand.InstRecursive());
+            }
+        };
+        for (size_t next = 0; next < pending.size() && next < 512; ++next) {
+            const IR::Inst* const current{pending[next]};
+            const IR::Opcode opcode{current->GetOpcode()};
+            if (opcode == IR::Opcode::GetCbufU32 || opcode == IR::Opcode::GetCbufU32x2) {
+                if (current->Arg(0).IsImmediate() && !current->Arg(1).IsImmediate() &&
+                    current->Arg(0).U32() < Info::MAX_CBUFS) {
+                    dynamic_mask |= 1U << current->Arg(0).U32();
+                }
+                continue;
+            }
+            if (IsGlobalMemory(*current) || opcode == IR::Opcode::LoadStorage32 ||
+                opcode == IR::Opcode::LoadStorage64 || opcode == IR::Opcode::LoadStorage128 ||
+                opcode == IR::Opcode::LoadSharedU32 || opcode == IR::Opcode::LoadSharedU64 ||
+                opcode == IR::Opcode::LoadSharedU128 || opcode == IR::Opcode::LoadLocal) {
+                loaded = true;
+                continue;
+            }
+            switch (pointer_operands_only ? opcode : IR::Opcode::Void) {
+            case IR::Opcode::Void:
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::IAdd64:
+            case IR::Opcode::Phi:
+            case IR::Opcode::CompositeConstructU32x2:
+            case IR::Opcode::CompositeExtractU32x2:
+            case IR::Opcode::PackUint2x32:
+            case IR::Opcode::UnpackUint2x32:
+                for (size_t arg = 0; arg < current->NumArgs(); ++arg) {
+                    enqueue(current->Arg(arg));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+            case IR::Opcode::SelectU64:
+                enqueue(current->Arg(1));
+                enqueue(current->Arg(2));
+                break;
+            default:
+                break;
+            }
+        }
+        return std::pair{dynamic_mask, loaded};
+    };
+    auto [dynamic_mask, loaded] = search(true);
+    if (dynamic_mask == 0 && !loaded) {
+        std::tie(dynamic_mask, loaded) = search(false);
+    }
+    dynamic_cbuf_mask |= dynamic_mask;
+    if (dynamic_mask != 0) {
+        return UntrackedReason::DynamicCbuf;
+    }
+    return loaded ? UntrackedReason::LoadedPointer : UntrackedReason::Other;
+}
+
+/// The records a pointer loaded by a LoadGlobal64 comes from: its address must be a constant
+/// buffer pointer (fixed, or any pointer slot a dynamic offset can reach) plus a constant, through
+/// phis and selects. A path that is anything else is left out.
+small_vector<NativeIndirectSlot, 4> PointerRecords(IR::Inst& load, Environment& env) {
+    small_vector<NativeIndirectSlot, 4> result;
+    const std::optional<LowAddrInfo> addr{TrackLowAddress(&load)};
+    if (!addr || addr->value.IsImmediate()) {
+        return result;
+    }
+    struct Pending {
+        const IR::Inst* inst;
+        s64 offset;
+    };
+    small_vector<Pending, 16> pending{{addr->value.InstRecursive(), addr->imm_offset}};
+    std::unordered_set<const IR::Inst*> visited{pending.front().inst};
+    const auto add = [&](u32 index, u32 slot, s64 offset) {
+        if (offset < 0 || offset >= 0x10000 || !Common::IsAligned(offset, 4)) {
+            return;
+        }
+        const NativeIndirectSlot record{
+            .cbuf_index = index, .cbuf_offset = slot, .deref_offset = static_cast<u32>(offset)};
+        if (std::ranges::find(result, record) == result.end()) {
+            result.push_back(record);
+        }
+    };
+    const auto cbuf = [&](const IR::Inst* read, s64 offset) {
+        const IR::Value index{read->Arg(0)};
+        const IR::Value cbuf_offset{read->Arg(1)};
+        if (!index.IsImmediate() || index.U32() >= Info::MAX_CBUFS) {
+            return;
+        }
+        if (cbuf_offset.IsImmediate()) {
+            if (Common::IsAligned(cbuf_offset.U32(), 8) &&
+                env.IsCbufStorageBufferPointer(index.U32(), cbuf_offset.U32())) {
+                add(index.U32(), cbuf_offset.U32(), offset);
+            }
+        } else if (NativeDynamicCbufPointers()) {
+            ForEachDynamicPointerSlot(index.U32(), cbuf_offset, env,
+                                      [&](u32 slot) { add(index.U32(), slot, offset); });
+        }
+    };
+    const auto enqueue = [&](const IR::Value& value, s64 offset) {
+        if (!value.IsImmediate() && visited.insert(value.InstRecursive()).second) {
+            pending.push_back({value.InstRecursive(), offset});
+        }
+    };
+    for (size_t next = 0; next < pending.size() && next < 64; ++next) {
+        const auto [inst, offset] = pending[next];
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::GetCbufU32:
+            cbuf(inst, offset);
+            break;
+        case IR::Opcode::CompositeExtractU32x2:
+            if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0 &&
+                !inst->Arg(0).IsImmediate() &&
+                inst->Arg(0).InstRecursive()->GetOpcode() == IR::Opcode::GetCbufU32x2) {
+                cbuf(inst->Arg(0).InstRecursive(), offset);
+            }
+            break;
+        case IR::Opcode::IAdd32:
+            for (size_t arg = 0; arg < 2; ++arg) {
+                if (inst->Arg(arg).IsImmediate()) {
+                    enqueue(inst->Arg(1 - arg),
+                            offset + static_cast<s32>(inst->Arg(arg).U32()));
+                    break;
+                }
+            }
+            break;
+        case IR::Opcode::Phi:
+            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                enqueue(inst->Arg(arg), offset);
+            }
+            break;
+        case IR::Opcode::SelectU32:
+            enqueue(inst->Arg(1), offset);
+            enqueue(inst->Arg(2), offset);
+            break;
+        default:
+            break;
+        }
+    }
+    return result;
+}
+
+/// Native programs: the records an access's pointer is loaded from. The pointer is the low word of
+/// a LoadGlobal64 added into the low address, through additions, phis and selects (an index
+/// computed from loaded values is not followed).
+small_vector<NativeIndirectSlot, 4> IndirectRecordSlots(const IR::Inst& inst, StorageInfo& info,
+                                                        Environment& env) {
+    small_vector<NativeIndirectSlot, 4> result;
+    const std::optional<LowAddrInfo> addr{TrackLowAddress(const_cast<IR::Inst*>(&inst))};
+    if (!addr || addr->value.IsImmediate()) {
+        return result;
+    }
+    small_vector<const IR::Inst*, 32> pending{addr->value.InstRecursive()};
+    std::unordered_set<const IR::Inst*> visited{pending.front()};
+    const auto enqueue = [&](const IR::Value& value) {
+        if (!value.IsImmediate() && visited.insert(value.InstRecursive()).second) {
+            pending.push_back(value.InstRecursive());
+        }
+    };
+    for (size_t next = 0; next < pending.size() && next < 256; ++next) {
+        const IR::Inst* const current{pending[next]};
+        switch (current->GetOpcode()) {
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::Phi:
+            for (size_t arg = 0; arg < current->NumArgs(); ++arg) {
+                enqueue(current->Arg(arg));
+            }
+            break;
+        case IR::Opcode::SelectU32:
+            enqueue(current->Arg(1));
+            enqueue(current->Arg(2));
+            break;
+        case IR::Opcode::CompositeExtractU32x2: {
+            if (!current->Arg(1).IsImmediate() || current->Arg(1).U32() != 0 ||
+                current->Arg(0).IsImmediate()) {
+                break;
+            }
+            IR::Inst* const load{current->Arg(0).InstRecursive()};
+            if (load->GetOpcode() != IR::Opcode::LoadGlobal64) {
+                break;
+            }
+            auto it{info.record_slots.find(load)};
+            if (it == info.record_slots.end()) {
+                it = info.record_slots.emplace(load, PointerRecords(*load, env)).first;
+            }
+            for (const NativeIndirectSlot& record : it->second) {
+                if (std::ranges::find(result, record) == result.end()) {
+                    result.push_back(record);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return result;
+}
+
+void CountUntracked(const IR::Inst& inst, StorageInfo& info, Environment& env) {
+    const bool write{IsGlobalMemoryWrite(inst)};
+    auto& stats{info.stats};
+    const auto bump = [](u16& counter) {
+        if (counter != 0xffff) {
+            ++counter;
+        }
+    };
+    switch (ClassifyUntracked(inst, stats.dyn_cbuf_mask)) {
+    case UntrackedReason::DynamicCbuf:
+        bump(write ? stats.dyn_cbuf_writes : stats.dyn_cbuf_loads);
+        break;
+    case UntrackedReason::LoadedPointer:
+        if (!write && NativeIndirectPointers() && env.ShaderStage() == Stage::Compute) {
+            // Read only: the records' targets are bound for each dispatch (native_indirect).
+            const auto records{IndirectRecordSlots(inst, info, env)};
+            if (!records.empty()) {
+                info.indirect_slots.insert(records.begin(), records.end());
+                bump(stats.indirect_loads);
+                break;
+            }
+        }
+        bump(write ? stats.loaded_ptr_writes : stats.loaded_ptr_loads);
+        break;
+    case UntrackedReason::Other:
+        bump(write ? stats.other_writes : stats.other_loads);
+        break;
+    }
 }
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself.
@@ -1080,6 +1439,9 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     const std::optional<LowAddrInfo> low_addr_info{TrackLowAddress(&inst)};
     if (!low_addr_info) {
         // Failed to track the low address, use NVN fallbacks
+        if (env.IsNativeProgram()) {
+            CountUntracked(inst, info, env);
+        }
         return false;
     }
     // First try to find storage buffers in the NVN address
@@ -1098,16 +1460,27 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         if (it == info.native_candidates.end()) {
             it = info.native_candidates.emplace(start, NativePointerCandidates(low_addr, env)).first;
         }
-        const auto& candidates{it->second};
-        if (candidates.size() > 1) {
+        const auto& candidates{it->second.fixed};
+        const auto& dynamic{it->second.dynamic};
+        if (candidates.size() > 1 || !dynamic.empty()) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
+            const bool write{IsGlobalMemoryWrite(inst)};
             for (const StorageBufferAddr& candidate : candidates) {
                 info.set.insert(candidate);
-                if (IsGlobalMemoryWrite(inst)) {
+                if (write) {
                     info.writes.insert(candidate);
                     info.unbounded_writes.insert(candidate);
                 }
+            }
+            if (!dynamic.empty()) {
+                info.dynamic_set.insert(dynamic.begin(), dynamic.end());
+                if (write) {
+                    info.dynamic_writes.insert(dynamic.begin(), dynamic.end());
+                }
+                info.stats.dyn_cbuf_mask |= it->second.dynamic_cbuf_mask;
+                u16& counter{write ? info.stats.dyn_bound_writes : info.stats.dyn_bound_loads};
+                counter = counter == 0xffff ? counter : static_cast<u16>(counter + 1);
             }
             info.native_runtime_bounds = true;
             return true;
@@ -1125,6 +1498,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         // them were unmapped when their pipelines were first built. The binding reads the pointer
         // again for every dispatch.
         if (!paired_pointer || !info.atomic_pointers.contains(*paired_pointer)) {
+            CountUntracked(inst, info, env);
             return false;
         }
         storage_buffer = paired_pointer;
@@ -1747,7 +2121,65 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             info.untracked_writes |= !bound && IsGlobalMemoryWrite(inst);
         }
     }
+    if (!info.dynamic_set.empty()) {
+        // A pointer slot over the limit stays unbound: accesses through it are dropped, as they
+        // were before these slots were bound at all.
+        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+                                            host_info.max_descriptor_set_storage_buffers)};
+        for (const StorageBufferAddr& slot : info.dynamic_set) {
+            if (!info.set.contains(slot) && info.set.size() >= limit) {
+                ++info.stats.dyn_slots_dropped;
+                continue;
+            }
+            info.set.insert(slot);
+            ++info.stats.dyn_slots;
+            if (info.dynamic_writes.contains(slot)) {
+                // The stores stay global and pick the slot at run time, at any offset (the count
+                // words past the pointer included): no store extent, the whole binding is marked.
+                info.writes.insert(slot);
+                info.unbounded_writes.insert(slot);
+            }
+        }
+        if (info.stats.dyn_slots_dropped != 0) {
+            LOG_WARNING(Shader,
+                        "{} constant buffer pointer slots read at dynamic offsets exceed the "
+                        "storage buffer limit {} and stay unbound",
+                        info.stats.dyn_slots_dropped, limit);
+        }
+    }
+    size_t indirect_bindings{};
+    if (!info.indirect_slots.empty()) {
+        // Read-only bindings for pointers loaded from records, after every other binding, as many
+        // as the storage buffer limit and MAX_NATIVE_INDIRECT_BINDINGS allow. The dispatch binds
+        // the distinct targets of the first records that have one.
+        auto& stats{info.stats};
+        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+                                            host_info.max_descriptor_set_storage_buffers)};
+        const size_t room{limit > info.set.size() ? limit - info.set.size() : 0};
+        const size_t slots{std::min(info.indirect_slots.size(), Info::MAX_NATIVE_INDIRECT_SLOTS)};
+        indirect_bindings = std::min({Info::MAX_NATIVE_INDIRECT_BINDINGS, room, slots});
+        if (indirect_bindings == 0) {
+            stats.indirect_slots_dropped = static_cast<u16>(info.indirect_slots.size());
+            stats.loaded_ptr_loads =
+                static_cast<u16>(std::min(0xffff, stats.loaded_ptr_loads + stats.indirect_loads));
+            stats.indirect_loads = 0;
+        } else {
+            stats.indirect_slots = static_cast<u16>(slots);
+            stats.indirect_slots_dropped = static_cast<u16>(info.indirect_slots.size() - slots);
+            stats.indirect_bindings = static_cast<u16>(indirect_bindings);
+            program.info.native_indirect_slots.assign(info.indirect_slots.begin(),
+                                                      info.indirect_slots.begin() + slots);
+            info.native_runtime_bounds = true;
+        }
+        if (stats.indirect_slots_dropped != 0) {
+            LOG_WARNING(Shader,
+                        "{} pointer records of loaded storage pointers exceed the record cap {} or "
+                        "the storage buffer limit {} and are not bound",
+                        stats.indirect_slots_dropped, Info::MAX_NATIVE_INDIRECT_SLOTS, limit);
+        }
+    }
     program.info.native_global_bounds |= info.native_runtime_bounds;
+    program.info.native_global_stats = info.stats;
     // Store extents, before the accesses are rebased (the analysis reads the guest addresses)
     std::map<StorageBufferAddr, StorageWriteExtent> extents;
     if (!info.untracked_writes) {
@@ -1782,6 +2214,18 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                                                   : StorageWriteExtent{},
         });
     }
+    for (size_t index = 0; index < indirect_bindings; ++index) {
+        // The first record's slot, for code that looks at every descriptor's constant buffer
+        // pointer; the binding itself comes from Info::native_indirect_slots.
+        const NativeIndirectSlot& first{program.info.native_indirect_slots.front()};
+        program.info.storage_buffers_descriptors.push_back({
+            .cbuf_index = first.cbuf_index,
+            .cbuf_offset = first.cbuf_offset,
+            .count = 1,
+            .is_written = false,
+            .native_indirect = true,
+        });
+    }
     for (const StorageInst& storage_inst : info.to_replace) {
         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
         const auto it{info.set.find(storage_inst.storage_buffer)};
@@ -1794,14 +2238,51 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     }
 }
 
+bool NativeDynamicCbufPointers() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_DYN_CBUF_POINTERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NativeIndirectPointers() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 void JoinStorageInfo(Info& base, Info& source) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
+    {
+        auto& lhs{base.native_global_stats};
+        const auto& rhs{source.native_global_stats};
+        const auto add = [](u16& a, u16 b) { a = static_cast<u16>(std::min(0xffff, a + b)); };
+        add(lhs.dyn_cbuf_writes, rhs.dyn_cbuf_writes);
+        add(lhs.dyn_cbuf_loads, rhs.dyn_cbuf_loads);
+        add(lhs.loaded_ptr_writes, rhs.loaded_ptr_writes);
+        add(lhs.loaded_ptr_loads, rhs.loaded_ptr_loads);
+        add(lhs.other_writes, rhs.other_writes);
+        add(lhs.other_loads, rhs.other_loads);
+        add(lhs.dyn_bound_writes, rhs.dyn_bound_writes);
+        add(lhs.dyn_bound_loads, rhs.dyn_bound_loads);
+        add(lhs.dyn_slots, rhs.dyn_slots);
+        add(lhs.dyn_slots_dropped, rhs.dyn_slots_dropped);
+        lhs.dyn_cbuf_mask |= rhs.dyn_cbuf_mask;
+        add(lhs.indirect_loads, rhs.indirect_loads);
+        add(lhs.indirect_slots, rhs.indirect_slots);
+        add(lhs.indirect_slots_dropped, rhs.indirect_slots_dropped);
+        add(lhs.indirect_bindings, rhs.indirect_bindings);
+    }
     auto& descriptors = base.storage_buffers_descriptors;
     for (auto& desc : source.storage_buffers_descriptors) {
         auto it{std::ranges::find_if(descriptors, [&desc](const auto& existing) {
             return desc.cbuf_index == existing.cbuf_index &&
-                   desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count;
+                   desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count &&
+                   desc.native_indirect == existing.native_indirect;
         })};
         if (it != descriptors.end()) {
             if (desc.is_written) {

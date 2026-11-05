@@ -52,6 +52,27 @@ static inline bool AddressSpaceContains(const Common::PageTable& table, const Co
     return addr + size >= addr && addr + size <= max_addr;
 }
 
+/// EDEN_NX2_READ_TRAPS=0 turns read traps off.
+static bool ReadTrapsDisabledByEnv() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
+        return value != nullptr && value[0] == '0';
+    }();
+    return disabled;
+}
+
+/// Whether reactive flushing takes read permission away from every cached page.
+/// EDEN_NX2_NO_REACTIVE=1 drops that on Switch 2 programs. Opt-in: without it a CPU read of
+/// GPU-written memory can see stale data.
+static bool ReactiveFlushingProtects() {
+    static const bool nx2_no_reactive = [] {
+        const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return Settings::values.use_reactive_flushing.GetValue() &&
+           !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
+}
+
 // Implementation class used to keep the specifics of the memory subsystem hidden
 // from outside classes. This also allows modification to the internals of the memory
 // subsystem without needing to rebuild all files that make use of the memory interface.
@@ -502,16 +523,7 @@ struct Memory::Impl {
 
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
-            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
-            // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
+            if (!ReactiveFlushingProtects() || !cached) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
@@ -586,26 +598,23 @@ struct Memory::Impl {
     /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
     /// are not used there.
     bool ReadTrapsEnabled() const {
-        static const bool disabled = [] {
-            const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
-            return value != nullptr && value[0] == '0';
-        }();
-        return !disabled && current_page_table->fastmem_arena &&
+        return !ReadTrapsDisabledByEnv() && current_page_table->fastmem_arena &&
                !Settings::values.use_reactive_flushing.GetValue() &&
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
-    void RasterizerArmReadTraps(u64 vaddr, u64 size) {
+    bool RasterizerArmReadTraps(u64 vaddr, u64 size) {
         // Clean cached read areas also need invalidation when reactive flushing is enabled.
         read_trap_generation.fetch_add(1, std::memory_order_release);
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
-            return;
+            return true;
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         std::scoped_lock lk{read_trap_mutex};
         u64 run_begin = 0;
         u64 run_pages = 0;
+        bool all_armed = true;
         const auto protect_run = [&] {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
@@ -621,6 +630,7 @@ struct Memory::Impl {
             armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (!cached || !armed_read_traps.insert(page).second) {
                 armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+                all_armed &= cached;
                 protect_run();
                 continue;
             }
@@ -630,6 +640,7 @@ struct Memory::Impl {
             ++run_pages;
         }
         protect_run();
+        return all_armed;
     }
 
     bool ReadTrapArmed(u64 vaddr, u64 size) {
@@ -1199,8 +1210,23 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
 }
 
-void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
-    impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+bool Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
+    return impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+}
+
+bool Memory::RasterizerReadTrapsActive() {
+    // Under NCE every fault is taken as a write: a read of a protected page does not flush.
+    if (Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Nce) {
+        return false;
+    }
+    // Without fastmem every access to a cached page takes the slow path.
+    if (!Settings::IsFastmemEnabled()) {
+        return true;
+    }
+    if (Settings::values.use_reactive_flushing.GetValue()) {
+        return ReactiveFlushingProtects();
+    }
+    return !ReadTrapsDisabledByEnv();
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
