@@ -458,6 +458,63 @@ TEST_CASE("Guarded per-tap gathers retain immediate offsets through SPIRV transl
     }
 }
 
+TEST_CASE("Per-tap offset proof crosses LEA writes to other registers",
+          "[video_core][ampere][gather][logged_textures]") {
+    // Ocarina 5bb12e1ef721b75f (compute at 0x11489edc00): R2 and R3 hold the tap offsets, then
+    // LEA R8, R8, R7 at 0x5a0 sits between them and the F16.PTP gather at 0x680.
+    const Instruction lea{{0x08087211, 0x00000007, 0x078ff8ff, 0x000fc800}};
+    const Instruction gather{{0x08047b63, 0x30003002, 0x001eaf05, 0x000fc200}};
+    for (const bool half : {false, true}) {
+        auto tap = gather;
+        // F32 results take two registers per destination: move the second pair to R10.
+        if (!half) tap.words[2] = (tap.words[2] & ~((1U << 15) | 0xffU)) | 10U;
+        const std::array native{
+            Instruction{{0xff027424, 0x00010000, 0x078e00ff, 0}},
+            Instruction{{0xff037424, 0x01010100, 0x078e00ff, 0}},
+            lea, tap, Exit,
+        };
+        const auto lowered = Shader::Ampere::LowerToMaxwell(native);
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        auto code = lowered.instructions;
+        for (const u32 reg : {4U, half ? 5U : 10U})
+            code.insert(code.end() - 1, 0xef58000000070000ULL | reg | (255ULL << 8) |
+                (u64{reg * 4} << 20) | (4ULL << 48));
+        TextureEnvironment env;
+        env.code = code;
+        env.binding = lowered.required_texture_buffer;
+        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+        Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{0x50}};
+        Shader::ObjectPool<IR::Inst> inst_pool;
+        Shader::ObjectPool<IR::Block> block_pool;
+        Shader::HostTranslateInfo host;
+        host.ApplyDescriptorLimitPolicy();
+        auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+        u32 gathers = 0;
+        for (const auto* block : program.blocks) {
+            for (const auto& inst : *block) {
+                if (inst.GetOpcode() != IR::Opcode::ImageGather) continue;
+                ++gathers;
+                const std::array<std::array<u32, 4>, 2> expected{{{0, 0, 1, 0}, {0, 1, 1, 1}}};
+                for (const u32 argument : {2U, 3U}) {
+                    const auto* offsets = inst.Arg(argument).InstRecursive();
+                    REQUIRE(offsets->GetOpcode() == IR::Opcode::CompositeConstructU32x4);
+                    REQUIRE(offsets->AreAllArgsImmediates());
+                    for (u32 lane = 0; lane < 4; ++lane)
+                        CHECK(offsets->Arg(lane).U32() == expected[argument - 2][lane]);
+                }
+            }
+        }
+        REQUIRE(gathers == 1);
+        // A LEA that writes either offset register leaves them unproven.
+        for (const u32 clobbered : {2U, 3U}) {
+            auto invalid = native;
+            invalid[2].words[0] = (invalid[2].words[0] & ~0xff0000U) | (clobbered << 16);
+            CHECK_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+        }
+    }
+}
+
 TEST_CASE("Half gathers reject reserved second coordinates before scratch copies",
           "[video_core][ampere][logged_textures]") {
     for (u32 source = 246; source < 255; ++source) {
