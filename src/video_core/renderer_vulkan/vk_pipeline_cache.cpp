@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <fstream>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -18,6 +19,7 @@
 #include <bit>
 #include <numeric>
 #include "common/cityhash.h"
+#include "common/cpu_features.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -326,8 +328,15 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 }
 
 size_t GetTotalPipelineWorkers() {
-    const size_t max_core_threads =
-        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+    const size_t logical_threads =
+        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
+    const size_t max_core_threads = logical_threads - 1ULL;
+    if (const char* const env = std::getenv("EDEN_NX2_PIPELINE_WORKERS"); env && *env) {
+        const long parsed = std::strtol(env, nullptr, 10);
+        if (parsed > 0) {
+            return std::min<size_t>(static_cast<size_t>(parsed), max_core_threads);
+        }
+    }
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
@@ -337,6 +346,11 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    if (const auto physical_cores = Common::GetProcessorCount();
+        physical_cores && static_cast<size_t>(*physical_cores) >= logical_threads &&
+        logical_threads <= 8ULL) {
+        return std::max<size_t>(logical_threads / 2ULL, 2ULL);
+    }
     return max_core_threads;
 #endif
 }
@@ -680,7 +694,7 @@ constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
 // MoltenVK keeps the previous eight sessions: a pipeline built while playing goes through
 // SPIR-V -> MSL -> Metal, far more than the 2-3 ms the shorter window assumes, so each one
 // built at boot is a stutter avoided.
-constexpr u8 UsedPipelinesMaxAge = 2;
+constexpr u8 UsedPipelinesMaxAge = 16;
 constexpr u8 UsedPipelinesMaxAgeMoltenVK = 8;
 
 u8 MaxUsedPipelineAge(const Device& device) {
@@ -1139,7 +1153,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         return nullptr;
     }
     if (used_this_session.insert(pipeline.get()).second &&
-        std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::minutes{2}) {
+        std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::seconds{15}) {
         SaveUsedPipelines();
     }
     if (current_pipeline) {
@@ -1179,7 +1193,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // (~7.5 ms each measured on Ocarina of Time; one log: 434 evicted, then 177 rebuilt in 10 s for
     // 1323 ms on the GPU thread). With asynchronous shaders its draws are discarded until it is
     // rebuilt, which shows as pop-in every few minutes.
-    constexpr u64 EvictAfterFrames = 9000;
+    constexpr u64 EvictAfterFrames = 36000; // PR #161 (was 9000 on our line)
     if (frame_count <= EvictAfterFrames) {
         return;
     }

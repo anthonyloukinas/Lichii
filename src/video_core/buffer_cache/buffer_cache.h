@@ -3239,6 +3239,9 @@ void BufferCache<P>::ReportPageProtection() {
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
     ApplyHotEpoch();
+    if (!memory_tracker.HasPendingCpuUpload(device_addr, size)) {
+        return true;
+    }
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
 #else

@@ -87,6 +87,15 @@ public:
         static const bool enabled = Nx2EnvSwitch("EDEN_NX2_WRITER_LAUNCHES", true);
         return enabled;
     }
+    /// EDEN_NX2_PR161_WAITS (default on): PR #161's front waits. DmaPusher::Step waits for the
+    /// writers before the last sync only (WaitForSyncedWriters), an acquire first waits for the
+    /// releases noted for its semaphore (WaitForSemaphore), macro DMA reads take PR #161's wait
+    /// and flush, list copies are submitted at once. =0: the waits of our line before the merge
+    /// (WaitForWriters, MetBeforeDrain, the ranged FrontDmaRead wait, deferred list copies).
+    [[nodiscard]] static bool Pr161Waits() {
+        static const bool enabled = Nx2EnvSwitch("EDEN_NX2_PR161_WAITS", true);
+        return enabled;
+    }
     /// EDEN_NX2_DMA_READ_RANGES (default on): the front logs where its 3D constant buffer and
     /// inline uploads, reports and the puller's semaphore releases write (NoteRangedWrite), and
     /// its memory reads wait only for the logged writes they overlap (WaitForMemoryRange). =cb
@@ -209,7 +218,8 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
     /// Whether WaitForWriters would wait now (front thread).
     [[nodiscard]] bool WritersPending() {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -264,6 +274,22 @@ public:
         return consumed_cache < MemoryTarget(address, size, nullptr);
     }
 
+    static constexpr size_t SemSlot(u64 addr) noexcept {
+        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10) ^ (addr >> 18)) & 63U);
+    }
+    void NoteSemaphoreWrite(u64 addr) noexcept {
+        sem_write_positions[SemSlot(addr)] = write_position;
+        last_release_position = write_position;
+    }
+    void NoteAnyRelease() noexcept {
+        last_release_position = write_position;
+    }
+    [[nodiscard]] u64 LastReleasePosition() const noexcept {
+        return last_release_position;
+    }
+    bool WaitForSemaphore(u64 addr, DrainSite site = DrainSite::Acquire) {
+        return WaitFor(sem_write_positions[SemSlot(addr)], site);
+    }
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -353,6 +379,8 @@ private:
     u64 last_sync_position{};
     u64 last_memory_write_position{};
     SplitWriteLog write_log;
+    u64 last_release_position{};
+    std::array<u64, 64> sem_write_positions{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -378,6 +406,8 @@ private:
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
 };
 
 } // namespace VideoCommon

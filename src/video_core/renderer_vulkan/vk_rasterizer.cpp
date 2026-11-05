@@ -1964,6 +1964,12 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
     if (!buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         return;
     }
+    // PR #161 submits the copy at once (EDEN_NX2_PR161_WAITS, default on); =0 defers it as
+    // below.
+    if (VideoCommon::GpuSplit::Pr161Waits()) {
+        scheduler.Flush();
+        return;
+    }
     // EDEN_NX2_LIST_COPY_SUBMIT_NOW (default on): when the split's front is waiting for the back
     // right now, it is about to read the list (it waits for its writers, DmaPusher::Step), so
     // submit the copy at once: deferred, it went with the next submission, after the draws
@@ -2387,12 +2393,7 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    if (device.IsMoltenVK()) {
-        scheduler.DeferFragmentBarrier();
-        return;
-    }
-    // We already put barriers when a render pass finishes
-    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.DeferFragmentBarrier();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
@@ -3061,21 +3062,22 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    u32 budget = SubmissionPolicy::DefaultNativeBudget;
+    const u32 default_native_budget =
+        device.IsMoltenVK() ? SubmissionPolicy::DefaultNativeBudget : 4096U;
+    u32 budget = default_native_budget;
     if (native && !android) {
-        static const u32 configured_budget = [] {
+        static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
             if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
                 if (const auto parsed = SubmissionPolicy::ParseBudget(value)) {
-                    return *parsed;
+                    return parsed;
                 }
                 LOG_WARNING(Render_Vulkan,
-                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}, "
-                            "using {}",
-                            (std::numeric_limits<u32>::max)(), SubmissionPolicy::DefaultNativeBudget);
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}",
+                            (std::numeric_limits<u32>::max)());
             }
-            return SubmissionPolicy::DefaultNativeBudget;
+            return std::nullopt;
         }();
-        budget = configured_budget;
+        budget = configured_budget.value_or(default_native_budget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {

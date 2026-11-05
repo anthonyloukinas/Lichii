@@ -680,7 +680,15 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
         }
         return;
     }
-    ProcessDirtyRegisters(method, argument);
+    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+        draw_manager.DrawDeferred(*this, true);
+    }
+    if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+        regs.reg_array[method] = argument;
+        for (auto const& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    }
     ProcessMethodCall(method, argument, method_argument, is_last_call);
 }
 
@@ -1069,6 +1077,7 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
+    std::vector<u32> cb_words;
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
@@ -1235,6 +1244,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     }
     for (u32 i = 0; i < range_count; ++i) {
         split.NoteRangedWrite(ranges[i].address, ranges[i].size);
+    }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        split.NoteSemaphoreWrite(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]);
     }
 }
 
@@ -1421,6 +1435,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     for (u32 i = 0; i < range_count; ++i) {
         split.NoteRangedWrite(ranges[i].address, ranges[i].size);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        split.NoteSemaphoreWrite(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]);
+    }
 }
 
 void Maxwell3D::TargetTraceFrontCount(const FrontState& fs, u32 start, u32 value) {
@@ -1471,6 +1490,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const auto read = [&fs](u32 address) {
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        const auto flush_cb = [&] {
+            if (!fs.cb_words.empty()) {
+                split.MultiMethod(this, cb_data, fs.cb_words.data(),
+                                  static_cast<u32>(fs.cb_words.size()),
+                                  static_cast<u32>(fs.cb_words.size()), nullptr);
+                fs.cb_words.clear();
+            }
+        };
         const auto emit = [&](u32 address, u32 value) {
             if (address >= MacroRegistersStart) {
                 return false;
@@ -1482,6 +1510,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 address == MAXWELL3D_REG_INDEX(vertex_buffer.count)) [[unlikely]] {
                 TargetTraceFrontCount(fs, start, value);
             }
+            if (address >= cb_data && address < cb_data + 16 &&
+                fs.control != Regs::ShadowRamControl::Replay) {
+                fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+                fs.cb_words.push_back(value);
+                return true;
+            }
+            flush_cb();
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
             if (address == 0x157 || address == 0x158) {
@@ -1513,6 +1548,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             result = engine.native_interpreter.Execute(engine.native_code, start, fs.parameters,
                                                        read, emit);
         }
+        flush_cb();
         if (!result.success) {
             engine.native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
@@ -1572,17 +1608,22 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     };
     const bool ranged = !full_drain && VideoCommon::GpuSplit::RangedWrites();
+    // EDEN_NX2_PR161_WAITS (default on): PR #161's wait (the writers before the last sync and
+    // the releases noted for the source's semaphore slot, then a drain and flush where the words
+    // lie in GPU-written pages). =0: the ranged wait below and a flush wherever the caches hold
+    // newer words.
+    const bool pr161 = VideoCommon::GpuSplit::Pr161Waits();
     if (full_drain) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-    } else if (ranged) {
+    } else if (!pr161 && ranged) {
         split.WaitForMemoryRange(source, read_bytes, VideoCommon::DrainSite::MacroDmaRead);
-    } else {
+    } else if (!pr161) {
         split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead);
     }
-    if (trace) {
-        trace->Waited();
-    }
     if (VideoCommon::QueryDma::TraceEnabled()) {
+        if (pr161) {
+            split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        }
         split.Run(
             [this, macro, method, source, read_bytes] {
                 if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
@@ -1592,11 +1633,30 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 }
             },
             VideoCommon::DrainSite::MacroDmaFlush);
+    } else if (pr161 && !full_drain) {
+        split.WaitForSyncedWriters(VideoCommon::DrainSite::MacroDmaRead);
+        split.WaitForSemaphore(source, VideoCommon::DrainSite::MacroDmaRead);
+    }
+    if (trace) {
+        trace->Waited();
+    }
+    bool gpu_written = false;
+    for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        if (device && Tegra::Nx2IsGpuWritten(*device)) {
+            gpu_written = true;
+            break;
+        }
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    flush_if_dirty();
+    if (!pr161 || full_drain) {
+        flush_if_dirty();
+    } else if (gpu_written) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        flush_if_dirty();
+    }
     if (trace) {
         trace->Front(mesh_count_trace.macro_start, ram,
                      static_cast<u32>(GetNativeMacroEngine().native_interpreter.data_ram_writes.size()));

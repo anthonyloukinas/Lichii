@@ -53,8 +53,18 @@ struct WordManager {
         u64 const last_word = (~u64{0} << shift) >> shift;
         heap[num_words * size_t(Type::CPU) + num_words - 1] = last_word;
         heap[num_words * size_t(Type::Untracked) + num_words - 1] = last_word;
+        upload_words = 0;
+        for (size_t index = 0; index < num_words; ++index) {
+            if ((CpuWord(index) | UntrackedWord(index)) != 0) {
+                ++upload_words;
+            }
+        }
     }
     explicit WordManager() = default;
+
+    [[nodiscard]] bool HasPendingUpload() const noexcept {
+        return upload_words != 0;
+    }
 
     static u64 ExtractBits(u64 word, size_t page_start, size_t page_end) {
         constexpr size_t number_bits = sizeof(u64) * 8;
@@ -126,7 +136,10 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         std::vector<std::pair<VAddr, u64>> ranges;
         std::vector<std::pair<VAddr, u64>> cooled_ranges;
+        const bool affects_upload = type == Type::CPU || type == Type::CachedCPU;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            const u64 before_cpu = affects_upload ? CpuWord(index) : 0;
+            const u64 before_untracked = affects_upload ? UntrackedWord(index) : 0;
             if (type == Type::GPU && enable) {
                 CoolHotPages(index, mask, cooled_ranges);
             }
@@ -152,6 +165,9 @@ struct WordManager {
                 if (type == Type::CPU || type == Type::CachedCPU)
                     untracked_words[index] &= ~mask;
             }
+            if (affects_upload) {
+                NoteUploadWord(before_cpu, before_untracked, CpuWord(index), UntrackedWord(index));
+            }
         });
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, (!enable) ? 1 : -1);
@@ -171,6 +187,9 @@ struct WordManager {
     template <typename Func>
     void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
         //static_assert(type != Type::Untracked);
+        if (type == Type::CPU && upload_words == 0) {
+            return;
+        }
         std::span<u64> state_words = Span(type);
         std::span<u64> untracked_words = Span(Type::Untracked);
         std::span<u64> cached_words = Span(Type::CachedCPU);
@@ -184,7 +203,10 @@ struct WordManager {
         };
         std::vector<std::pair<VAddr, u64>> ranges;
         u64 kept_pages = 0;
+        const bool affects_upload = clear && (type == Type::CPU || type == Type::CachedCPU);
         IterateWords(offset, size, [&](size_t index, u64 mask) {
+            const u64 before_cpu = affects_upload ? CpuWord(index) : 0;
+            const u64 before_untracked = affects_upload ? UntrackedWord(index) : 0;
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
@@ -200,6 +222,9 @@ struct WordManager {
                     untracked_words[index] &= ~(mask & ~keep);
                 if (type == Type::CPU)
                     cached_words[index] &= ~word;
+            }
+            if (affects_upload) {
+                NoteUploadWord(before_cpu, before_untracked, CpuWord(index), UntrackedWord(index));
             }
             const size_t base_offset = index * PAGES_PER_WORD;
             IteratePages(word, [&](size_t pages_offset, size_t pages_size) {
@@ -316,11 +341,15 @@ struct WordManager {
         auto const cpu_words = Span(Type::CPU);
         std::vector<std::pair<VAddr, u64>> ranges;
         for (u64 word_index = 0; word_index < num_words; ++word_index) {
+            const u64 before_cpu = cpu_words[word_index];
+            const u64 before_untracked = untracked_words[word_index];
             const u64 cached_bits = cached_words[word_index];
             CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
             untracked_words[word_index] |= cached_bits;
             cpu_words[word_index] |= cached_bits;
             cached_words[word_index] = 0;
+            NoteUploadWord(before_cpu, before_untracked, cpu_words[word_index],
+                           untracked_words[word_index]);
         }
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, -1);
@@ -449,6 +478,28 @@ struct WordManager {
         });
     }
 
+    [[nodiscard]] u64& CpuWord(size_t index) noexcept {
+        return heap[index];
+    }
+
+    [[nodiscard]] u64& UntrackedWord(size_t index) noexcept {
+        return heap[num_words * size_t(Type::Untracked) + index];
+    }
+
+    void NoteUploadWord(u64 before_cpu, u64 before_untracked, u64 after_cpu,
+                        u64 after_untracked) noexcept {
+        const bool was = (before_cpu | before_untracked) != 0;
+        const bool now = (after_cpu | after_untracked) != 0;
+        if (was == now) {
+            return;
+        }
+        if (now) {
+            ++upload_words;
+        } else {
+            --upload_words;
+        }
+    }
+
     std::span<u64> Span(Type type) noexcept {
         return std::span<u64>(heap.data() + num_words * size_t(type), num_words);
     }
@@ -461,6 +512,7 @@ struct WordManager {
     DeviceTracker* tracker = nullptr;
     Nx2HotPages::HotList* hot_list = nullptr; ///< EDEN_NX2_HOT_PAGES (the memory tracker's)
     VAddr cpu_addr = 0;
+    u32 upload_words = 0;
 };
 
 } // namespace VideoCommon
