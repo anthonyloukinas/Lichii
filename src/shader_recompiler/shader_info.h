@@ -180,6 +180,9 @@ struct StorageBufferDescriptor {
     /// the pointer records of Info::native_indirect_slots (not from cbuf_index/cbuf_offset). Read
     /// only; its base address is a push constant (Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET).
     bool native_indirect{};
+    /// When set, the buffer pointer is read from memory at this offset from the constant buffer
+    /// pointer, which is bound as its own descriptor.
+    u32 indirect_offset{~0U};
     /// How far the program's stores reach past the pointer (unbounded unless proven)
     StorageWriteExtent write_extent{};
 

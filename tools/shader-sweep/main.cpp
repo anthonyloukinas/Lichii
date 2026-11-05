@@ -103,6 +103,10 @@ u64 CbufKey(u32 bank, u32 offset) {
     return (u64{bank} << 32) | offset;
 }
 
+u64 IndirectCbufKey(u32 bank, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (u64{indirect & 0x3fffff} << 40) | CbufKey(bank, offset);
+}
+
 class OfflineEnvironment final : public Shader::Environment {
 public:
     void Load(std::span<const u8> bytes, u32 version) {
@@ -247,6 +251,10 @@ public:
             return true;
         }
         return Lookup(pointers, CbufKey(bank, offset), "storage pointer classification") != 0;
+    }
+    bool IsCbufIndirectStorageBufferPointer(u32 bank, u32 offset, u32 indirect) override {
+        return Lookup(pointers, IndirectCbufKey(bank, offset, indirect),
+                      "storage pointer table classification") != 0;
     }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
         if (assume_storage_pointers && !cbuf_values.contains(CbufKey(bank, offset))) {
@@ -542,7 +550,7 @@ int main(int argc, char** argv) {
                 std::cout << "shader-sweep [INPUT] [--stage "
                              "vertex|tess-control|tess-eval|geometry|fragment|compute]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47|48|49|50]\n"
+                             "--cache-version 46|47|48|49|50|51|52]\n"
                              "  [--pipeline-key FILE] [--capture-extent] "
                              "(--output SPV | --lower-only WORDS) [--dump-ir FILE]\n"
                              "  [--assume-storage-pointers]\n";
@@ -576,8 +584,9 @@ int main(int argc, char** argv) {
             else if (arg == "--dump-ir")
                 dump_ir = value;
             else if (arg == "--cache-version") {
-                if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50")
-                    throw std::runtime_error("Expected cache version 46, 47, 48, 49 or 50");
+                if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
+                    value != "51" && value != "52")
+                    throw std::runtime_error("Expected cache version 46 to 52");
                 version = static_cast<u32>(std::stoul(value));
             } else if (arg == "--output" || arg == "--lower-only") {
                 if (!output.empty())

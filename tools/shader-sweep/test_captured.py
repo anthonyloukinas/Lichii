@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -41,7 +42,13 @@ def main():
             if "pipeline_key" in fixture:
                 key.write_bytes(bytes.fromhex(fixture["pipeline_key"]))
                 command += ["--pipeline-key", str(key)]
-            compiled = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            environment = dict(os.environ)
+            if "expect_native_global" in fixture:
+                # Recorded with Anthony's bindings on, their default before the merge of upstream
+                # #150 made them opt-in.
+                environment.update(EDEN_NX2_DYN_CBUF_POINTERS="1", EDEN_NX2_INDIRECT_POINTERS="1")
+            compiled = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                      env=environment)
             if compiled.returncode:
                 raise RuntimeError(f"{path.stem}: compiler exit {compiled.returncode}\n"
                                    f"{compiled.stdout}{compiled.stderr}")
