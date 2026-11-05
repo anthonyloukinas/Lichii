@@ -108,6 +108,13 @@ enum class Counter : u32 {
     RangeWaitByRange,   ///< ... an overlapping logged write
     RangeVerifyReads,   ///< EDEN_NX2_WAIT_VERIFY: reads repeated after the old wait
     RangeVerifyDiffs,   ///< ... whose words differed
+    // Semaphore acquires with EDEN_NX2_ACQUIRE_RANGES (puller.cpp MetBeforeDrain).
+    AcquireMetNoDrain,     ///< Met without a drain
+    AcquireResumedNoDrain, ///< A suspended channel's acquire met without a drain
+    AcquireMetAfterWait,   ///< Of both: after waiting for the semaphore's possible writers
+    AcquireDrained,        ///< Not met yet: drained as before
+    AcquireVerifyChecks,   ///< EDEN_NX2_WAIT_VERIFY: met acquires checked again after a drain
+    AcquireVerifyDiffs,    ///< ... not met any more
     Count,
 };
 
@@ -244,6 +251,17 @@ inline void Report(const char* thread_name = "GPU thread") {
             per_second(Counter::RangeWaitByWriter), per_second(Counter::RangeWaitBySync),
             per_second(Counter::RangeWaitByUnranged), per_second(Counter::RangeWaitByRange),
             per_second(Counter::RangeVerifyReads), per_second(Counter::RangeVerifyDiffs));
+    }
+    if (data.counters[static_cast<size_t>(Counter::AcquireMetNoDrain)] +
+            data.counters[static_cast<size_t>(Counter::AcquireResumedNoDrain)] +
+            data.counters[static_cast<size_t>(Counter::AcquireDrained)] !=
+        0) {
+        line += fmt::format(
+            " | acquires met without a drain {:.0f} (resumes {:.0f}, {:.0f} after a short wait), "
+            "drained {:.0f} (verify {:.0f}, {:.0f} differ)",
+            per_second(Counter::AcquireMetNoDrain), per_second(Counter::AcquireResumedNoDrain),
+            per_second(Counter::AcquireMetAfterWait), per_second(Counter::AcquireDrained),
+            per_second(Counter::AcquireVerifyChecks), per_second(Counter::AcquireVerifyDiffs));
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {

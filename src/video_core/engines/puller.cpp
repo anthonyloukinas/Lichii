@@ -79,6 +79,50 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_ACQUIRE_RANGES (default on): before draining for an acquire, wait only for the queued
+// work that can write the semaphore (GpuSplit::WaitForMemoryRange: compute and copy work, unlogged
+// memory writes, the last host-level wait and the logged writes over it) and read it. The rest
+// can't change the word, so a value met now is met after a drain too; one not met yet takes the
+// drain as before. Returns whether the acquire is met.
+bool MetBeforeDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, bool resume) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    static const bool enabled = VideoCommon::Nx2EnvSwitch("EDEN_NX2_ACQUIRE_RANGES", true);
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!enabled || !split.Active()) {
+        return false;
+    }
+    const bool waited =
+        split.WaitForMemoryRange(acquire.address, sizeof(u32), VideoCommon::DrainSite::Acquire);
+    const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
+    if (!acquire.Matches(word)) {
+        Profile::Add(Profile::Counter::AcquireDrained, 1);
+        return false;
+    }
+    if (VideoCommon::GpuSplit::VerifyWaits()) {
+        DrainBack();
+        const u32 drained = ReadSemaphoreWord(dma_pusher, acquire.address);
+        Profile::Add(Profile::Counter::AcquireVerifyChecks, 1);
+        if (!acquire.Matches(drained)) {
+            Profile::Add(Profile::Counter::AcquireVerifyDiffs, 1);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(HW_GPU,
+                            "Split wait verify: semaphore {:#x} (op {}, {:#x}) met at {:#x} "
+                            "before the drain, not at {:#x} after it",
+                            acquire.address, acquire.operation, acquire.value, word, drained);
+            }
+            return false;
+        }
+    }
+    Profile::Add(resume ? Profile::Counter::AcquireResumedNoDrain
+                        : Profile::Counter::AcquireMetNoDrain,
+                 1);
+    if (waited) {
+        Profile::Add(Profile::Counter::AcquireMetAfterWait, 1);
+    }
+    return true;
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -108,6 +152,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
+    if (MetBeforeDrain(dma_pusher, *pending_acquire, true)) {
+        return true;
+    }
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
@@ -272,6 +319,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (MetBeforeDrain(dma_pusher, acquire, false)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
