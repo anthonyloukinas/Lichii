@@ -175,11 +175,22 @@ struct StorageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     bool is_written;
-    /// Native: a pointer slot bound only because a pointer table is read at a dynamic offset. Its
-    /// accesses can sit far past the pointer, so the binding is not cut at the memory layout.
-    bool native_dynamic_slot{};
+    /// Native: bound for each dispatch to a storage pointer loaded from memory, read from one of
+    /// the pointer records of Info::native_indirect_slots (not from cbuf_index/cbuf_offset). Read
+    /// only; its base address is a push constant (Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET).
+    bool native_indirect{};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
+};
+
+/// A record a native program loads a storage pointer from: the constant buffer pointer at
+/// cbuf_index:cbuf_offset points to it, and the loaded pointer is at deref_offset in it.
+struct NativeIndirectSlot {
+    u32 cbuf_index;
+    u32 cbuf_offset;
+    u32 deref_offset;
+
+    auto operator<=>(const NativeIndirectSlot&) const = default;
 };
 
 struct TextureBufferDescriptor {
@@ -287,10 +298,17 @@ struct NativeGlobalStats {
     u16 dyn_slots;         ///< constant buffer slots bound for dynamic pointer reads
     u16 dyn_slots_dropped; ///< slots left out by the storage buffer limit
     u32 dyn_cbuf_mask;     ///< constant buffers read for pointers at a dynamic offset
+    /// Loads through a pointer loaded from a record (Info::native_indirect_slots), kept global
+    /// with the records' targets bound read-only for each dispatch.
+    u16 indirect_loads;
+    u16 indirect_slots;         ///< records the dispatch reads targets from
+    u16 indirect_slots_dropped; ///< records left out by the record cap
+    u16 indirect_bindings;      ///< read-only storage buffers the targets are bound to
 
     [[nodiscard]] bool Any() const noexcept {
         return dyn_cbuf_writes | dyn_cbuf_loads | loaded_ptr_writes | loaded_ptr_loads |
-               other_writes | other_loads | dyn_bound_writes | dyn_bound_loads | dyn_slots_dropped;
+               other_writes | other_loads | dyn_bound_writes | dyn_bound_loads | dyn_slots_dropped |
+               indirect_loads | indirect_slots_dropped;
     }
     bool operator==(const NativeGlobalStats&) const = default;
 };
@@ -299,6 +317,9 @@ struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
     static constexpr size_t MAX_SSBOS{32};
+    /// Read-only storage buffers for pointers loaded from records, and records read per program
+    static constexpr size_t MAX_NATIVE_INDIRECT_BINDINGS{8};
+    static constexpr size_t MAX_NATIVE_INDIRECT_SLOTS{32};
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
@@ -375,6 +396,10 @@ struct Info {
     /// is a candidate and its bound length (not an NVN size word) limits the range.
     bool native_global_bounds{};
     NativeGlobalStats native_global_stats{};
+    /// Records whose loaded pointers the native_indirect storage buffers are bound to, in the order
+    /// the dispatch tries them
+    boost::container::static_vector<NativeIndirectSlot, MAX_NATIVE_INDIRECT_SLOTS>
+        native_indirect_slots;
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};

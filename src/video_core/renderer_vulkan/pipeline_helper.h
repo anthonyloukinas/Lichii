@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 
@@ -254,8 +255,11 @@ public:
                                               VK_SHADER_STAGE_MESH_BIT_EXT
                                         : VK_SHADER_STAGE_ALL_GRAPHICS)),
             .offset = 0,
-            .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                    static_cast<u32>(sizeof(RenderAreaLayout)),
+            .size = uses_native_indirect
+                        ? Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET +
+                              Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_SIZE
+                        : static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                              static_cast<u32>(sizeof(RenderAreaLayout)),
         };
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -271,6 +275,12 @@ public:
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
+        // A native compute program's read-only storage buffers for pointers loaded from records
+        // take their base addresses from the push constants.
+        uses_native_indirect |=
+            (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+            std::ranges::any_of(info.storage_buffers_descriptors,
+                                [](const auto& desc) { return desc.native_indirect; });
 
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
@@ -309,6 +319,7 @@ private:
     const Device* device{};
     bool is_compute{};
     bool uses_mesh{};
+    bool uses_native_indirect{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};
