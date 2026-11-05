@@ -45,6 +45,12 @@ Stage ParseStage(std::string_view name) {
         if (name == StageNames[i])
             return static_cast<Stage>(i);
     }
+    // Native task and mesh programs carry a vertex (task) or tessellation (mesh) header type: the
+    // stage comes from the pipeline's mesh control, so it is given explicitly.
+    if (name == "task")
+        return Stage::Task;
+    if (name == "mesh")
+        return Stage::Mesh;
     throw std::runtime_error("Unknown stage: " + std::string{name});
 }
 
@@ -101,6 +107,10 @@ V Lookup(const std::map<K, V>& values, K key, std::string_view name) {
 
 u64 CbufKey(u32 bank, u32 offset) {
     return (u64{bank} << 32) | offset;
+}
+
+u64 IndirectCbufKey(u32 bank, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (u64{indirect & 0x3fffff} << 40) | CbufKey(bank, offset);
 }
 
 class OfflineEnvironment final : public Shader::Environment {
@@ -190,6 +200,10 @@ public:
         stage = value;
     }
 
+    void SetMeshRegisters(const std::array<u32, 3>& registers) {
+        mesh_registers = registers;
+    }
+
     void SetHeader(std::span<const u8> bytes) {
         std::memcpy(&sph, bytes.data(), sizeof(sph));
         const u64 size = sph.LocalMemorySize() + sph.common3.shader_local_memory_crs_size;
@@ -248,6 +262,10 @@ public:
         }
         return Lookup(pointers, CbufKey(bank, offset), "storage pointer classification") != 0;
     }
+    bool IsCbufIndirectStorageBufferPointer(u32 bank, u32 offset, u32 indirect) override {
+        return Lookup(pointers, IndirectCbufKey(bank, offset, indirect),
+                      "storage pointer table classification") != 0;
+    }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
         if (assume_storage_pointers && !cbuf_values.contains(CbufKey(bank, offset))) {
             return 0;
@@ -255,9 +273,15 @@ public:
         return Lookup(cbuf_values, CbufKey(bank, offset), "constant buffer value");
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
+        if (assume_textures && !texture_types.contains(handle)) {
+            return Shader::TextureType::Color2D;
+        }
         return Lookup(texture_types, handle, "texture type");
     }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        if (assume_textures && !texture_formats.contains(handle)) {
+            return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+        }
         return Lookup(texture_formats, handle, "texture pixel format");
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
@@ -315,6 +339,7 @@ public:
 
     bool captured{};
     bool assume_storage_pointers{};
+    bool assume_textures{};
     std::vector<u64> code;
 
 private:
@@ -535,17 +560,20 @@ int main(int argc, char** argv) {
         bool lower_only{};
         bool capture_extent{};
         bool assume_storage_pointers{};
+        bool assume_textures{};
         std::string dump_ir;
+        std::optional<std::array<u32, 3>> mesh_registers;
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
             if (arg == "--help") {
                 std::cout << "shader-sweep [INPUT] [--stage "
-                             "vertex|tess-control|tess-eval|geometry|fragment|compute]\n"
+                             "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
+                             "  [--mesh-registers SHADER_A,SHADER_B,INIT (hex, task/mesh)]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47|48|49|50]\n"
+                             "--cache-version 46|47|48|49|50|51|52]\n"
                              "  [--pipeline-key FILE] [--capture-extent] "
                              "(--output SPV | --lower-only WORDS) [--dump-ir FILE]\n"
-                             "  [--assume-storage-pointers]\n";
+                             "  [--assume-storage-pointers] [--assume-textures]\n";
                 return 0;
             }
             if (!arg.starts_with("--")) {
@@ -562,6 +590,10 @@ int main(int argc, char** argv) {
                 assume_storage_pointers = true;
                 continue;
             }
+            if (arg == "--assume-textures") {
+                assume_textures = true;
+                continue;
+            }
             if (++i == argc)
                 throw std::runtime_error("Missing value for " + arg);
             const std::string value{argv[i]};
@@ -575,9 +607,23 @@ int main(int argc, char** argv) {
                 pipeline_key = value;
             else if (arg == "--dump-ir")
                 dump_ir = value;
+            else if (arg == "--mesh-registers") {
+                std::array<u32, 3> registers{};
+                size_t begin = 0;
+                for (size_t index = 0; index < registers.size(); ++index) {
+                    const size_t end = value.find(',', begin);
+                    if ((end == std::string::npos) != (index + 1 == registers.size()))
+                        throw std::runtime_error("Expected three comma-separated mesh registers");
+                    registers[index] = static_cast<u32>(
+                        std::stoul(value.substr(begin, end - begin), nullptr, 16));
+                    begin = end + 1;
+                }
+                mesh_registers = registers;
+            }
             else if (arg == "--cache-version") {
-                if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50")
-                    throw std::runtime_error("Expected cache version 46, 47, 48, 49 or 50");
+                if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
+                    value != "51" && value != "52")
+                    throw std::runtime_error("Expected cache version 46 to 52");
                 version = static_cast<u32>(std::stoul(value));
             } else if (arg == "--output" || arg == "--lower-only") {
                 if (!output.empty())
@@ -607,6 +653,11 @@ int main(int argc, char** argv) {
         }
         OfflineEnvironment env;
         env.assume_storage_pointers = assume_storage_pointers;
+        env.assume_textures = assume_textures;
+        if (assume_textures) {
+            diagnostic["assumptions"].push_back(
+                "Uncaptured textures are 2D A8B8G8R8_UNORM");
+        }
         if (assume_storage_pointers) {
             diagnostic["assumptions"].push_back(
                 "Uncaptured constant-buffer words are storage pointers and read as zero");
@@ -633,7 +684,16 @@ int main(int argc, char** argv) {
                 const u32 type = header.common0.shader_type;
                 if (type < 1 || type > 5)
                     throw std::runtime_error("Invalid native graphics header stage");
-                const Stage header_stage = static_cast<Stage>(type - 1);
+                Stage header_stage = static_cast<Stage>(type - 1);
+                // A task program is bound in the vertex slot, a mesh program in a tessellation
+                // slot (translate_program.cpp)
+                if (requested_stage == Stage::Task && header_stage == Stage::VertexB) {
+                    header_stage = Stage::Task;
+                } else if (requested_stage == Stage::Mesh &&
+                           (header_stage == Stage::TessellationControl ||
+                            header_stage == Stage::TessellationEval)) {
+                    header_stage = Stage::Mesh;
+                }
                 if ((requested_stage && *requested_stage != header_stage) ||
                     (env.captured && env.ShaderStage() != header_stage)) {
                     throw std::runtime_error("Stage disagrees with native header");
@@ -727,10 +787,22 @@ int main(int argc, char** argv) {
             }
         }
         diagnostic["stage"] = StageNames[static_cast<u32>(env.ShaderStage())];
-        if (env.ShaderStage() == Stage::Task || env.ShaderStage() == Stage::Mesh ||
-            env.ShaderStage() == Stage::VertexA) {
-            throw MissingContext(
-                "Task, mesh and vertex-A require additional pipeline stage context");
+        if (env.ShaderStage() == Stage::VertexA) {
+            throw MissingContext("Vertex-A requires additional pipeline stage context");
+        }
+        if (env.ShaderStage() == Stage::Task || env.ShaderStage() == Stage::Mesh) {
+            if (env.captured) {
+                throw MissingContext("Task and mesh cache records lack the mesh registers");
+            }
+            if (!mesh_registers) {
+                // Triangles, 64 vertices, 126 primitives, 32 threads per stage, one payload line
+                mesh_registers = std::array<u32, 3>{4U | (64U << 4) | (126U << 13), 32U << 20,
+                                                    32U | (1U << 12) | (1U << 22)};
+                diagnostic["assumptions"].push_back(
+                    "No mesh registers: triangles, 64 vertices, 126 primitives, 32 threads, one "
+                    "payload line; no per-primitive outputs");
+            }
+            env.SetMeshRegisters(*mesh_registers);
         }
         const auto key = pipeline_key.empty() ? std::vector<u8>{} : ReadFile(pipeline_key);
         auto runtime = Runtime(key, env.ShaderStage(), diagnostic["assumptions"]);

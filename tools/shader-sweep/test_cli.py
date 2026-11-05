@@ -195,6 +195,26 @@ class CliTests(unittest.TestCase):
                                                      and original[(control >> 23) & 7])
                     self.assertEqual(predicates, expected, (hex(control), mask, value))
 
+    def test_oot_indexed_uniform_byte_load(self):
+        # ULDC.U8 URd, c[bank][URi+imm] from Ocarina's culling programs (0x1149dfdf00 +0x7e0,
+        # 0x1149f2bd00 +0x3f0): LDC.U8 with the index's register, then MOV R0, URd feeds the
+        # colour output so the load stays live through SPIR-V.
+        for words, dest, index, bank, offset in (
+                ((0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400), 4, 13, 5, 3),
+                ((0x06087abb, 0x01002080, 0x08000000, 0x000fe400), 8, 6, 4, 0x82)):
+            with self.subTest(load=hex(words[0])):
+                mapped = lambda uniform: uniform + 216 if uniform < 22 else uniform + 218
+                move = struct.pack("<4I", 0x00007c02, dest, 0x08000f00, 0)
+                source = self.write("oot-uldc.bin", struct.pack("<4I", *words) + move + NATIVE_EXIT)
+                self.run_cli(source, "--lower-only", self.output)
+                first = struct.unpack_from("<Q", self.output.read_bytes())[0]
+                self.assertEqual(first, 0xEF90000000070000 | mapped(dest) | (mapped(index) << 8) |
+                                 (offset << 20) | (bank << 36))
+                capture = self.write("shader.env", environment(50, 4))
+                self.run_cli(source, "--environment", capture, "--cache-version", 50,
+                             "--output", self.output)
+                self.validate()
+
     def test_oot_uniform_multiply_and_signed_source(self):
         for instruction in (
             (0x040474a4, 0x00003c00, 0x0f8e0206, 0x000fc600),
@@ -307,7 +327,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sum(op == 218 for op, _ in emitted), 1)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47, 48, 49, 50):
+        for version in (46, 47, 48, 49, 50, 51, 52):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))

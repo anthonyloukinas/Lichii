@@ -327,13 +327,17 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
         CHECK_FALSE(lowered);
         CHECK(lowered.instructions.empty());
     }
+    // The indexed form lowers to LDC.U16 with the index's mapped register (UR0 -> R216); a
+    // direct-form control word on it is still rejected. Ocarina of Time loads U8 and U16 values
+    // through an index register (upstream #144); signed widths stay rejected.
     auto indexed = CapturedUniformLoad;
     SetBits(indexed, 0, 12, 0xabb);
+    CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
     SetBits(indexed, 91, 1, 1);
-    // Ocarina of Time loads U8 and U16 values through an index register.
-    const auto indexed_load = LowerToMaxwell(std::array{indexed, Exit});
-    INFO(indexed_load.error);
-    CHECK(indexed_load);
+    const auto lowered = LowerToMaxwell(std::array{indexed, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    CHECK(lowered.instructions.front() == ((0xef9200600207ffdcULL & ~(u64{0xff} << 8)) | (u64{216} << 8)));
     SetBits(indexed, 73, 3, 1);
     CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
 }

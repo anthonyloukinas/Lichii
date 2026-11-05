@@ -827,6 +827,64 @@ TEST_CASE("Fast Fusion logged ULDC loads one unsigned byte without neighboring b
     }
 }
 
+TEST_CASE("Ocarina indexed ULDC.U8 loads one byte at the uniform index plus offset",
+          "[video_core][ampere][fast_fusion_logged]") {
+    // Captured from the culling programs at 0x1149dfdf00 (+0x7e0), 0x1149f2bd00 (+0x3f0),
+    // 0x1149ecc900 (+0x3f0) and 0x1149ddea00 (+0x470):
+    // ULDC.U8 URd, c[bank][URi+imm] with (d, i, bank, imm) below.
+    struct Case {
+        Instruction instruction;
+        u32 dest, index, bank, offset;
+    };
+    const auto SetBits = [](Instruction& instruction, u32 bit, u32 width, u32 value) {
+        const u32 mask = ((1U << width) - 1) << (bit % 32);
+        instruction.words[bit / 32] =
+            (instruction.words[bit / 32] & ~mask) | ((value << (bit % 32)) & mask);
+    };
+    for (const Case& c : {Case{{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 4, 13, 5, 3},
+                          Case{{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 8, 6, 4, 0x82},
+                          Case{{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 7, 6, 4, 0x82},
+                          Case{{{0x11047abb, 0x01400000, 0x08000000, 0x000fe400}}, 4, 17, 5, 0}}) {
+        const auto map = [](u32 uniform) { return uniform < 22 ? uniform + 216 : uniform + 218; };
+        const auto lowered = LowerToMaxwell(std::array{c.instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        REQUIRE(lowered.instructions.size() == 2);
+        CHECK(lowered.instructions.front() ==
+              (0xef90000000070000ULL | map(c.dest) | (u64{map(c.index)} << 8) |
+               (u64{c.offset} << 20) | (u64{c.bank} << 36)));
+        // Run it from bank 0 (the test machine has one bank) at several bases, unaligned ones
+        // included: exactly one byte lands in the destination.
+        auto bank0 = c.instruction;
+        SetBits(bank0, 54, 5, 0);
+        const auto run = LowerToMaxwell(std::array{bank0, Exit});
+        REQUIRE(run);
+        for (const u32 base : {0U, 1U, 0x102U, 0x1003U, 0x7ff0U}) {
+            LoggedMachine machine;
+            machine.registers[0][map(c.index)] = base;
+            const auto before = machine.registers[0];
+            machine.Run(run.instructions);
+            for (u32 reg = 0; reg < 246; ++reg)
+                CHECK(machine.registers[0][reg] ==
+                      (reg == map(c.dest) ? u32{machine.constants[base + c.offset]} : before[reg]));
+        }
+    }
+    // Signed widths and URZ destinations stay rejected. Upstream #144 accepts any immediate on the
+    // indexed form (the index register can align it), so offsets of 0x8000 and up and an
+    // unaligned halfword offset are not rejected here.
+    auto load = Instruction{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}};
+    for (const auto change : std::array{std::array{73U, 3U, 1U}, std::array{73U, 3U, 3U},
+                                        std::array{16U, 8U, 63U}}) {
+        auto changed = load;
+        SetBits(changed, change[0], change[1], change[2]);
+        CHECK_FALSE(LowerToMaxwell(std::array{changed, Exit}));
+    }
+    auto halfword = load;
+    SetBits(halfword, 73, 3, 2);
+    SetBits(halfword, 38, 16, 2);
+    CHECK(LowerToMaxwell(std::array{halfword, Exit}));
+}
+
 TEST_CASE("Fast Fusion captured register shadows distinguish pairs uniform inputs and constants",
           "[video_core][ampere][fast_fusion_logged]") {
     for (const auto instruction : {CapturedMin, CapturedSpecialZero, CapturedMultiply}) {

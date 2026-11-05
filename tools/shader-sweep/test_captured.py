@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -35,13 +36,29 @@ def main():
             env = root / "shader.env"
             key = root / "pipeline.key"
             output = root / "shader.spv"
-            env.write_bytes(serialize_environment(fixture["environment"]))
-            command = [str(args.compiler.resolve()), "--environment", str(env),
-                       "--cache-version", str(fixture["cache_version"]), "--output", str(output)]
+            if "native_header" in fixture:
+                # A raw dump (native header + code), for programs without a cache record (task
+                # and mesh programs aren't serialized)
+                raw = root / "shader.bin"
+                raw.write_bytes(bytes.fromhex(fixture["native_header"]))
+                command = [str(args.compiler.resolve()), str(raw), "--format", "native-header",
+                           "--stage", fixture["stage"], *fixture.get("flags", []),
+                           "--output", str(output)]
+            else:
+                env.write_bytes(serialize_environment(fixture["environment"]))
+                command = [str(args.compiler.resolve()), "--environment", str(env),
+                           "--cache-version", str(fixture["cache_version"]), "--output",
+                           str(output)]
             if "pipeline_key" in fixture:
                 key.write_bytes(bytes.fromhex(fixture["pipeline_key"]))
                 command += ["--pipeline-key", str(key)]
-            compiled = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            environment = dict(os.environ)
+            if "expect_native_global" in fixture:
+                # Recorded with Anthony's bindings on, their default before the merge of upstream
+                # #150 made them opt-in.
+                environment.update(EDEN_NX2_DYN_CBUF_POINTERS="1", EDEN_NX2_INDIRECT_POINTERS="1")
+            compiled = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                      env=environment)
             if compiled.returncode:
                 raise RuntimeError(f"{path.stem}: compiler exit {compiled.returncode}\n"
                                    f"{compiled.stdout}{compiled.stderr}")
@@ -53,7 +70,8 @@ def main():
                 if native_global.get(field) != expected:
                     raise RuntimeError(f"{path.stem}: native_global {field} is "
                                        f"{native_global.get(field)}, expected {expected}")
-            validated = subprocess.run([args.spirv_val, "--target-env", "vulkan1.2", str(output)],
+            target = "vulkan1.3" if fixture.get("stage") in ("task", "mesh") else "vulkan1.2"
+            validated = subprocess.run([args.spirv_val, "--target-env", target, str(output)],
                                        capture_output=True, text=True, timeout=30)
             if validated.returncode:
                 raise RuntimeError(f"{path.stem}: {validated.stdout}{validated.stderr}")

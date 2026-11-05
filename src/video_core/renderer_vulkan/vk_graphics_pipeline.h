@@ -238,6 +238,9 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
+    /// Binds stage's native_indirect storage buffers at first_index on (task and mesh programs)
+    void BindNativeIndirect(size_t stage, size_t first_index);
+
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
@@ -275,6 +278,13 @@ private:
     u32 zero_texture_handles{};
     bool writes_storage{};
     bool writes_images{};
+    /// Task and mesh programs' read-only storage buffers for pointers loaded from records: how
+    /// many each stage has (after its other storage buffers), and the base addresses the draw
+    /// pushes at NATIVE_INDIRECT_BASES_OFFSET (task's, then mesh's: NativeIndirectBasesFirst).
+    std::array<u32, NUM_STAGES> num_native_indirect{};
+    bool uses_native_indirect{};
+    std::array<u64, Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_SIZE / sizeof(u64)>
+        native_indirect_bases{};
 
     DeltaBlocker delta_blocker{};
     bool delta_views_valid{};

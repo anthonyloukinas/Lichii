@@ -275,10 +275,11 @@ public:
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
-        // A native compute program's read-only storage buffers for pointers loaded from records
-        // take their base addresses from the push constants.
+        // A native compute, task or mesh program's read-only storage buffers for pointers loaded
+        // from records take their base addresses from the push constants.
         uses_native_indirect |=
-            (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+            (stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
+                      VK_SHADER_STAGE_MESH_BIT_EXT)) != 0 &&
             std::ranges::any_of(info.storage_buffers_descriptors,
                                 [](const auto& desc) { return desc.native_indirect; });
 
