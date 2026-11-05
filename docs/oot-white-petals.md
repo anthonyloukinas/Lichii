@@ -95,6 +95,31 @@ The clamp is a guess about how far a dispatch writes. What a real bound could co
 - **A per-game heuristic** (this knob as a setting) is the fallback if the IR route stalls. It
   is wrong for any title whose native compute really writes further than the cap.
 
+## Evidence and related work
+
+The evidence, so this page stands alone. It comes from a frame dump of Ocarina of Time
+(`0400486024DEC000`, the path outside Link's house, frame 1740: 182 dispatches, 2,062 draws):
+
+- All 98 skinning palette outputs are bound with `bound_size = 8388608`. Each writes about
+  17–45 KB.
+- 39 compute inputs that the CPU wrote are already flagged GPU-modified when bound. The only
+  thing covering them is an earlier dispatch's 8 MiB mark. 9 of them carry the flag over from the
+  previous frame.
+- At draw time, 36–95% of the 32-bit words the draws read from the pool are the CPU's
+  `0x6f6f6f6f` fill (7.41e28 as a float).
+
+Related upstream work:
+
+- PR #104 (merged into nx2) is the nearest. It narrows fence downloads to Preflushable pages but
+  leaves the write mark as it is (see above).
+- PR #103 (merged) changes how a collected write is applied, not when. The leaf flicker survived
+  it in the field.
+- PR #102 (open) lowers depth-compare gathers. It is relevant to the indoor shadow shader's
+  translation, not to the write mark.
+
+No upstream change bounds the write mark of a native compute storage binding. That is the part
+this experiment adds.
+
 ## `EDEN_NX2_COMPUTE_WRITE_MARK=<bytes>`
 
 Limits how much of a **native** compute storage binding is marked GPU-written to
