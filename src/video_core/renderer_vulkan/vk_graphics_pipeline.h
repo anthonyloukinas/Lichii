@@ -221,12 +221,13 @@ public:
         return has_computed_handles;
     }
 
-    /// EDEN_NX2_DELTA_HANDLES (default on): delta draws for pipelines with computed handles, and
-    /// handle constant buffer binds and writes checked by reading the handles again.
+    /// EDEN_NX2_DELTA_HANDLES=1: delta draws for pipelines with computed handles, and handle
+    /// constant buffer binds and writes checked by reading the handles again. Off by default: an
+    /// unchanged handle doesn't cover a texture or sampler header rewritten under it.
     [[nodiscard]] static bool DeltaHandles() {
         static const bool enabled = [] {
             const char* value = std::getenv("EDEN_NX2_DELTA_HANDLES");
-            return value == nullptr || value[0] != '0';
+            return value != nullptr && value[0] == '1';
         }();
         return enabled;
     }
