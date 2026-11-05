@@ -9,6 +9,7 @@
 #include "core/core.h"
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -26,6 +27,9 @@ void KeplerMemory::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     execution_mask.reset();
     execution_mask[KEPLERMEMORY_REG_INDEX(exec)] = true;
     execution_mask[KEPLERMEMORY_REG_INDEX(data)] = true;
+    if (VideoCommon::GpuSplit::WriterLaunches()) {
+        memory_write_mask = execution_mask;
+    }
 }
 
 void KeplerMemory::ConsumeSinkImpl(Core::System& system) {

@@ -86,10 +86,45 @@ inline u64 Now() {
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
 }
 
+/// Amounts counted on the GPU thread, logged per second with the zones.
+enum class Counter : u32 {
+    DownloadBytes,  ///< Buffer data copied back from the host GPU at fences
+    DownloadCopies, ///< Buffer ranges copied back
+    DmaReadBytes,   ///< Guest memory the native MME read with DMA
+    DownloadBytesOnDmaPages, ///< Of DownloadBytes: on pages the MME has DMA-read
+    MethodWrites,   ///< 3D register writes (Maxwell3D::CallMethod below the macro range)
+    SameValueWrites, ///< Of MethodWrites: the register already held the value
+    AcquireChecks,  ///< Semaphore acquires evaluated
+    AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    // Macro DMA reads with EDEN_NX2_DMA_READ_RANGES (GpuSplit::WaitForMemoryRange), against the
+    // wait for every memory write before.
+    RangeWaitFree,      ///< Neither waits
+    RangeWaitSkipped,   ///< The old wait would have waited, this one doesn't
+    RangeWaitShortened, ///< Both wait, this one for less
+    RangeWaitSame,      ///< Both wait as long
+    RangeWaitByWriter,  ///< Waits that compute or copy work sets (in MemoryReason order)
+    RangeWaitBySync,    ///< ... the last host-level wait
+    RangeWaitByUnranged, ///< ... an unlogged memory write
+    RangeWaitByRange,   ///< ... an overlapping logged write
+    RangeVerifyReads,   ///< EDEN_NX2_WAIT_VERIFY: reads repeated after the old wait
+    RangeVerifyDiffs,   ///< ... whose words differed
+    // Semaphore acquires with EDEN_NX2_ACQUIRE_RANGES (puller.cpp MetBeforeDrain).
+    AcquireMetNoDrain,     ///< Met without a drain
+    AcquireResumedNoDrain, ///< A suspended channel's acquire met without a drain
+    AcquireMetAfterWait,   ///< Of both: after waiting for the semaphore's possible writers
+    AcquireDrained,        ///< Not met yet: drained as before
+    AcquireVerifyChecks,   ///< EDEN_NX2_WAIT_VERIFY: met acquires checked again after a drain
+    AcquireVerifyDiffs,    ///< ... not met any more
+    // EDEN_NX2_STEP_WRITER_SKIP (DmaPusher::SkipWriterWait).
+    StepWriterSkips,  ///< Entries read without waiting for queued compute and copy work
+    StepWriterMisses, ///< ... that the work wrote after all (back thread)
+    Count,
+};
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, static_cast<size_t>(Counter::Count)> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
@@ -132,17 +167,6 @@ private:
     u64 parent_child_ns{};
 };
 
-/// Amounts counted on the GPU thread, logged per second with the zones.
-enum class Counter : u32 {
-    DownloadBytes,  ///< Buffer data copied back from the host GPU at fences
-    DownloadCopies, ///< Buffer ranges copied back
-    DmaReadBytes,   ///< Guest memory the native MME read with DMA
-    DownloadBytesOnDmaPages, ///< Of DownloadBytes: on pages the MME has DMA-read
-    MethodWrites,   ///< 3D register writes (Maxwell3D::CallMethod below the macro range)
-    SameValueWrites, ///< Of MethodWrites: the register already held the value
-    AcquireChecks,  ///< Semaphore acquires evaluated
-    AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
-};
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
 /// while profiling): which buffer downloads anything on the GPU thread reads back.
@@ -213,6 +237,42 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    const auto per_second = [&](Counter counter) {
+        return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
+    };
+    if (data.counters[static_cast<size_t>(Counter::RangeWaitFree)] +
+            data.counters[static_cast<size_t>(Counter::RangeWaitSkipped)] +
+            data.counters[static_cast<size_t>(Counter::RangeWaitShortened)] +
+            data.counters[static_cast<size_t>(Counter::RangeWaitSame)] !=
+        0) {
+        line += fmt::format(
+            " | macro dma read waits free/skipped/shortened/same {:.0f}/{:.0f}/{:.0f}/{:.0f} "
+            "(set by writer {:.0f}, sync {:.0f}, unranged {:.0f}, range {:.0f}; verify {:.0f} "
+            "reads, {:.0f} differ)",
+            per_second(Counter::RangeWaitFree), per_second(Counter::RangeWaitSkipped),
+            per_second(Counter::RangeWaitShortened), per_second(Counter::RangeWaitSame),
+            per_second(Counter::RangeWaitByWriter), per_second(Counter::RangeWaitBySync),
+            per_second(Counter::RangeWaitByUnranged), per_second(Counter::RangeWaitByRange),
+            per_second(Counter::RangeVerifyReads), per_second(Counter::RangeVerifyDiffs));
+    }
+    if (data.counters[static_cast<size_t>(Counter::AcquireMetNoDrain)] +
+            data.counters[static_cast<size_t>(Counter::AcquireResumedNoDrain)] +
+            data.counters[static_cast<size_t>(Counter::AcquireDrained)] !=
+        0) {
+        line += fmt::format(
+            " | acquires met without a drain {:.0f} (resumes {:.0f}, {:.0f} after a short wait), "
+            "drained {:.0f} (verify {:.0f}, {:.0f} differ)",
+            per_second(Counter::AcquireMetNoDrain), per_second(Counter::AcquireResumedNoDrain),
+            per_second(Counter::AcquireMetAfterWait), per_second(Counter::AcquireDrained),
+            per_second(Counter::AcquireVerifyChecks), per_second(Counter::AcquireVerifyDiffs));
+    }
+    if (data.counters[static_cast<size_t>(Counter::StepWriterSkips)] +
+            data.counters[static_cast<size_t>(Counter::StepWriterMisses)] !=
+        0) {
+        line += fmt::format(" | entries read without the writer wait {:.0f} ({:.0f} too early)",
+                            per_second(Counter::StepWriterSkips),
+                            per_second(Counter::StepWriterMisses));
+    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {

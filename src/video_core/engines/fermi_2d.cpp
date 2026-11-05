@@ -11,6 +11,7 @@
 #include "common/logging.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/sw_blitter/blitter.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_draw_runs.h"
 #include "video_core/rasterizer_interface.h"
@@ -32,6 +33,9 @@ Fermi2D::Fermi2D(MemoryManager& memory_manager_) : memory_manager{memory_manager
 
     execution_mask.reset();
     execution_mask[FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1] = true;
+    if (VideoCommon::GpuSplit::WriterLaunches()) {
+        memory_write_mask = execution_mask;
+    }
 }
 
 Fermi2D::~Fermi2D() = default;

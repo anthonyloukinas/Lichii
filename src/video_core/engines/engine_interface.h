@@ -49,6 +49,9 @@ public:
     /// clears are left out: their writes are visible only after a host-level wait.
     std::bitset<(std::numeric_limits<u16>::max)()> memory_write_mask =
         std::bitset<(std::numeric_limits<u16>::max)()>{}.set();
+    /// Methods that launch GPU work which can write command lists (dispatches, copies): the
+    /// split's WaitForWriters position (GpuSplit::WriterLaunches).
+    std::bitset<(std::numeric_limits<u16>::max)()> writer_mask{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};

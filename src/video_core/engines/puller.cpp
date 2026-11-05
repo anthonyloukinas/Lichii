@@ -59,8 +59,68 @@ void OnBack(const Func& func) {
     }
 }
 
+// A semaphore release, run as OnBack does: logged as a write to the 16 bytes at `address`
+// (EDEN_NX2_DMA_READ_RANGES), so front reads elsewhere don't wait for it.
+template <typename Func>
+void OnBackRelease(const Func& func, GPUVAddr address) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.Defer(func);
+        if (VideoCommon::GpuSplit::RangedReports()) {
+            split.NoteRangedWrite(address, 16);
+        } else {
+            split.NoteMemoryWrite();
+        }
+    } else {
+        func();
+    }
+}
+
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+}
+
+// EDEN_NX2_ACQUIRE_RANGES (default on): before draining for an acquire, wait only for the queued
+// work that can write the semaphore (GpuSplit::WaitForMemoryRange: compute and copy work, unlogged
+// memory writes, the last host-level wait and the logged writes over it) and read it. The rest
+// can't change the word, so a value met now is met after a drain too; one not met yet takes the
+// drain as before. Returns whether the acquire is met.
+bool MetBeforeDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, bool resume) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    static const bool enabled = VideoCommon::Nx2EnvSwitch("EDEN_NX2_ACQUIRE_RANGES", true);
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!enabled || !split.Active()) {
+        return false;
+    }
+    const bool waited =
+        split.WaitForMemoryRange(acquire.address, sizeof(u32), VideoCommon::DrainSite::Acquire);
+    const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
+    if (!acquire.Matches(word)) {
+        Profile::Add(Profile::Counter::AcquireDrained, 1);
+        return false;
+    }
+    if (VideoCommon::GpuSplit::VerifyWaits()) {
+        DrainBack();
+        const u32 drained = ReadSemaphoreWord(dma_pusher, acquire.address);
+        Profile::Add(Profile::Counter::AcquireVerifyChecks, 1);
+        if (!acquire.Matches(drained)) {
+            Profile::Add(Profile::Counter::AcquireVerifyDiffs, 1);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(HW_GPU,
+                            "Split wait verify: semaphore {:#x} (op {}, {:#x}) met at {:#x} "
+                            "before the drain, not at {:#x} after it",
+                            acquire.address, acquire.operation, acquire.value, word, drained);
+            }
+            return false;
+        }
+    }
+    Profile::Add(resume ? Profile::Counter::AcquireResumedNoDrain
+                        : Profile::Counter::AcquireMetNoDrain,
+                 1);
+    if (waited) {
+        Profile::Add(Profile::Counter::AcquireMetAfterWait, 1);
+    }
+    return true;
 }
 
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
@@ -92,6 +152,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
+    if (MetBeforeDrain(dma_pusher, *pending_acquire, true)) {
+        return true;
+    }
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
@@ -236,9 +299,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
-        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
+        OnBackRelease([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-        });
+        }, sequence_address);
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -256,6 +319,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (MetBeforeDrain(dma_pusher, acquire, false)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
@@ -309,10 +375,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
-    OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
+    OnBackRelease([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-    });
+    }, sequence_address);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -338,10 +404,10 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
-        OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
+        OnBackRelease([rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-        });
+        }, address);
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.

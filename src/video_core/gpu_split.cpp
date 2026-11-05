@@ -141,6 +141,7 @@ void GpuSplit::Stop() {
     last_writer_position = 0;
     last_sync_position = 0;
     last_memory_write_position = 0;
+    write_log.Reset();
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -230,9 +231,57 @@ bool GpuSplit::WaitForSync() {
 }
 
 bool GpuSplit::WaitForMemoryWriters(DrainSite site) {
-    const u64 target =
-        std::max({last_writer_position, last_sync_position, last_memory_write_position});
-    return WaitFor(std::min(target, write_position), site);
+    return WaitFor(MemoryWritersTarget(), site);
+}
+
+u64 GpuSplit::MemoryTarget(GPUVAddr address, u64 size, MemoryReason* reason) const {
+    // Everything that may write memory where the front can't tell: compute and copy work
+    // (shader stores, QMD releases), unlogged memory writes and, as for macro reads before, the
+    // work before the last host-level wait. Of the logged writes, only the overlapping ones.
+    u64 floor = last_writer_position;
+    MemoryReason why = MemoryReason::Writer;
+    if (last_sync_position > floor) {
+        floor = last_sync_position;
+        why = MemoryReason::Sync;
+    }
+    if (last_memory_write_position > floor) {
+        floor = last_memory_write_position;
+        why = MemoryReason::Unranged;
+    }
+    bool overlap = false;
+    const u64 target = write_log.Target(address, size, floor, consumed_cache, &overlap);
+    if (reason != nullptr) {
+        *reason = overlap ? MemoryReason::Range : why;
+    }
+    return std::min(target, write_position);
+}
+
+bool GpuSplit::WaitForMemoryRange(GPUVAddr address, u64 size, DrainSite site) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    MemoryReason reason{};
+    const u64 target = MemoryTarget(address, size, &reason);
+    if (Nx2Profile::Enabled() && site == DrainSite::MacroDmaRead) {
+        // Against the old wait: every logged write counted, overlapping or not.
+        const u64 old_target = MemoryWritersTarget();
+        using Counter = Nx2Profile::Counter;
+        const bool old_waits = old_target > consumed_cache;
+        const bool waits = target > consumed_cache;
+        if (!old_waits) {
+            Nx2Profile::Add(Counter::RangeWaitFree, 1);
+        } else if (!waits) {
+            Nx2Profile::Add(Counter::RangeWaitSkipped, 1);
+        } else {
+            Nx2Profile::Add(target < old_target ? Counter::RangeWaitShortened
+                                                : Counter::RangeWaitSame,
+                            1);
+        }
+        if (waits) {
+            Nx2Profile::Add(static_cast<Counter>(static_cast<u32>(Counter::RangeWaitByWriter) +
+                                                 static_cast<u32>(reason)),
+                            1);
+        }
+    }
+    return WaitFor(target, site);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
@@ -248,6 +297,12 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            // As after a drain: the back has (almost) nothing queued, so hand it the next
+            // methods in small batches. EDEN_NX2_WAIT_PUBLISH_RESET=0: keep the batch size.
+            static const bool reset_publish = Nx2EnvSwitch("EDEN_NX2_WAIT_PUBLISH_RESET", true);
+            if (reset_publish && write_position - consumed_cache < PublishEvery) {
+                publish_every = 8;
+            }
             Nx2Profile::AddDrain(site, start);
             return true;
         }
@@ -268,7 +323,8 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           bool memory_noted) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -290,9 +346,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
-    if (engine->memory_write_mask[method]) {
-        last_memory_write_position = write_position;
-    }
+    NoteMethod(engine, method, memory_noted);
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
