@@ -12,7 +12,11 @@ NVIDIA. Upstream's default branch is `nx2`; ours mirrors it and carries nothing 
 | `feat/shader-precompile` | "Build all cached pipelines at boot" setting, "Precompile Shader Cache" game-list action, `--precompile-shaders` for both binaries |
 | `fix/gather-lowering` | lowers the four texture-gather forms Ocarina used that were rejected (three cherry-picked from upstream `fix/oot-fog`, one LEA rule of ours); see `docs/oot-gather-lowering.md` |
 | `fix/pipeline-eviction-setting` | "Evict unused pipelines" setting + `EDEN_NX2_PIPELINE_EVICT=0`; eviction re-translates pipelines and shows as cycling pop-in |
-| `test/oot-local` | integration of the above on top of `nx2`, for play builds |
+| `feat/shader-translation-cache` | per-stage translated-SPIR-V cache ("Cache translated shaders", on by default): boot preload 2.1 s → 0.13 s, evicted-pipeline rebuild 12 ms → 0.4 ms; see `docs/shader-translation-cache.md` |
+| `fix/compute-storage-write-mark` | `EDEN_NX2_COMPUTE_WRITE_MARK=<bytes>` clamps how much of a native compute storage binding is marked GPU-written (upstream marks 8 MiB); `EDEN_NX2_DEFERRED_WRITE_LOG=1` per-frame traffic counters; see `docs/oot-white-petals.md` |
+| `feat/frame-dump-burst` | `EDEN_NX2_FRAME_DUMP_COUNT=N` captures N consecutive frames; file-mode trigger re-arms |
+| `feat/frame-dump-buffer-cap` | `EDEN_NX2_FRAME_DUMP_BUFFER_CAP=<bytes>` caps host-buffer readbacks in a frame dump (the 2 GiB budget otherwise goes to 8 MiB storage bindings) |
+| `test/oot-local` | integration of the above plus upstream `fix/oot-fog`, on top of `nx2`, for play builds |
 
 Rules: one topic per branch, based on `nx2`; never force-push a shared branch; if the
 integration branch has to be rebuilt it gets a new name or a forward merge. Upstream has its
@@ -62,6 +66,24 @@ and CPU ~37 % busy: the limit is the emulated GPU thread, which upstream's `perf
 targets. Asynchronous shaders only defers Vulkan pipeline creation; the Ampere-to-Maxwell
 lowering and SPIR-V translation still run on the GPU thread (~12 ms per pipeline), which is
 what a translation cache (`feat/shader-translation-cache`, in progress) is for.
+
+## Ocarina: what we know so far (2026-11-05)
+
+- **White every-other-frame particle flicker and the PCIe flood are one bug.** A native compute
+  program's storage pointer has no size, so the buffer cache binds `min(mapping, 8 MiB)` and marks all
+  8 MiB GPU-written per dispatch (~130 skinning dispatches/frame). CPU writes into those pages are
+  deferred to the next fence (stale per-object constants → white leaves) and the marks drive fence
+  readbacks that saturated PCIe at 9–27 GB/s GPU→host. `EDEN_NX2_COMPUTE_WRITE_MARK=65536` removed
+  the leaf flicker and cut the link traffic to ~0.2 GB/s. Upstream PR #104 attacks the fence side;
+  nobody upstream has the write-mark finding yet. Proper fix: bound the mark from the shader's store
+  extent (sketch in `docs/oot-white-petals.md`).
+- GPU Mode Accurate + reactive flushing hides the flicker (fence timing) at ~20 fps cost, and shows
+  bogus canopy shadows indoors instead — same stale-buffer class.
+- The four rejected gather shaders are lowered three ways upstream now (`fix/oot-fog`, PR #102, ours);
+  keep ours local.
+- Shaders live on disk in BNSH containers and pools map contiguously into GPU memory
+  (`tools/oot/` once published); lowering is <1 % of translation time, so pre-lowering from disk is
+  not worth it — the translation cache is.
 
 ## Logging a session
 
