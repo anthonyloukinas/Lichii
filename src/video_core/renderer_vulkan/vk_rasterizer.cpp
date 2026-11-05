@@ -1855,7 +1855,24 @@ void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
 }
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
+    // EDEN_NX2_FRAME_DUMP_BUFFER_CAP=<bytes> caps each recorded buffer (host readback and guest
+    // copy), clamped to 16 B..4 MiB; unset keeps 4 MiB. An Ocarina of Time dump spent 893 MiB of
+    // its 2 GiB budget on 4 MiB readbacks of 8 MiB skinning bindings and truncated at pass 70.
+    static const u32 BUFFER_CAP = [] {
+        constexpr u32 default_cap = 4U << 20;
+        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_BUFFER_CAP");
+        if (value == nullptr || value[0] == '\0') {
+            return default_cap;
+        }
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 0);
+        if (end == value) {
+            return default_cap;
+        }
+        const u32 cap = static_cast<u32>(std::clamp<unsigned long long>(parsed, 16, default_cap));
+        LOG_INFO(Render_Vulkan, "Frame dump: buffer cap {} bytes", cap);
+        return cap;
+    }();
     std::vector<FrameDump::BoundBuffer> buffers;
     buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
                                                  const auto& binding, u32 bound_size,

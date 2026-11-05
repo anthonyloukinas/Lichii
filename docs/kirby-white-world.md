@@ -222,6 +222,7 @@ back one whole frame inside the emulator. No capture tool is needed.
 | `EDEN_NX2_FRAME_DUMP` | Directory for the dump. It is created if missing. When unset, the dump code stays inactive. |
 | `EDEN_NX2_FRAME_DUMP_AT` | Which frame to capture: seconds after boot (`45`), a frame number with an `f` suffix (`2700f`), or `file` to capture once `capture.now` exists in the dump directory (checked every 30 frames). Default `60`. |
 | `EDEN_NX2_FRAME_DUMP_COUNT` | Number of consecutive frames to capture from the trigger, 1 to 8. Default `1`, which keeps the flat layout. With `N > 1` each frame gets its own `<dir>/frame-<k>/` (k = 1..N) with its own `manifest.jsonl`, and the log shows `Frame dump: burst k/N`. With `AT=file`, `capture.now` is deleted when a burst starts and the dump re-arms, so a later `touch` captures another burst into `<dir>/burst-<b>/`. Use it for artifacts that alternate between frames. |
+| `EDEN_NX2_FRAME_DUMP_BUFFER_CAP` | Most bytes recorded per bound buffer (host readback or guest copy), decimal or `0x` hex, clamped to 16 B..4 MiB. Default 4 MiB. Each recorded buffer counts against the 2 GiB dump cap, so lower it (for example `65536`) when large storage bindings would truncate the dump. |
 
 Example for the character select screen:
 
