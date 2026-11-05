@@ -14,6 +14,17 @@ mechanism (supported by a frame dump, not proven):
    (`GPU::InvalidateGPUCache`). Draws recorded before that read the old host copy.
 4. Which frames' data lands in marked pages depends on pool parity, hence every other frame.
 
+Field results (2026-11-05):
+
+- With PR #103 (inline page writes on by default) at Fast with reactive flushing off, the
+  flicker is still there. That fits: #103 changes how a collected write is applied, not when.
+- A second symptom, probably the same class of stale buffer: at Accurate with reactive flushing
+  on, the leaves are fine but bogus dappled "canopy" shadows cover the floor and root wall inside
+  Link's tree house. Switching to Fast live removes the shadows and brings the flicker back. The
+  shadow filter is pixel shader `d5e90d353c783c23` (a depth-compare gather reading a 4096²
+  shadow map). Accurate also disables the GPU split, delays fences, makes DMA reads safe and
+  refreshes macro parameters, so different pages go stale under each mode.
+
 Both knobs below are experiments, read once at startup from the environment. Neither has a
 settings entry.
 
@@ -40,7 +51,11 @@ totals since the previous line:
 
 - `collected_writes` / `collected_bytes`: guest CPU writes that were only collected (deferred).
 - `pool_writes` / `pool_bytes`: the part of those inside device `0x2b300000–0x2b900000`, the
-  skinning pool seen in the dump (a fixed range, only meaningful for that scene).
+  skinning pool seen in the dump (only meaningful for that scene).
+  `EDEN_NX2_DEFERRED_WRITE_RANGE=<begin>-<end>` (device addresses, hex or decimal) buckets another
+  range instead, for example the light-matrix uniform buffer the shadow draw reads, taken from a
+  frame dump's `device_addr`. The shadow map itself is an image and is not counted here unless
+  it is written by the CPU.
 - `invalidations`: `InvalidateGPUCache` calls (the points where collected writes are applied).
 - `applied_ranges` / `applied_bytes` / `applied_pool_bytes`: collected writes applied by those calls.
 - `write_mark`: the active `EDEN_NX2_COMPUTE_WRITE_MARK` (`full` when unset).
