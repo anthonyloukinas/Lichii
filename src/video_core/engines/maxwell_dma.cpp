@@ -13,6 +13,7 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
@@ -28,6 +29,11 @@ MaxwellDMA::MaxwellDMA(MemoryManager& memory_manager_)
 {
     execution_mask.reset();
     execution_mask[offsetof(Regs, launch_dma) / sizeof(u32)] = true;
+    if (VideoCommon::GpuSplit::WriterLaunches()) {
+        // The other methods only store their value; launch_dma copies and releases.
+        memory_write_mask = execution_mask;
+        writer_mask = execution_mask;
+    }
 }
 
 MaxwellDMA::~MaxwellDMA() = default;

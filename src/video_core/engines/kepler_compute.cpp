@@ -68,6 +68,23 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
             native_plain_methods[method] = false;
         }
     }
+    if (VideoCommon::GpuSplit::WriterLaunches()) {
+        // A method that only stores its value (in either mode) neither writes memory nor
+        // launches work: dispatches, uploads, semaphores and macros are the rest.
+        memory_write_mask.reset();
+        for (u32 method = 0; method < native_plain_methods.size(); ++method) {
+            memory_write_mask[method] = !native_plain_methods[method];
+        }
+        for (const size_t method : {KEPLER_COMPUTE_REG_INDEX(exec_upload),
+                                 KEPLER_COMPUTE_REG_INDEX(data_upload),
+                                 KEPLER_COMPUTE_REG_INDEX(launch)}) {
+            memory_write_mask[method] = true;
+        }
+        for (size_t method = 0xe00; method < memory_write_mask.size(); ++method) {
+            memory_write_mask[method] = true;
+        }
+        writer_mask = memory_write_mask;
+    }
 }
 
 KeplerCompute::~KeplerCompute() = default;

@@ -77,6 +77,15 @@ public:
         return front_macros;
     }
 
+    /// EDEN_NX2_WRITER_LAUNCHES (default on): the writer position follows the methods in each
+    /// engine's writer_mask, and engines other than the 3D one count only the methods that do
+    /// more than store a value as memory writes. =0: every compute and DMA method is a writer
+    /// (DmaPusher) and every method of those engines a memory write, as before.
+    [[nodiscard]] static bool WriterLaunches() {
+        static const bool enabled = Nx2EnvSwitch("EDEN_NX2_WRITER_LAUNCHES", true);
+        return enabled;
+    }
+
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
@@ -116,9 +125,7 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
-        if (engine->memory_write_mask[method]) {
-            last_memory_write_position = write_position;
-        }
+        NoteMethod(engine, method);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
@@ -129,9 +136,7 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
-        if (engine->memory_write_mask[method]) {
-            last_memory_write_position = write_position;
-        }
+        NoteMethod(engine, method);
     }
 
     /// Defer flag: the call doesn't end EDEN_NX2_FAST_DRAW reuse (nx2_fast_draw.h).
@@ -243,6 +248,15 @@ private:
         }
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
+    /// After a method was sent: the positions its memory writes and launches are waited for at.
+    void NoteMethod(Tegra::Engines::EngineInterface* engine, u32 method) {
+        if (engine->memory_write_mask[method]) {
+            last_memory_write_position = write_position;
+        }
+        if (engine->writer_mask[method]) {
+            last_writer_position = write_position;
+        }
+    }
     bool WaitFor(u64 target, DrainSite site);
 
     void BackLoop(std::stop_token stop_token);

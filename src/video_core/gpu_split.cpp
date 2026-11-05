@@ -296,9 +296,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
-    if (engine->memory_write_mask[method]) {
-        last_memory_write_position = write_position;
-    }
+    NoteMethod(engine, method);
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {

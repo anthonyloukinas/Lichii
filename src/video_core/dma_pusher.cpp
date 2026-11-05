@@ -472,9 +472,11 @@ void DmaPusher::CallMethod(u32 argument) {
             return;
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+        // With EDEN_NX2_WRITER_LAUNCHES the split notes them itself (writer_mask).
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = !VideoCommon::GpuSplit::WriterLaunches() &&
+                            (engine_type == Engines::EngineTypes::KeplerCompute ||
+                             engine_type == Engines::EngineTypes::MaxwellDMA);
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -532,9 +534,11 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             return;
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+        // With EDEN_NX2_WRITER_LAUNCHES the split notes them itself (writer_mask).
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = !VideoCommon::GpuSplit::WriterLaunches() &&
+                            (engine_type == Engines::EngineTypes::KeplerCompute ||
+                             engine_type == Engines::EngineTypes::MaxwellDMA);
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
