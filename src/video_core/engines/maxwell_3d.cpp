@@ -1493,9 +1493,21 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         const auto flush_cb = [&] {
             if (!fs.cb_words.empty()) {
-                split.MultiMethod(this, cb_data, fs.cb_words.data(),
-                                  static_cast<u32>(fs.cb_words.size()),
-                                  static_cast<u32>(fs.cb_words.size()), nullptr);
+                // Where the words went, as FrontWrite logs a constant buffer upload
+                // (EDEN_NX2_DMA_READ_RANGES): the offset has moved past them.
+                const u32 count = static_cast<u32>(fs.cb_words.size());
+                const bool ranged = VideoCommon::GpuSplit::RangedWrites();
+                split.MultiMethod(this, cb_data, fs.cb_words.data(), count, count, nullptr,
+                                  ranged);
+                if (ranged) {
+                    const GPUVAddr buffer =
+                        (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]}
+                         << 32) |
+                        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+                    split.NoteRangedWrite(buffer + fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] -
+                                              u64{count} * sizeof(u32),
+                                          u64{count} * sizeof(u32));
+                }
                 fs.cb_words.clear();
             }
         };
@@ -1512,6 +1524,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             if (address >= cb_data && address < cb_data + 16 &&
                 fs.control != Regs::ShadowRamControl::Replay) {
+                // The registers FrontWrite would keep (macro reads, FrontVerify, a later Replay).
+                fs.regs[address] = value;
+                if (fs.control == Regs::ShadowRamControl::Track ||
+                    fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+                    fs.shadow[address] = value;
+                }
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
                 fs.cb_words.push_back(value);
                 return true;

@@ -115,6 +115,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
+    back_exited.store(false, std::memory_order_seq_cst);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -291,16 +292,21 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         Pause();
     }
     front_waiting.store(true, std::memory_order_seq_cst);
-    while (back_running.load(std::memory_order_acquire)) {
+    while (!back_exited.load(std::memory_order_acquire)) {
         const u32 seen = front_wake.load(std::memory_order_seq_cst);
         consumed_cache = consumed.load(std::memory_order_seq_cst);
-        if (consumed_cache >= target || !back_running.load(std::memory_order_seq_cst)) {
+        if (consumed_cache >= target || back_exited.load(std::memory_order_seq_cst)) {
             break;
         }
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
     wait_target.store(~u64{0}, std::memory_order_relaxed);
+    // As after the spin above (EDEN_NX2_WAIT_PUBLISH_RESET).
+    static const bool reset_publish = Nx2EnvSwitch("EDEN_NX2_WAIT_PUBLISH_RESET", true);
+    if (reset_publish && write_position - consumed_cache < PublishEvery) {
+        publish_every = 8;
+    }
     Nx2Profile::AddDrain(site, start);
     return true;
 }
@@ -483,6 +489,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
     }
     back_running.store(false, std::memory_order_seq_cst);
+    back_exited.store(true, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();
 }

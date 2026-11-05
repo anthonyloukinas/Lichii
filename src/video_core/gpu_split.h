@@ -343,6 +343,12 @@ private:
         if (engine->writer_mask[method]) {
             last_writer_position = write_position;
         }
+        // PR #161's acquire resume skips its semaphore check until a release was sent since the
+        // last one (LastReleasePosition): launches and memory writes may release too. Its
+        // DmaPusher notes (NoteAnyRelease) are off with EDEN_NX2_WRITER_LAUNCHES.
+        if (engine->writer_mask[method] || engine->memory_write_mask[method]) {
+            last_release_position = write_position;
+        }
     }
     bool WaitFor(u64 target, DrainSite site);
     /// Why a memory read waits up to its target (EDEN_NX2_GPU_PROFILE counts each).
@@ -396,6 +402,9 @@ private:
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
+    /// False from MaybeStart until BackLoop returns: WaitFor sleeps until then. back_running is
+    /// set only once the back thread runs, so a wait right after the start ended at once.
+    std::atomic<bool> back_exited{true};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.

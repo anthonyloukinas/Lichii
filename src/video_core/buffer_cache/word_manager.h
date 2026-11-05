@@ -260,9 +260,12 @@ struct WordManager {
         if ((Span(Type::Hot)[index] & bit) == 0) {
             return false;
         }
+        const u64 before_cpu = CpuWord(index);
+        const u64 before_untracked = UntrackedWord(index);
         Span(Type::CPU)[index] |= bit;
         Span(Type::Untracked)[index] |= bit;
         Span(Type::CachedCPU)[index] &= ~bit;
+        NoteUploadWord(before_cpu, before_untracked, CpuWord(index), UntrackedWord(index));
         return true;
     }
 
@@ -274,12 +277,15 @@ struct WordManager {
         if ((Span(Type::Hot)[index] & bit) == 0) {
             return false;
         }
+        const u64 before_cpu = CpuWord(index);
+        const u64 before_untracked = UntrackedWord(index);
         Span(Type::Hot)[index] &= ~bit;
         Span(Type::Refault0)[index] &= ~bit;
         Span(Type::Refault1)[index] &= ~bit;
         Span(Type::CPU)[index] |= bit;
         Span(Type::Untracked)[index] |= bit;
         Span(Type::CachedCPU)[index] &= ~bit;
+        NoteUploadWord(before_cpu, before_untracked, CpuWord(index), UntrackedWord(index));
         return true;
     }
 
@@ -406,11 +412,14 @@ struct WordManager {
         hot &= ~cool;
         Span(Type::Refault0)[index] &= ~cool;
         Span(Type::Refault1)[index] &= ~cool;
+        const u64 before_cpu = CpuWord(index);
         u64& untracked = Span(Type::Untracked)[index];
+        const u64 before_untracked = untracked;
         CollectChangedRanges(true, index, untracked, cool, protect);
         untracked &= ~cool;
         Span(Type::CPU)[index] |= cool;
         Span(Type::CachedCPU)[index] &= ~cool;
+        NoteUploadWord(before_cpu, before_untracked, CpuWord(index), UntrackedWord(index));
         Nx2HotPages::Count(Nx2HotPages::g_counters.cooled, static_cast<u64>(std::popcount(cool)));
     }
 
