@@ -29,9 +29,27 @@ inline const bool g_nx2_deferred_write_log = [] {
     const char* value = std::getenv("EDEN_NX2_DEFERRED_WRITE_LOG");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }();
-// The device range of Ocarina of Time's skinning pool in the white-petals frame dump.
-inline constexpr u64 Nx2DeferredPoolBegin = 0x2b300000;
-inline constexpr u64 Nx2DeferredPoolEnd = 0x2b900000;
+// The device range the log buckets separately. Default: Ocarina of Time's skinning pool in the
+// white-petals frame dump. EDEN_NX2_DEFERRED_WRITE_RANGE=<begin>-<end> (hex or decimal) picks
+// another, for example a draw's light-matrix uniform buffer taken from a frame dump.
+inline const std::pair<u64, u64> g_nx2_deferred_pool = [] {
+    std::pair<u64, u64> range{0x2b300000, 0x2b900000};
+    const char* value = std::getenv("EDEN_NX2_DEFERRED_WRITE_RANGE");
+    if (value == nullptr) {
+        return range;
+    }
+    char* end = nullptr;
+    const u64 begin = std::strtoull(value, &end, 0);
+    if (end == value || *end != '-') {
+        return range;
+    }
+    const char* second = end + 1;
+    const u64 last = std::strtoull(second, &end, 0);
+    if (end == second || last <= begin) {
+        return range;
+    }
+    return std::pair<u64, u64>{begin, last};
+}();
 struct Nx2DeferredWriteCounters {
     std::atomic<u64> collected_writes{0};
     std::atomic<u64> collected_bytes{0};
@@ -45,8 +63,8 @@ struct Nx2DeferredWriteCounters {
 inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
 
 inline u64 Nx2PoolOverlap(u64 address, u64 size) {
-    const u64 begin = std::max<u64>(address, Nx2DeferredPoolBegin);
-    const u64 end = std::min<u64>(address + size, Nx2DeferredPoolEnd);
+    const u64 begin = std::max<u64>(address, g_nx2_deferred_pool.first);
+    const u64 end = std::min<u64>(address + size, g_nx2_deferred_pool.second);
     return end > begin ? end - begin : 0;
 }
 

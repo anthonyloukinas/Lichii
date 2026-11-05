@@ -1826,7 +1826,7 @@ void RasterizerVulkan::TickFrame() {
                  "pool_writes={} pool_bytes={} (pool 0x{:x}-0x{:x}) invalidations={} "
                  "applied_ranges={} applied_bytes={} applied_pool_bytes={} write_mark={}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
-                 Tegra::Nx2DeferredPoolBegin, Tegra::Nx2DeferredPoolEnd, invalidations,
+                 Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
                  applied_ranges, applied_bytes, applied_pool_bytes,
                  Tegra::g_nx2_compute_write_mark == ~u64{0}
                      ? std::string{"full"}
