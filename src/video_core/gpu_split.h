@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/split_write_log.h"
 
 namespace VideoCommon {
 
@@ -85,6 +87,22 @@ public:
         static const bool enabled = Nx2EnvSwitch("EDEN_NX2_WRITER_LAUNCHES", true);
         return enabled;
     }
+    /// EDEN_NX2_DMA_READ_RANGES (default on): the front logs where its 3D constant buffer and
+    /// inline uploads, reports and the puller's semaphore releases write (NoteRangedWrite), and
+    /// its memory reads wait only for the logged writes they overlap (WaitForMemoryRange). =cb
+    /// logs only the uploads (reports and releases count as unknown writes); =0 logs nothing.
+    [[nodiscard]] static bool RangedWrites() {
+        return RangedMode() != '0';
+    }
+    [[nodiscard]] static bool RangedReports() {
+        return RangedMode() == '1';
+    }
+    /// EDEN_NX2_WAIT_VERIFY=1 (diagnostic): a front read or acquire that skipped waiting is
+    /// repeated after the old wait, and differences are counted (EDEN_NX2_GPU_PROFILE) and logged.
+    [[nodiscard]] static bool VerifyWaits() {
+        static const bool enabled = Nx2EnvSwitch("EDEN_NX2_WAIT_VERIFY", false);
+        return enabled;
+    }
 
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() {
@@ -113,8 +131,9 @@ public:
 
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
+    /// `memory_noted`: the caller logs the memory the method writes (NoteRangedWrite) itself.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment) {
+                const GPUVAddr* segment, bool memory_noted = false) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -125,18 +144,20 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
-        NoteMethod(engine, method);
+        NoteMethod(engine, method, memory_noted);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                     bool memory_noted = false);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    bool memory_noted = false) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
-        NoteMethod(engine, method);
+        NoteMethod(engine, method, memory_noted);
     }
 
     /// Defer flag: the call doesn't end EDEN_NX2_FAST_DRAW reuse (nx2_fast_draw.h).
@@ -198,10 +219,28 @@ public:
     void NoteMemoryWrite() {
         last_memory_write_position = write_position;
     }
+    /// The memory write just sent changes [address, address + size) (RangedWrites).
+    void NoteRangedWrite(GPUVAddr address, u64 size) {
+        write_log.Note(address, size, write_position);
+    }
     /// For the front's macro memory reads (MME DMA): waits until the back executed the methods
-    /// that write memory in command order (memory_write_mask, NoteMemoryWrite), the compute and
-    /// copy work and the work before the last host-level wait, all sent so far.
+    /// that write memory in command order (memory_write_mask, NoteMemoryWrite, the logged ranged
+    /// writes), the compute and copy work and the work before the last host-level wait, all sent
+    /// so far.
     bool WaitForMemoryWriters(DrainSite site);
+    /// As WaitForMemoryWriters, but of the logged ranged writes only those overlapping
+    /// [address, address + size): what executing the rest cannot change.
+    bool WaitForMemoryRange(GPUVAddr address, u64 size, DrainSite site);
+    /// Whether WaitForMemoryWriters would wait now (front thread).
+    [[nodiscard]] bool MemoryWritersPending() {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache < MemoryWritersTarget();
+    }
+    /// Whether the queued work could still change [address, address + size) (front thread).
+    [[nodiscard]] bool MemoryRangePending(GPUVAddr address, u64 size) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache < MemoryTarget(address, size, nullptr);
+    }
 
 private:
     enum class Kind : u64 {
@@ -249,8 +288,8 @@ private:
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     /// After a method was sent: the positions its memory writes and launches are waited for at.
-    void NoteMethod(Tegra::Engines::EngineInterface* engine, u32 method) {
-        if (engine->memory_write_mask[method]) {
+    void NoteMethod(Tegra::Engines::EngineInterface* engine, u32 method, bool memory_noted) {
+        if (engine->memory_write_mask[method] && !memory_noted) {
             last_memory_write_position = write_position;
         }
         if (engine->writer_mask[method]) {
@@ -258,6 +297,25 @@ private:
         }
     }
     bool WaitFor(u64 target, DrainSite site);
+    /// Why a memory read waits up to its target (EDEN_NX2_GPU_PROFILE counts each).
+    enum class MemoryReason : u8 { Writer, Sync, Unranged, Range };
+    [[nodiscard]] u64 MemoryWritersTarget() const {
+        return std::min(std::max({last_writer_position, last_sync_position,
+                                  last_memory_write_position, write_log.NewestPosition()}),
+                        write_position);
+    }
+    /// The position WaitForMemoryRange waits for (uses consumed_cache).
+    u64 MemoryTarget(GPUVAddr address, u64 size, MemoryReason* reason) const;
+    static char RangedMode() {
+        static const char mode = [] {
+            const char* value = std::getenv("EDEN_NX2_DMA_READ_RANGES");
+            if (value == nullptr || value[0] == '\0') {
+                return '1';
+            }
+            return value[0] == '0' ? '0' : value[0] == 'c' ? 'c' : '1';
+        }();
+        return mode;
+    }
 
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
@@ -272,6 +330,7 @@ private:
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 last_memory_write_position{};
+    SplitWriteLog write_log;
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

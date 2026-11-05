@@ -58,6 +58,7 @@ add_executable(tests
     video_core/async_draw_policy.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/split_write_log.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     hid_core/sensor_info.cpp

@@ -3214,6 +3214,17 @@ public:
                               const u32* base_start, u32 amount, u32 methods_pending,
                               VideoCommon::Nx2MeshCountTrace::PushSource source);
 
+    struct MemoryRange {
+        GPUVAddr address;
+        u64 size;
+    };
+    /// The memory `words` writes of `method` change once the back runs them, from the registers
+    /// as they are before the writes (`regs`: the front's copy): constant buffer data, pitch
+    /// inline uploads and their release, and with `reports` report semaphores. Returns how many
+    /// ranges it filled, 0 for methods it can't tell (GpuSplit::RangedWrites).
+    static u32 FrontMemoryRanges(std::span<const u32> regs, u32 method, u32 words,
+                                 std::array<MemoryRange, 2>& out, bool reports);
+
     bool ShouldExecute() const {
         return execute_on;
     }
