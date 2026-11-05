@@ -1381,7 +1381,8 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
             if (is_written && write_mark_limit != 0) {
-                // write_mark_limit: EDEN_NX2_COMPUTE_WRITE_MARK, spread over the segments in order.
+                // write_mark_limit: the native write mark (BindComputeStorageBuffer), spread over
+                // the segments in order.
                 const u32 mark = static_cast<u32>(std::min<u64>(segment.size, write_mark_limit));
                 MarkWrittenBuffer(segment.buffer_id, segment.device_addr, mark);
                 if (write_mark_limit != ~u64{0}) {
