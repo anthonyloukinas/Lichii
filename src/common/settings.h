@@ -605,6 +605,11 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
+    // Builds every cached graphics pipeline at boot instead of only those recent sessions used
+    // (vk_pipeline_cache.cpp). EDEN_NX2_PRELOAD_ALL_PIPELINES=1 still forces it on.
+    SwitchableSetting<bool> preload_all_pipelines{linkage, false, "preload_all_pipelines",
+                                                  Category::RendererAdvanced};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
@@ -880,6 +885,10 @@ struct Values {
     Setting<bool> ext_content_from_game_dirs{linkage, true, "ext_content_from_game_dirs",
                                              Category::DataStorage};
     std::vector<std::string> external_content_dirs;
+
+    // Set by the frontends' "precompile shader cache" run: forces preload_all_pipelines for that
+    // boot only. Never saved.
+    bool force_preload_all_pipelines{false};
 
     // Debugging
     bool record_frame_times;

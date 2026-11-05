@@ -555,10 +555,28 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
+    if (lp.precompile_shaders) {
+        Settings::values.force_preload_all_pipelines = true;
+    }
+    size_t pipeline_total = 0;
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             state->system.GetApplicationProcessProgramID(), std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+            [&pipeline_total](VideoCore::LoadCallbackStage, size_t, size_t total) {
+                pipeline_total = total;
+            });
+    }
+    if (lp.precompile_shaders) {
+        // LoadDiskResources saved the Vulkan pipeline cache; SDL_AppQuit shuts the renderer down,
+        // which saves it again. The cores are started once first: shutting down a process whose
+        // cores never ran hangs in ServerManager's destructor.
+        Settings::values.force_preload_all_pipelines = false;
+        if (!Settings::values.use_disk_shader_cache.GetValue()) {
+            LOG_WARNING(Frontend, "Precompile: the disk pipeline cache is off, nothing to build");
+        }
+        LOG_INFO(Frontend, "Precompile finished: {} pipelines built; exiting", pipeline_total);
+        void(state->system.Run());
+        return SDL_APP_SUCCESS;
     }
 
     // don't do anything, SDL3 already exists for us :D

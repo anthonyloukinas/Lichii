@@ -543,7 +543,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
             ui->action_Fullscreen->setChecked(lp.fullscreen);
         }
 
-        if (!lp.filepath.empty()) {
+        if (!lp.filepath.empty() && lp.precompile_shaders) {
+            PrecompileShaderCache(QString::fromStdString(lp.filepath), true);
+        } else if (!lp.filepath.empty()) {
             BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
         } else if (lp.launch_setup) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
@@ -1459,6 +1461,8 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::OpenFolderRequested, this, &MainWindow::OnGameListOpenFolder);
     connect(game_list, &GameList::OpenTransferableShaderCacheRequested, this,
             [this](u64 program_id) { QtCommon::Path::OpenShaderCache(program_id, this); });
+    connect(game_list, &GameList::PrecompileShaderCacheRequested, this,
+            [this](const QString& game_path) { PrecompileShaderCache(game_path); });
     connect(game_list, &GameList::RemoveInstalledEntryRequested, this,
             &MainWindow::OnGameListRemoveInstalledEntry);
     connect(game_list, &GameList::RemoveFileRequested, this, &MainWindow::OnGameListRemoveFile);
@@ -2051,6 +2055,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
 
     // Create and start the emulation thread
     QtCommon::emu_thread = std::make_unique<EmuThread>();
+    QtCommon::emu_thread->SetPrecompileOnly(precompile_shaders_run);
     emit EmulationStarting();
     QtCommon::emu_thread->start();
 
@@ -2091,6 +2096,31 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtCommon::emu_thread.get(), &EmuThread::ShaderCacheReloadFinished, this,
         [this] {
             loading_screen->OnLoadComplete();
+        },
+        Qt::QueuedConnection);
+
+    connect(
+        QtCommon::emu_thread.get(), &EmuThread::PrecompileFinished, this,
+        [this](std::size_t total) {
+            const bool exit_when_done = exit_after_precompile;
+            // Stops the renderer, which saves the Vulkan pipeline cache once more.
+            ShutdownGame();
+            if (exit_when_done) {
+                QTimer::singleShot(0, this, &QWidget::close);
+                return;
+            }
+            if (total == 0) {
+                QMessageBox::information(
+                    this, tr("Precompile Shader Cache"),
+                    tr("This game has no cached pipelines to build yet. Play it once with "
+                       "\"Use persistent pipeline cache\" on, then precompile again."));
+            } else {
+                QMessageBox::information(
+                    this, tr("Precompile Shader Cache"),
+                    tr("Built %n cached pipeline(s). They load from the pipeline cache at the "
+                       "next boot.",
+                       nullptr, static_cast<int>(total)));
+            }
         },
         Qt::QueuedConnection);
 
@@ -2161,6 +2191,28 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
 
 void MainWindow::BootGameFromList(const QString& filename, StartGameType with_config) {
     BootGame(filename, ApplicationAppletParameters(), with_config);
+}
+
+void MainWindow::PrecompileShaderCache(const QString& filename, bool exit_when_done) {
+    if (emulation_running || boot_in_progress) {
+        QMessageBox::information(this, tr("Precompile Shader Cache"),
+                                 tr("Stop the running game before precompiling shaders."));
+        return;
+    }
+    LOG_INFO(Frontend, "Precompiling the shader cache of {}", filename.toStdString());
+    precompile_shaders_run = true;
+    exit_after_precompile = exit_when_done;
+    Settings::values.force_preload_all_pipelines = true;
+    BootGame(filename, ApplicationAppletParameters(), StartGameType::Normal);
+    if (!emulation_running) {
+        // The boot failed or was cancelled: nothing will stop it, so clear the run here.
+        precompile_shaders_run = false;
+        exit_after_precompile = false;
+        Settings::values.force_preload_all_pipelines = false;
+        if (exit_when_done) {
+            QTimer::singleShot(0, this, &QWidget::close);
+        }
+    }
 }
 
 bool MainWindow::OnShutdownBegin() {
@@ -2275,6 +2327,9 @@ void MainWindow::OnEmulationStopped() {
     }
 
     emulation_running = false;
+    precompile_shaders_run = false;
+    exit_after_precompile = false;
+    Settings::values.force_preload_all_pipelines = false;
 
     discord_rpc->Update();
     Common::FeralGamemode::Stop();
@@ -3152,8 +3207,10 @@ void MainWindow::OnStartGame() {
     UpdateMenuState();
     OnTasStateChanged();
 
-    play_time_manager->SetProgramId(QtCommon::system->GetApplicationProcessProgramID());
-    play_time_manager->Start();
+    if (!precompile_shaders_run) {
+        play_time_manager->SetProgramId(QtCommon::system->GetApplicationProcessProgramID());
+        play_time_manager->Start();
+    }
 
     discord_rpc->Update();
     Common::FeralGamemode::Start();

@@ -278,6 +278,8 @@ private:
     void BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                   StartGameType with_config = StartGameType::Normal);
     void BootGameFromList(const QString& filename, StartGameType with_config);
+    /// Boots the game with every cached pipeline built at load, then stops before it runs.
+    void PrecompileShaderCache(const QString& filename, bool exit_when_done = false);
     void ShutdownGame();
     void TerminateEmulationThread();
 
@@ -553,6 +555,8 @@ private:
     // Whether emulation is currently running in yuzu.
     bool emulation_running = false;
     bool boot_in_progress = false;
+    bool precompile_shaders_run = false;
+    bool exit_after_precompile = false;
     bool close_pending = false;
     // The path to the game currently running
     QString current_game_path;

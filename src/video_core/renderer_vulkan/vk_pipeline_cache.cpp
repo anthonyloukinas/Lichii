@@ -651,13 +651,16 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
 
-// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+// The "Build all cached pipelines at boot" setting (per game), a precompile run, or
+// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before. Read on each
+// LoadDiskResources call: the per-game setting can differ between titles in one process.
 bool PreloadAllPipelines() {
-    static const bool all = [] {
+    static const bool env = [] {
         const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
         return value != nullptr && value[0] == '1';
     }();
-    return all;
+    return env || Settings::values.preload_all_pipelines.GetValue() ||
+           Settings::values.force_preload_all_pipelines;
 }
 } // Anonymous namespace
 
@@ -780,6 +783,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
+    const bool preload_all = PreloadAllPipelines();
+    if (preload_all) {
+        LOG_INFO(Render_Vulkan, "Building all cached pipelines at boot");
+    }
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -860,7 +867,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
+        if (!preload_all &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;

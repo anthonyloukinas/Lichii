@@ -75,6 +75,18 @@ public:
         m_should_run_cv.notify_one();
     }
 
+    /**
+     * Precompile run: emit PrecompileFinished once the disk shader cache is loaded, so the
+     * frontend can stop emulation right away. Call before start().
+     */
+    void SetPrecompileOnly(bool precompile_only) {
+        m_precompile_only = precompile_only;
+    }
+
+    bool IsPrecompileOnly() const {
+        return m_precompile_only;
+    }
+
 private:
     void EmulationPaused(std::unique_lock<std::mutex>& lk);
     void EmulationResumed(std::unique_lock<std::mutex>& lk);
@@ -87,6 +99,7 @@ private:
     Common::Event m_stopped;
     bool m_should_run{true};
     std::optional<u64> m_pending_shader_cache_title;
+    bool m_precompile_only{false};
 
 signals:
     /**
@@ -111,4 +124,7 @@ signals:
 
     void ShaderCacheReloadStarted();
     void ShaderCacheReloadFinished();
+
+    /// Precompile run: the disk shader cache finished loading; total is the pipelines built.
+    void PrecompileFinished(std::size_t total);
 };

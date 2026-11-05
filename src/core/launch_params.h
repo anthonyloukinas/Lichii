@@ -38,6 +38,8 @@ struct LaunchParams {
     bool fullscreen = false;
     bool force_null_render = false;
     bool force_single_core = false;
+    // --precompile-shaders: build every cached pipeline of the game, save the caches and exit.
+    bool precompile_shaders = false;
     // print
     bool print_version = false;
     bool print_help = false;

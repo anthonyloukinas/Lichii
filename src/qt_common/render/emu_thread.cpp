@@ -27,10 +27,13 @@ void EmuThread::run() {
     gpu.ObtainContext();
 
     emit LoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
+    std::size_t pipeline_total = 0;
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         QtCommon::system->Renderer().ReadRasterizer()->LoadDiskResources(
             QtCommon::system->GetApplicationProcessProgramID(), stop_token,
-            [this](VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
+            [this, &pipeline_total](VideoCore::LoadCallbackStage stage, std::size_t value,
+                                    std::size_t total) {
+                pipeline_total = total;
                 emit LoadProgress(stage, value, total);
             });
     }
@@ -40,6 +43,16 @@ void EmuThread::run() {
     gpu.Start();
 
     QtCommon::system->GetCpuManager().OnGpuReady();
+
+    if (m_precompile_only) {
+        // The cache is built and the driver pipeline cache written (LoadDiskResources saves it,
+        // and the pipeline cache saves it again when the renderer shuts down). The frontend stops
+        // emulation through the normal path as soon as it sees this. The guest still starts below:
+        // shutting down a process whose cores never ran hangs in ServerManager's destructor.
+        LOG_INFO(Frontend, "Precompile finished: {} pipelines built; stopping emulation",
+                 pipeline_total);
+        emit PrecompileFinished(pipeline_total);
+    }
 
     if (QtCommon::system->DebuggerEnabled()) {
         QtCommon::system->InitializeDebugger();

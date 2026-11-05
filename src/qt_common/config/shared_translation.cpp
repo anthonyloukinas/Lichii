@@ -277,6 +277,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, preload_all_pipelines, tr("Build all cached pipelines at boot"),
+           tr("Builds every pipeline in the disk cache while the game loads, instead of only the "
+              "ones the last two sessions used.\nBoot takes longer and uses more memory, but "
+              "cached pipelines are never compiled mid-play, which removes that stutter."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
