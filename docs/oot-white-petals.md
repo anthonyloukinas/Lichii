@@ -1,4 +1,4 @@
-# Ocarina of Time: white falling leaves (experiment knobs)
+# Ocarina of Time: white falling leaves and the native compute write mark
 
 The falling leaves outside Link's house flash pure white every other frame at GPU Mode Fast with
 reactive flushing off. Accurate plus reactive flushing hides it at about 20 fps. The suspected
@@ -29,8 +29,10 @@ Field results (2026-11-05):
   5–30 MB/s when idle. Run (a) below rules out buffer-cache downloads as the source; the
   staging and native-dispatch counters are there to find it.
 
-Both knobs below are experiments, read once at startup from the environment. Neither has a
-settings entry.
+The fix is the **Native compute write mark** setting (Graphics > Advanced, per game), default
+Auto: each native compute storage binding is marked written only as far as the shader's stores
+can reach for that dispatch (see "The store-extent fix" below). The two environment knobs further
+down remain for A/B runs, read once at startup.
 
 ## The PCIe readback (performance)
 
@@ -120,15 +122,55 @@ Related upstream work:
 No upstream change bounds the write mark of a native compute storage binding. That is the part
 this experiment adds.
 
+## The store-extent fix
+
+`GlobalMemoryToStorageBufferPass` already traces each global store to the constant-buffer
+pointer it is based on. It now also bounds where the store can land: the low address word,
+minus the pointer word, is evaluated as an upper bound of the form
+
+    const + sum(stride_i * gl_LocalInvocationID_i) + sum(stride_i * gl_WorkGroupID_i)
+
+through additions, constant multiplications and shifts, masks and bit-field extracts (both only
+shrink a value), selects and non-loop phis (the larger alternative). The store's size is added to
+the constant. Every store to a buffer widens the bound component by component, and the result is
+kept per descriptor (`StorageBufferDescriptor::write_extent`,
+`src/shader_recompiler/storage_write_extent.h`).
+
+The bound is unknown (the whole binding is marked, as before) when any store's offset depends on a
+value loaded from memory, another constant-buffer word (a count or offset parameter), a loop-carried
+value, a negative or 64-bit computation, or anything else not listed; when a store stays a global
+access (it may land in any bound buffer); and when the access goes through a run-time choice of
+several candidate pointers.
+
+Native `IMAD` is lowered to XMAD 16-bit halves. The high half of an operand is taken as zero only
+while that operand stays below 2^16 for the dispatch: the descriptor records the operand's bound as
+a guard, and the dispatch falls back to the whole binding if the guard can reach 2^16.
+
+At dispatch (`BufferCache::BindComputeStorageBuffer`, native programs only) the QMD's block and
+grid sizes resolve the bound to bytes past the pointer; the mark is
+`min(binding size, (pointer - aligned binding start) + extent)`. An indirect dispatch has no known
+grid, so a bound with workgroup-id terms falls back to the whole binding. Read-only bindings are
+never marked. Graphics storage bindings and Maxwell (Switch 1) programs are unchanged.
+
+| Native compute write mark | Behaviour |
+|---|---|
+| Auto (default) | the store extent above; the whole binding when it is unknown |
+| Full binding | upstream behaviour: the whole binding (up to 8 MiB) |
+| 64 KiB cap | the 2026-11-05 experiment: at most 64 KiB |
+
+`EDEN_NX2_COMPUTE_WRITE_MARK` still caps all three. Known limit, upstream and separate: the binding
+itself stops at 8 MiB, so a native dispatch that writes more than 8 MiB past its pointer writes
+outside what the cache tracks, whatever the mark.
+
 ## `EDEN_NX2_COMPUTE_WRITE_MARK=<bytes>`
 
-Limits how much of a **native** compute storage binding is marked GPU-written to
-`min(binding size, <bytes>)`. The binding size itself does not change: the shader can still read
+Caps how much of a **native** compute storage binding is marked GPU-written to
+`min(mark, <bytes>)`, where the mark is what the Native compute write mark setting chose. The binding size itself does not change: the shader can still read
 and write all of it, only the cache's claim about what was written shrinks. Multi-range bindings
 spend the limit across their segments in order. Maxwell (Switch 1) programs and graphics bindings
 are untouched. Accepts decimal or `0x` hex.
 
-- Unset: current behaviour (the whole binding, up to 8 MiB).
+- Unset: the setting decides (Auto by default).
 - `65536`: mark at most 64 KiB from the binding's base.
 - `0`: do not mark native compute storage bindings written at all. This breaks anything that
   reads compute output back on the CPU or relies on the cache knowing the GPU owns those bytes:
@@ -180,12 +222,16 @@ totals since the previous line:
   `native_storage_upload_bytes`: the part done while binding native compute storage buffers.
 - `native_dispatches`, `native_storage_bindings`, `native_bound_bytes`, `native_marked_bytes`:
   native compute dispatches this frame, their storage bindings, the bytes those bindings cover
-  (up to 8 MiB each) and the bytes marked GPU-written for them after the clamp.
+  (up to 8 MiB each) and the bytes marked GPU-written for them.
+- `native_bounded` / `native_unbounded`: written native bindings whose mark the store extent
+  bounded, and the ones that kept the whole binding (extent unknown, Full, or the 64 KiB cap).
+  Multi-range bindings are not counted.
 - `fence_copies`, `fence_copy_bytes`, `fence_copy_pool_bytes`: fence downloads as the GPU
   copies them into host staging, before superseded ranges are dropped.
 - `mapped_read_bytes`: bytes the CPU read straight from host-visible device-local buffers in
   `DownloadBufferMemory` (also counted in `sync_downloads`).
-- `write_mark`: the active `EDEN_NX2_COMPUTE_WRITE_MARK` (`full` when unset).
+- `write_mark`: the Native compute write mark setting (`Auto`, `Full`, `Cap64K`);
+  `write_mark_cap`: `EDEN_NX2_COMPUTE_WRITE_MARK` (`none` when unset).
 
 Field run (a), 3,808 frames at Fast: collected writes every frame, not alternating (about 290 KB
 per frame, 136 KB in the pool, even and odd frames the same); `applied_pool_bytes` about 96 KB per

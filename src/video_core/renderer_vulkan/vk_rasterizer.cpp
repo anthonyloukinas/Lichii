@@ -1956,6 +1956,8 @@ void RasterizerVulkan::TickFrame() {
         const u64 native_bindings = take(c.native_storage_bindings);
         const u64 native_bound_bytes = take(c.native_storage_bytes);
         const u64 native_marked_bytes = take(c.native_marked_bytes);
+        const u64 native_bounded = take(c.native_bounded_bindings);
+        const u64 native_unbounded = take(c.native_unbounded_bindings);
         const u64 fence_copies = take(c.fence_copies);
         const u64 fence_copy_bytes = take(c.fence_copy_bytes);
         const u64 fence_copy_pool_bytes = take(c.fence_copy_pool_bytes);
@@ -1968,17 +1970,19 @@ void RasterizerVulkan::TickFrame() {
                  "sync_download_calls={} staging(requests/bytes) upload={} download={} "
                  "device_local={} buffer_upload_bytes={} native_storage_upload_bytes={} "
                  "native_dispatches={} native_storage_bindings={} native_bound_bytes={} "
-                 "native_marked_bytes={} fence_copies={} fence_copy_bytes={} "
-                 "fence_copy_pool_bytes={} mapped_read_bytes={} write_mark={}",
+                 "native_marked_bytes={} native_bounded={} native_unbounded={} fence_copies={} "
+                 "fence_copy_bytes={} fence_copy_pool_bytes={} mapped_read_bytes={} "
+                 "write_mark={} write_mark_cap={}",
                  render_trace_frame, writes, bytes, pool_writes, pool_bytes,
                  Tegra::g_nx2_deferred_pool.first, Tegra::g_nx2_deferred_pool.second, invalidations,
                  applied_ranges, applied_bytes, applied_pool_bytes, fence_downloads,
                  sync_downloads, sync_calls, staging_upload, staging_download, staging_device,
                  buffer_upload_bytes, native_upload_bytes, native_dispatches, native_bindings,
-                 native_bound_bytes, native_marked_bytes, fence_copies, fence_copy_bytes,
-                 fence_copy_pool_bytes, mapped_read_bytes,
+                 native_bound_bytes, native_marked_bytes, native_bounded, native_unbounded,
+                 fence_copies, fence_copy_bytes, fence_copy_pool_bytes, mapped_read_bytes,
+                 Settings::CanonicalizeEnum(Settings::values.native_compute_write_mark.GetValue()),
                  Tegra::g_nx2_compute_write_mark == ~u64{0}
-                     ? std::string{"full"}
+                     ? std::string{"none"}
                      : std::to_string(Tegra::g_nx2_compute_write_mark));
     }
     ++render_trace_frame;
