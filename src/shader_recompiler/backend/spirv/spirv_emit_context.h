@@ -444,6 +444,8 @@ private:
     void DefineNativeIndirectBases(const Info& info);
     [[nodiscard]] bool UsesNativeIndirectBases(const Info& info) const;
     [[nodiscard]] Id NativeIndirectBasesType();
+    /// Push constant offset of this stage's indirect bases (NativeIndirectBasesFirst)
+    [[nodiscard]] u32 NativeIndirectBasesOffset() const;
     /// Base address of the index-th native_indirect storage buffer, from the push constants
     [[nodiscard]] Id NativeIndirectBase(u32 index);
     /// Length of a storage buffer's runtime array (in its elements), as a 32-bit unsigned value

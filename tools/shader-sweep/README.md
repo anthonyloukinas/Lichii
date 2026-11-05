@@ -48,9 +48,18 @@ The header supplies the exact stage. Instruction-only compilation needs `--stage
 or a captured environment. Graphics compilation also requires a header or environment;
 the tool does not invent graphics input/output metadata.
 
-The six explicit stage names are `vertex`, `tess-control`, `tess-eval`, `geometry`,
-`fragment`, and `compute`. Conflicting explicit, header, and environment stages are errors.
-Task, mesh, and vertex-A cache records report missing pipeline context.
+The explicit stage names are `vertex`, `tess-control`, `tess-eval`, `geometry`,
+`fragment`, `compute`, `task`, and `mesh`. Conflicting explicit, header, and environment stages
+are errors, except that a native task program carries a vertex header and a mesh program a
+tessellation header: `--stage task|mesh` overrides those. Task and mesh programs need the
+pipeline's mesh registers (`--mesh-registers SHADER_A,SHADER_B,INIT`, hex); without them the
+tool assumes triangles, 64 vertices, 126 primitives, 32 threads and one payload line, and says
+so in `assumptions`. Task, mesh, and vertex-A cache records report missing pipeline context
+(task and mesh programs are not serialized to the cache; use raw dumps).
+`--assume-textures` treats textures without a captured type or format as 2D A8B8G8R8_UNORM.
+
+Fixtures with a `native_header` field (hex of a raw dump, with `stage` and `flags`) are
+compiled from the raw dump instead of a cache environment.
 
 For matching a raw capture against a cache, lower without choosing a graphics stage:
 

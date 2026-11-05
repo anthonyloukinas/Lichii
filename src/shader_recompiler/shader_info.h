@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/type.h"
+#include "shader_recompiler/stage.h"
 #include "shader_recompiler/storage_write_extent.h"
 #include "shader_recompiler/varying_state.h"
 
@@ -326,6 +327,12 @@ struct Info {
     /// Read-only storage buffers for pointers loaded from records, and records read per program
     static constexpr size_t MAX_NATIVE_INDIRECT_BINDINGS{8};
     static constexpr size_t MAX_NATIVE_INDIRECT_SLOTS{32};
+    /// Task and mesh programs share a draw's push constants: 4 bindings each
+    static constexpr size_t MAX_NATIVE_INDIRECT_GRAPHICS_BINDINGS{4};
+    [[nodiscard]] static constexpr size_t MaxNativeIndirectBindings(Stage stage) noexcept {
+        return stage == Stage::Compute ? MAX_NATIVE_INDIRECT_BINDINGS
+                                       : MAX_NATIVE_INDIRECT_GRAPHICS_BINDINGS;
+    }
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)

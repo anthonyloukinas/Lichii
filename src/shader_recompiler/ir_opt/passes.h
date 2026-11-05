@@ -44,6 +44,9 @@ bool NativeDynamicCbufPointers();
 /// through a pointer loaded from a record that upstream's table entries leave unbound get
 /// read-only native_indirect bindings, and the runtime pick checks the bound length.
 bool NativeIndirectPointers();
+/// Also for task and mesh programs (bound per draw); EDEN_NX2_INDIRECT_POINTERS=compute: compute
+/// programs only
+bool NativeIndirectGraphicsPointers();
 
 // Dual Vertex
 void VertexATransformPass(IR::Program& program);

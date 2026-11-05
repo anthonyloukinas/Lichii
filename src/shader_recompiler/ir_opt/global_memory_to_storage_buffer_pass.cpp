@@ -12,6 +12,7 @@
 #include <numeric>
 #include <map>
 #include <optional>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -1625,6 +1626,19 @@ small_vector<NativeIndirectSlot, 4> IndirectRecordSlots(const IR::Inst& inst, St
     return result;
 }
 
+/// Stages whose loads through pointers loaded from records get native_indirect bindings
+bool IndirectPointerStage(Stage stage) {
+    switch (stage) {
+    case Stage::Compute:
+        return NativeIndirectPointers();
+    case Stage::Task:
+    case Stage::Mesh:
+        return NativeIndirectGraphicsPointers();
+    default:
+        return false;
+    }
+}
+
 void CountUntracked(const IR::Inst& inst, StorageInfo& info, Environment& env) {
     const bool write{IsGlobalMemoryWrite(inst)};
     auto& stats{info.stats};
@@ -1638,8 +1652,9 @@ void CountUntracked(const IR::Inst& inst, StorageInfo& info, Environment& env) {
         bump(write ? stats.dyn_cbuf_writes : stats.dyn_cbuf_loads);
         break;
     case UntrackedReason::LoadedPointer:
-        if (!write && NativeIndirectPointers() && env.ShaderStage() == Stage::Compute) {
-            // Read only: the records' targets are bound for each dispatch (native_indirect).
+        if (!write && IndirectPointerStage(env.ShaderStage())) {
+            // Read only: the records' targets are bound for each dispatch or draw
+            // (native_indirect).
             const auto records{IndirectRecordSlots(inst, info, env)};
             if (!records.empty()) {
                 info.indirect_slots.insert(records.begin(), records.end());
@@ -2447,7 +2462,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                             host_info.max_descriptor_set_storage_buffers)};
         const size_t room{limit > info.set.size() ? limit - info.set.size() : 0};
         const size_t slots{std::min(info.indirect_slots.size(), Info::MAX_NATIVE_INDIRECT_SLOTS)};
-        indirect_bindings = std::min({Info::MAX_NATIVE_INDIRECT_BINDINGS, room, slots});
+        indirect_bindings = std::min({Info::MaxNativeIndirectBindings(program.stage), room, slots});
         if (indirect_bindings == 0) {
             stats.indirect_slots_dropped = static_cast<u16>(info.indirect_slots.size());
             stats.loaded_ptr_loads =
@@ -2544,6 +2559,15 @@ bool NativeIndirectPointers() {
         // default; also gates the in-bounds check of the SPIR-V runtime pick.
         const char* const value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NativeIndirectGraphicsPointers() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
+        return NativeIndirectPointers() &&
+               (value == nullptr || std::string_view{value}.find("compute") == std::string_view::npos);
     }();
     return enabled;
 }
