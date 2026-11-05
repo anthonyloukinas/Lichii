@@ -216,6 +216,12 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
             (topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
              device.IsPatchListPrimitiveRestartSupported()));
 }
+
+/// EDEN_NX2_A2C_REFRESH=1: record the alpha-to-coverage enable on every draw.
+bool AlphaToCoverageRefresh() {
+    static const bool refresh{std::getenv("EDEN_NX2_A2C_REFRESH") != nullptr};
+    return refresh;
+}
 } // Anonymous namespace
 
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
@@ -2730,7 +2736,9 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
     if (skip_enabled) {
         ++skip_stats.dynamic_states;
     }
-    if (skip_enabled && !topology_changed && (flags & dynamic_state_flags).none()) {
+    // The A2C refresh records its state on draws with no dirty flag set, so it can't be skipped.
+    if (skip_enabled && !topology_changed && !AlphaToCoverageRefresh() &&
+        (flags & dynamic_state_flags).none()) {
         ++skip_stats.dynamic_skipped;
         if (VideoCommon::Nx2FastDraw::g_verify) {
             // Nothing may be recorded: any flag the full update consumes was outside the mask.
@@ -3394,8 +3402,7 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
 void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
     // The enable also depends on the pipeline writing colour 0, which the dirty flag does not
     // track. EDEN_NX2_A2C_REFRESH=1 records it on every draw so it never outlives its pipeline.
-    static const bool refresh{std::getenv("EDEN_NX2_A2C_REFRESH") != nullptr};
-    if (!state_tracker.TouchAlphaToCoverageEnable() && !refresh) {
+    if (!state_tracker.TouchAlphaToCoverageEnable() && !AlphaToCoverageRefresh()) {
         return;
     }
     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
