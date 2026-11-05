@@ -570,6 +570,9 @@ private:
     std::array<Binding, 32> v_buffer{};
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
+    // EDEN_NX2_DEFERRED_WRITE_LOG: set while SynchronizeBuffer runs for a native compute storage
+    // binding, so its uploads are counted apart.
+    bool nx2_native_storage_sync = false;
 
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;

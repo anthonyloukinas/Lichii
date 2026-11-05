@@ -491,6 +491,9 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::BindHostComputeBuffers() {
+    if (Tegra::g_nx2_deferred_write_log && kepler_compute->IsNativeMode()) [[unlikely]] {
+        Tegra::Nx2Count(Tegra::g_nx2_deferred_writes.native_dispatches, 1);
+    }
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -1502,14 +1505,23 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
+        nx2_native_storage_sync = native;
         SynchronizeBuffer(buffer, binding.device_addr, size);
+        nx2_native_storage_sync = false;
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
-        if (is_written && write_mark_limit != 0) {
-            const u32 mark = static_cast<u32>(std::min<u64>(size, write_mark_limit));
+        const u32 mark =
+            is_written ? static_cast<u32>(std::min<u64>(size, write_mark_limit)) : 0;
+        if (mark != 0) {
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, true);
+        }
+        if (Tegra::g_nx2_deferred_write_log && native) [[unlikely]] {
+            auto& c = Tegra::g_nx2_deferred_writes;
+            Tegra::Nx2Count(c.native_storage_bindings, 1);
+            Tegra::Nx2Count(c.native_storage_bytes, size);
+            Tegra::Nx2Count(c.native_marked_bytes, mark);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -2318,6 +2330,13 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    if (Tegra::g_nx2_deferred_write_log) [[unlikely]] {
+        auto& c = Tegra::g_nx2_deferred_writes;
+        Tegra::Nx2Count(c.buffer_upload_bytes, total_size_bytes);
+        if (nx2_native_storage_sync) {
+            Tegra::Nx2Count(c.native_storage_upload_bytes, total_size_bytes);
+        }
+    }
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {

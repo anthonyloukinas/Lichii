@@ -26,9 +26,8 @@ Field results (2026-11-05):
   refreshes macro parameters, so different pages go stale under each mode.
 - Transfer volume: `nvidia-smi dmon` over about 16 s of gameplay at Fast shows `txpci`
   (GPU to host) at 9–27 GB/s (PCIe 4.0 x16 saturated) against 0.24–0.65 GB/s `rxpci`, and
-  5–30 MB/s when idle. That is the download path. An 8 MiB write mark on bindings that write
-  17–45 KB would make most of those downloads cover bytes the GPU never wrote; the
-  `*_downloads` counters below measure it.
+  5–30 MB/s when idle. Run (a) below rules out buffer-cache downloads as the source; the
+  staging and native-dispatch counters are there to find it.
 
 Both knobs below are experiments, read once at startup from the environment. Neither has a
 settings entry.
@@ -70,7 +69,21 @@ totals since the previous line:
   stalls. An 8 MiB write mark makes every CPU read or write of a marked page a candidate for a
   download, so the clamp may cut transfer volume as well as fix the leaves. Texture-cache
   downloads are not counted.
+- `staging(requests/bytes) upload= download= device_local=`: every `StagingBufferPool::Request`,
+  which carries all buffer- and texture-cache staging (texture uploads and downloads included).
+  It does not see CPU reads or writes through mapped device-local (ReBAR) memory: the buffer
+  cache's own buffers, and the stream buffer.
+- `buffer_upload_bytes`: buffer-cache uploads of CPU-modified pages (`SynchronizeBuffer`);
+  `native_storage_upload_bytes`: the part done while binding native compute storage buffers.
+- `native_dispatches`, `native_storage_bindings`, `native_bound_bytes`, `native_marked_bytes`:
+  native compute dispatches this frame, their storage bindings, the bytes those bindings cover
+  (up to 8 MiB each) and the bytes marked GPU-written for them after the clamp.
 - `write_mark`: the active `EDEN_NX2_COMPUTE_WRITE_MARK` (`full` when unset).
+
+Field run (a), 3,808 frames at Fast: collected writes every frame, not alternating (about 290 KB
+per frame, 136 KB in the pool, even and odd frames the same); `applied_pool_bytes` about 96 KB per
+frame; fence downloads about 16 MB per frame and sync downloads about 0. So the 20–27 GB/s
+`txpci` is not buffer-cache downloads.
 
 If `pool_bytes` alternates from frame to frame in step with the flicker, the mechanism is confirmed.
 When unset, the cost is one branch on a constant per collected write.
