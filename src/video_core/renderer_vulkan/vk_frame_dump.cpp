@@ -203,6 +203,9 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     } else {
         trigger_seconds = std::strtod(value.data(), nullptr);
     }
+    if (const char* const count = std::getenv("EDEN_NX2_FRAME_DUMP_COUNT")) {
+        burst_count = static_cast<u32>(std::clamp(std::strtol(count, nullptr, 10), 1L, 8L));
+    }
     LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
 }
 
@@ -561,12 +564,21 @@ void FrameDump::WriterLoop() {
                      << '\n';
             manifest.close();
             LOG_INFO(Render_Vulkan, "Frame dump done: {} images, {}, {} MiB in {}{}", images,
-                     job.tags, written_bytes >> 20, directory.string(),
+                     job.tags, written_bytes >> 20, frame_directory.string(),
                      job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
                                    : "");
             continue;
         }
-        if (job.name.empty()) {
+        if (job.begin) {
+            frame_directory = job.name;
+            images = 0;
+            written_bytes = 0;
+            manifest.open(frame_directory / "manifest.jsonl", std::ios::trunc);
+            if (!manifest) {
+                LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", frame_directory.string());
+            }
+            manifest << job.tags << '\n';
+        } else if (job.name.empty()) {
             manifest << job.tags << '\n';
         } else {
             Write(job);
@@ -659,7 +671,7 @@ void FrameDump::Write(const Job& job) {
 }
 
 void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
-    std::ofstream file{directory / name, std::ios::binary};
+    std::ofstream file{frame_directory / name, std::ios::binary};
     file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     written_bytes += data.size();
 }
@@ -669,6 +681,8 @@ void FrameDump::TickFrame() {
         return;
     }
     ++frame;
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (capturing) {
         EndPass();
         Drain();
@@ -677,30 +691,67 @@ void FrameDump::TickFrame() {
                  .summary = true,
                  .truncated = truncated});
         capturing = false;
-        done = true;
+        if (++burst_frame < burst_count) {
+            BeginFrame(elapsed);
+        } else if (trigger_file.empty()) {
+            done = true;
+        } else {
+            LOG_INFO(Render_Vulkan, "Frame dump: re-armed, touch {} for another burst",
+                     trigger_file.string());
+        }
         return;
     }
-    const double elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::error_code error;
     if (frame < trigger_frame && elapsed < trigger_seconds &&
         (trigger_file.empty() || frame % 30 != 0 ||
          !std::filesystem::exists(trigger_file, error))) {
         return;
     }
-    std::filesystem::create_directories(directory, error);
-    manifest.open(directory / "manifest.jsonl", std::ios::trunc);
-    if (!manifest) {
-        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", directory.string());
+    if (!trigger_file.empty()) {
+        std::filesystem::remove(trigger_file, error);
+    }
+    ++bursts;
+    burst_frame = 0;
+    BeginFrame(elapsed);
+}
+
+void FrameDump::BeginFrame(double elapsed) {
+    std::filesystem::path path = directory;
+    if (bursts > 1) {
+        path /= fmt::format("burst-{}", bursts);
+    }
+    if (burst_count > 1) {
+        path /= fmt::format("frame-{}", burst_frame + 1);
+    }
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", path.string());
         done = true;
         return;
     }
-    manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
-             << '\n';
-    writer = std::thread{[this] { WriterLoop(); }};
+    truncated = false;
+    recorded_bytes = 0;
+    sequence = 0;
+    pass_framebuffer = nullptr;
+    pass_index = 0;
+    pass_first_draw = 0;
+    draws = 0;
+    dispatches = 0;
+    dispatch_sampled.clear();
+    Enqueue({.name = path.string(),
+             .tags = fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame,
+                                 elapsed),
+             .begin = true});
+    if (!writer.joinable()) {
+        writer = std::thread{[this] { WriterLoop(); }};
+    }
     capturing = true;
+    if (burst_count > 1) {
+        LOG_INFO(Render_Vulkan, "Frame dump: burst {}/{}", burst_frame + 1, burst_count);
+    }
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot) into {}", frame,
-             elapsed, directory.string());
+             elapsed, path.string());
 }
 
 } // namespace Vulkan
