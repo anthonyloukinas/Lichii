@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -398,6 +399,7 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    zero_texture_handles = 0;
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -429,14 +431,34 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory,
-                                       [&](u32 cbuf) -> GPUVAddr {
-                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                                                      ? cbufs[cbuf].address
-                                                      : GPUVAddr{};
-                                       }),
-                                   via_header_index);
+                const auto evaluate{[&](u64 storage_alignment) {
+                    return VideoCommon::EvaluateTextureHandle(
+                        info, desc.handle_program, *gpu_memory,
+                        [&](u32 cbuf) -> GPUVAddr {
+                            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                              : GPUVAddr{};
+                        },
+                        storage_alignment);
+                }};
+                // The program's storage offsets are relative to the buffer address aligned down
+                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=1 reads
+                // the words there instead of at the unaligned address.
+                static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
+                const u64 storage_alignment{device.GetStorageBufferAlignment()};
+                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
+                if (raw == 0) {
+                    ++zero_texture_handles;
+                    static std::set<std::pair<u64, u32>> logged;
+                    const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
+                    if (logged.size() < 64 && logged.insert(key_program).second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Texture handle program {} of stage {} (shader {:016x}) gave 0; "
+                                 "aligned to {} it gives {:#x}, unaligned {:#x}",
+                                 desc.handle_program, stage, key_program.first, storage_alignment,
+                                 evaluate(storage_alignment), evaluate(1));
+                    }
+                }
+                return TexturePair(raw, via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
