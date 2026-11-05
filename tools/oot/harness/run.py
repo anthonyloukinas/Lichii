@@ -326,7 +326,7 @@ class Run:
     def check_input(self):
         """The SDL driver logs controller lines at boot; record what it saw."""
         txt = self.emu_log.read_text(errors="replace") if self.emu_log.exists() else ""
-        lines = [l for l in txt.splitlines()[:400] if "sdl_driver" in l or "Controller" in l]
+        lines = [l for l in txt.splitlines()[:400] if "input_common/drivers/sdl" in l or "Input <" in l]
         self.info["input_log_lines"] = lines[:10]
 
     # -- scripted boot
@@ -535,7 +535,7 @@ def main():
     ap.add_argument("--walk", type=float, default=3, help="seconds of left stick forward")
     ap.add_argument("--turn-pulses", type=int, default=6, help="right-stick pulses per 90-degree turn")
     ap.add_argument("--pulse", type=float, default=0.2, help="seconds per right-stick pulse")
-    ap.add_argument("--pulse-gap", type=float, default=0.3, help="seconds between pulses")
+    ap.add_argument("--pulse-gap", type=float, default=0.6, help="seconds between pulses (the camera coasts briefly; shorter gaps over-turn)")
     ap.add_argument("--rot-dir", type=float, default=1.0, help="right stick x deflection (+1 right, -1 left)")
     ap.add_argument("--probe-steps", type=int, default=0, help="calibration: rotate in N small steps instead of measuring")
     ap.add_argument("--probe-step", type=float, default=0.2, help="calibration: seconds per step")

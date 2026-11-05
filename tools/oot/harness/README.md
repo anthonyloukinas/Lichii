@@ -45,9 +45,11 @@ before and after and records any change in `run.json` (`live_files_changed`).
   Load/Cancel dialog) compared as 64x32 grayscale thumbnails; in-game is the heart HUD (red pixels
   top-left). `python3 -I states.py <png>...` prints the classification and scores for screenshots;
   `states.py make-refs title=... load_list=... load_confirm=...` rebuilds references.
-- **Camera turns**: 6 right-stick pulses of 0.2 s = ~90° (24 = a full turn, measured with
-  `--probe-steps 24`). Each cycle after the first logs a rotation-closure score (how close four
-  turns came back to the first view).
+- **Camera turns**: 6 right-stick pulses of 0.2 s with 0.6 s gaps = ~90° (24 = a full turn,
+  measured with `--probe-steps 24`). Shorter gaps over-turn: with 0.3 s the headings drifted about
+  90° every two cycles. Each cycle after the first logs a rotation-closure score (thumbnail MAD of
+  the q0 view against cycle 0's; ~37 for visually matching views, since fog, leaves and NPCs move,
+  ~55 when drifted). The per-visit rows in summary.md show whether a heading's fps is stable.
 - **Shutdown**: SIGTERM to the emulator (SIGINT is `_exit(1)` in this frontend), wait for exit and
   check the log for "Emulation cleanup completed"; SIGKILL after `--shutdown-timeout`. Core dumps
   of the emulator are disabled unless `--keep-cores`.
