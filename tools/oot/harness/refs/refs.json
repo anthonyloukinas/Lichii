@@ -1,0 +1,32 @@
+{
+  "title": {
+    "box": [
+      560,
+      220,
+      1360,
+      640
+    ],
+    "threshold": 25.0,
+    "source": "011-040-boot.png"
+  },
+  "load_list": {
+    "box": [
+      0,
+      0,
+      1920,
+      60
+    ],
+    "threshold": 8.0,
+    "source": "014-048-afterA1.png"
+  },
+  "load_confirm": {
+    "box": [
+      760,
+      640,
+      1160,
+      800
+    ],
+    "threshold": 10.0,
+    "source": "016-052-afterA2.png"
+  }
+}

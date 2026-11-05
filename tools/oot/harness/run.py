@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""Unattended Ocarina of Time test run on Lichii: boot -> title -> load the newest save -> walk ->
+rotate the camera through four headings, with MangoHud (mangoapp) fps, the PCIe sampler, the
+emulator log and screenshots, then a clean shutdown and summary.json / summary.md.
+
+    python3 -I tools/oot/harness/run.py [--binary PATH] [--duration 120] [--headless]
+                                        [--refresh-profile] [--env EDEN_NX2_X=1 ...]
+
+Never touches the live ~/.config/eden, ~/.local/share/eden or ~/.cache/eden: the emulator runs
+with its working directory in the harness profile, whose user/ directory puts it in portable mode
+(see portable.py). Output: ~/Downloads/OOT/harness-runs/<stamp>/. Exit 0 = full run, 2 = a step
+failed (the run stops at the last reliable state; see run.json "failed_step" and the screenshots),
+3 = refused to start (another instance, low memory).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True  # keep __pycache__ out of the worktree
+sys.path.insert(0, str(HERE))  # -I drops the script dir; these are the harness's own modules
+
+import analyze  # noqa: E402
+import pad as padmod  # noqa: E402
+import portable as prof  # noqa: E402
+import states  # noqa: E402
+
+HOME = Path.home()
+DEF_BIN = HOME / "dev/Lichii/build-test/bin/lichii"
+DEF_GAME = HOME / "Downloads/OOT/The Legend of Zelda Ocarina of TIme [04004860224DEC000].nup"
+DEF_PROFILE = HOME / "Downloads/OOT/harness-profile"
+DEF_OUT = HOME / "Downloads/OOT/harness-runs"
+DEF_ENV = {"EDEN_NX2_COMPUTE_WRITE_MARK": "65536", "EDEN_NX2_DEFERRED_WRITE_LOG": "1"}
+EMU_PATTERN = r"bin/lichii|lichii-linux|bin/eden"
+CLEANUP_LINE = "Emulation cleanup completed"
+LOG_TS = re.compile(rb"^\[\s*(\d+\.\d+)\]")
+
+
+class Abort(Exception):
+    """A scripted step failed; the run stops at the last reliable state."""
+
+
+# ------------------------------------------------------------------ screenshot backends
+class GamescopeShots:
+    """gamescopectl screenshot against this run's gamescope socket (independent of the desktop
+    compositor; captures the composited output). A debug-server backend (upstream PR #111,
+    EDEN_NX2_DEBUG_SERVER) can be added as another class with the same capture() signature."""
+
+    name = "gamescope"
+
+    def __init__(self, socket_name):
+        self.env = dict(os.environ, GAMESCOPE_WAYLAND_DISPLAY=socket_name)
+
+    def capture(self, path, timeout=10):
+        path = Path(path)
+        try:
+            subprocess.run(["gamescopectl", "screenshot", str(path)], env=self.env,
+                           capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        for _ in range(int(timeout / 0.1)):  # gamescope writes the file asynchronously
+            if path.exists() and path.stat().st_size > 0:
+                time.sleep(0.2)
+                return path
+            time.sleep(0.1)
+        return None
+
+
+SHOT_BACKENDS = {"gamescope": GamescopeShots}
+
+
+# ------------------------------------------------------------------ helpers
+def emu_pids():
+    out = subprocess.run(["pgrep", "-f", EMU_PATTERN], capture_output=True, text=True).stdout.split()
+    return [int(p) for p in out if int(p) != os.getpid()]
+
+
+def descendants(pid):
+    kids, frontier = [], [pid]
+    while frontier:
+        p = frontier.pop()
+        try:
+            for t in Path(f"/proc/{p}/task").iterdir():
+                c = (t / "children").read_text().split()
+                kids += map(int, c)
+                frontier += map(int, c)
+        except OSError:
+            pass
+    return kids
+
+
+def mem_available_gib():
+    for ln in open("/proc/meminfo"):
+        if ln.startswith("MemAvailable:"):
+            return int(ln.split()[1]) / 2**20
+    return 0.0
+
+
+def last_log_ts(path):
+    """Timestamp of the last complete line of the emulator log (seconds since emulator start)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            lines = f.read().split(b"\n")[:-1]
+    except OSError:
+        return None
+    for ln in reversed(lines):
+        m = LOG_TS.match(ln)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def live_fingerprint():
+    """mtimes of the live emulator files the harness must never write (checked after the run)."""
+    fp = {}
+    for root in (prof.LIVE_CONFIG, prof.LIVE_CACHE / "shader", prof.LIVE_DATA / "nand/user"):
+        if root.exists():
+            for p in root.rglob("*"):
+                if p.is_file():
+                    fp[str(p)] = p.stat().st_mtime_ns
+    return fp
+
+
+# ------------------------------------------------------------------ the run
+class Run:
+    def __init__(self, a):
+        self.a = a
+        self.stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.dir = Path(a.out_root) / self.stamp
+        self.dir.mkdir(parents=True)
+        self.t0 = time.time()
+        self.steps, self.phases = [], []
+        self.log_offset = None
+        self.mh_start = None
+        self.gs = self.sampler = self.pad = self.shots = None
+        self.emu_pid = None
+        self.user = None
+        self.n_shot = 0
+        self.info = {"stamp": self.stamp, "binary": str(a.binary), "game": str(a.game),
+                     "profile": str(a.profile), "headless": a.headless}
+
+    # -- bookkeeping
+    def say(self, msg):
+        line = f"[{time.time() - self.t0:7.1f}s] {msg}"
+        print(line, flush=True)
+        with open(self.dir / "harness.log", "a") as f:
+            f.write(line + "\n")
+
+    def step(self, name, status, note=""):
+        self.steps.append({"t": round(time.time() - self.t0, 1), "step": name, "status": status, "note": note})
+        self.say(f"{name}: {status}" + (f" ({note})" if note else ""))
+
+    @property
+    def emu_log(self):
+        return self.user / "log/eden_log.txt"
+
+    def sync_clock(self):
+        ts = last_log_ts(self.emu_log)
+        if ts is not None:
+            off = time.time() - ts
+            self.log_offset = off if self.log_offset is None else min(self.log_offset, off)
+
+    def shot(self, name):
+        self.n_shot += 1
+        p = self.dir / "screenshots" / f"{self.n_shot:03d}-{name}.png"
+        p.parent.mkdir(exist_ok=True)
+        return self.shots.capture(p)
+
+    def look(self, keep=None):
+        """Screenshot + classification. Polling shots go to screenshots/poll/ and are pruned."""
+        self.sync_clock()
+        tmp = self.dir / "screenshots/poll" / f"{int((time.time() - self.t0) * 10):06d}.png"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        if not self.shots.capture(tmp):
+            return "noshot", {}, None
+        from PIL import Image
+        state, f = states.classify(Image.open(tmp), self.refs)
+        if keep:
+            self.n_shot += 1
+            dst = self.dir / "screenshots" / f"{self.n_shot:03d}-{keep}.png"
+            shutil.copy2(tmp, dst)
+            return state, f, dst
+        return state, f, tmp
+
+    def wait_state(self, want, timeout, every=2.0, on_tick=None):
+        end = time.time() + timeout
+        state, f, last = None, {}, None
+        while time.time() < end:
+            if self.emu_pid and not Path(f"/proc/{self.emu_pid}").exists():
+                raise Abort("emulator exited")
+            state, f, last = self.look()
+            if state in want:
+                return state, f, last
+            if on_tick:
+                on_tick(state)
+            time.sleep(every)
+        return None, f, last
+
+    # -- launch
+    def preflight(self):
+        others = emu_pids()
+        if others and self.a.wait_idle:
+            self.say(f"another emulator instance is running ({others}); waiting up to {self.a.wait_idle}s")
+            end = time.time() + self.a.wait_idle
+            while others and time.time() < end:
+                time.sleep(5)
+                others = emu_pids()
+        why = None
+        mem = mem_available_gib()
+        if others:
+            why = f"another emulator instance is running: {others}"
+        elif mem < self.a.min_mem_gib:
+            why = f"MemAvailable {mem:.1f} GiB < {self.a.min_mem_gib} GiB"
+        elif not Path(self.a.binary).exists():
+            why = f"binary not found: {self.a.binary}"
+        if why:
+            self.say("refusing to start: " + why)
+            shutil.rmtree(self.dir, ignore_errors=True)
+            sys.exit(3)
+
+    def launch(self):
+        a = self.a
+        if a.refresh_profile or not prof.exists(a.profile):
+            prof.refresh(a.profile, log=self.say)
+        self.user = prof.prepare_run(a.profile, padmod.sdl_guid(), keep_save=a.keep_save,
+                                     extra_pins=a.pin, log=self.say)
+        if self.emu_log.exists():
+            self.emu_log.unlink()
+        self.refs = states.load_refs()
+
+        env = dict(os.environ)
+        run_env = dict(DEF_ENV)
+        run_env.update({k: v for k, v in os.environ.items() if k.startswith("EDEN_NX2_")})
+        for kv in a.env:
+            k, _, v = kv.partition("=")
+            if v == "":
+                run_env.pop(k, None)
+            else:
+                run_env[k] = v
+        env.update(run_env)
+        self.info["env"] = run_env
+        env["MANGOHUD_CONFIG"] = (f"fps,frametime,no_display,control=mangohud,output_folder={self.dir},"
+                                  f"log_interval={a.mangohud_interval}")
+        env.pop("MANGOHUD", None)
+
+        # The virtual pad must exist before SDL enumerates joysticks.
+        self.pad = padmod.Pad()
+        self.say(f"virtual pad {self.pad.devnode} guid {padmod.sdl_guid()}")
+        time.sleep(1.0)
+
+        self.sampler = subprocess.Popen(["nvidia-smi", "dmon", "-s", "tu", "-d", "1", "-o", "DT"],
+                                        stdout=open(self.dir / "pcie.txt", "w"), stderr=subprocess.DEVNULL)
+        gs = ["gamescope", "-W", str(a.width), "-H", str(a.height), "-w", str(a.width), "-h", str(a.height),
+              "--force-windows-fullscreen"]
+        if a.headless:
+            gs += ["--backend", "headless"]
+        if not a.no_mangohud:
+            gs += ["--mangoapp"]
+        inner = ["env", "QT_QPA_PLATFORM=xcb", "MANGOHUD=0", str(a.binary), "-f", "-g", str(a.game)]
+
+        def child_setup():
+            os.nice(0)
+            if not a.keep_cores:  # crash cores of a 36 GB process fill the disk
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+        self.say("launch: " + " ".join(gs + ["--"] + inner))
+        self.gs = subprocess.Popen(gs + ["--"] + inner, cwd=str(a.profile), env=env,
+                                   stdout=open(self.dir / "gamescope.txt", "w"), stderr=subprocess.STDOUT,
+                                   preexec_fn=child_setup, start_new_session=True)
+        end = time.time() + 30
+
+        def is_emu(pid):
+            try:
+                return Path(f"/proc/{pid}/exe").resolve() == Path(a.binary).resolve()
+            except OSError:
+                return False
+
+        def ppid(pid):
+            try:
+                return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                return -1
+
+        while time.time() < end and not self.emu_pid:
+            # the emulator itself, not a forked helper of it (whose parent is also the emulator)
+            for k in sorted(descendants(self.gs.pid)):
+                if is_emu(k) and not is_emu(ppid(k)):
+                    self.emu_pid = k
+                    break
+            time.sleep(0.2)
+        sock = None
+        if self.emu_pid:  # gamescope tells its clients where it is; read it from the emulator's env
+            for _ in range(50):
+                try:
+                    for kv in Path(f"/proc/{self.emu_pid}/environ").read_bytes().split(b"\0"):
+                        if kv.startswith(b"GAMESCOPE_WAYLAND_DISPLAY="):
+                            sock = kv.split(b"=", 1)[1].decode()
+                except OSError:
+                    pass
+                if sock:
+                    break
+                time.sleep(0.2)
+        if sock:
+            self.shots = SHOT_BACKENDS[a.shots](sock)
+        self.info["gamescope_socket"] = sock
+        self.info["emu_pid"] = self.emu_pid
+        self.step("launch", "ok" if self.emu_pid else "fail", f"pid {self.emu_pid}, socket {sock}")
+        if not self.emu_pid:
+            raise Abort("emulator process not found under gamescope" +
+                        (" (gamescope exited; see gamescope.txt)" if self.gs.poll() is not None else ""))
+        if not sock:
+            raise Abort("could not read GAMESCOPE_WAYLAND_DISPLAY from the emulator's environment")
+
+    def check_input(self):
+        """The SDL driver logs controller lines at boot; record what it saw."""
+        txt = self.emu_log.read_text(errors="replace") if self.emu_log.exists() else ""
+        lines = [l for l in txt.splitlines()[:400] if "sdl_driver" in l or "Controller" in l]
+        self.info["input_log_lines"] = lines[:10]
+
+    # -- scripted boot
+    def boot_to_game(self):
+        a = self.a
+        st, f, _ = self.wait_state({"title"}, a.boot_timeout)
+        self.check_input()
+        if st != "title":
+            self.shot("FAIL-title")
+            raise Abort(f"title screen not detected within {a.boot_timeout}s (last features {f})")
+        time.sleep(1.5)  # title menu fades in; input before that is ignored
+        self.shot("title")
+        self.step("title", "ok", f"title score {f.get('title')}")
+
+        for name, want, keep in (("file-select", {"load_list", "load_confirm"}, "file-select"),
+                                 ("load-confirm", {"load_confirm"}, "load-confirm")):
+            ok = None
+            for attempt in range(3):
+                self.pad.press("a")
+                ok, f, _ = self.wait_state(want, 6, every=1.0)
+                if ok:
+                    break
+                self.say(f"{name}: not reached after A (attempt {attempt + 1}, features {f})")
+            if not ok:
+                self.shot(f"FAIL-{name}")
+                raise Abort(f"{name} not reached after 3 A presses (last features {f})")
+            time.sleep(0.8)
+            self.shot(keep)
+            self.step(name, "ok", ok)
+
+        pressed = [time.time()]
+        self.pad.press("a")
+
+        def nudge(state):  # still on the confirm dialog: the press was dropped, press again
+            if state == "load_confirm" and time.time() - pressed[0] > 4:
+                self.pad.press("a")
+                pressed[0] = time.time()
+
+        st, f, _ = self.wait_state({"ingame"}, a.load_timeout, on_tick=nudge)
+        if st != "ingame":
+            self.shot("FAIL-ingame")
+            raise Abort(f"in-game HUD not detected within {a.load_timeout}s (last features {f})")
+        time.sleep(a.settle)
+        self.shot("in-game")
+        self.step("in-game", "ok", f"hearts {f.get('hearts')}")
+
+    # -- measurement
+    def mangohud(self, on):
+        if self.a.no_mangohud:
+            return
+        r = subprocess.run(["mangohudctl", "set", "log_session", "1" if on else "0"],
+                           capture_output=True, text=True)
+        if on:
+            self.mh_start = time.time()
+        self.step("mangohud-log-" + ("start" if on else "stop"), "ok" if r.returncode == 0 else "fail",
+                  (r.stderr or r.stdout).strip()[:200])
+
+    def phase(self, name, seconds, kind="phase", action=None, **extra):
+        start = time.time()
+        if action:
+            action()
+        end_at = start + seconds
+        while time.time() < end_at:
+            if not Path(f"/proc/{self.emu_pid}").exists():
+                raise Abort(f"emulator exited during {name}")
+            self.sync_clock()
+            time.sleep(min(1.0, max(0.0, end_at - time.time())))
+        ph = {"name": name, "kind": kind, "start": start, "end": time.time()}
+        ph.update(extra)
+        self.phases.append(ph)
+        return ph
+
+    def turn(self):
+        """~90 degrees of camera yaw: short right-stick pulses (calibrated with --probe-steps:
+        24 x 0.2 s pulses = one full turn on the Kokiri Forest spawn)."""
+        for _ in range(self.a.turn_pulses):
+            self.pad.hold_stick("r", self.a.rot_dir, 0, self.a.pulse)
+            time.sleep(self.a.pulse_gap)
+
+    def measure(self):
+        a = self.a
+        self.mangohud(True)
+        t_end = time.time() + a.duration
+        self.phase("idle-spawn", min(a.heading_seconds, a.duration / 4))
+        self.shot("spawn")
+        walk = self.phase("walk", a.walk, action=lambda: self.pad.hold_stick("l", 0, -1, a.walk))
+        self.shot("after-walk")
+        self.step("walk", "ok", f"{walk['end'] - walk['start']:.1f}s forward")
+        from PIL import Image
+        box = (0, 120, 1920, 900)
+        cycle, start_view = 0, None
+        per_cycle = 4 * (a.heading_seconds + a.turn_pulses * (a.pulse + a.pulse_gap) + 1.5)
+        while cycle == 0 or time.time() + per_cycle <= t_end:
+            for q in range(4):
+                time.sleep(0.5)  # camera settles
+                shot = self.shot(f"heading{q}-c{cycle}")
+                if q == 0 and shot:
+                    v = states.thumb(Image.open(shot), box)
+                    if start_view is not None:  # did four turns come back to the same view?
+                        self.step(f"rotation-closure-c{cycle}", "ok", f"MAD vs cycle-0 q0 view {states.mad(v, start_view):.1f}")
+                    else:
+                        start_view = v
+                self.phase(f"q{q}", a.heading_seconds, kind="heading", cycle=cycle,
+                           screenshot=str(shot.relative_to(self.dir)) if shot else None)
+                self.turn()
+            self.step(f"heading-cycle-{cycle}", "ok")
+            cycle += 1
+        rest = t_end - time.time()
+        if rest > 2:
+            self.phase("tail", rest)
+        self.mangohud(False)
+        self.phases.insert(0, {"name": "in-game", "kind": "phase",
+                               "start": self.phases[0]["start"], "end": self.phases[-1]["end"]})
+
+    def rotation_probe(self):
+        """Calibration: turn the camera in small right-stick steps with a screenshot after each, so
+        --turn-pulses/--pulse can be set to what turns 90 degrees (compare the shots to step 0)."""
+        from PIL import Image
+        box = (0, 120, 1920, 900)
+        p0 = self.shot("probe-000")
+        ref = states.thumb(Image.open(p0), box) if p0 else None
+        scores = []
+        for i in range(1, self.a.probe_steps + 1):
+            self.pad.hold_stick("r", self.a.rot_dir, 0, self.a.probe_step)
+            time.sleep(0.6)
+            p = self.shot(f"probe-{i:03d}")
+            d = round(states.mad(states.thumb(Image.open(p), box), ref), 1) if (p and ref) else None
+            scores.append((round(i * self.a.probe_step, 2), d))
+        self.info["rotation_probe"] = scores
+        self.step("rotation-probe", "ok", " ".join(f"{t}s:{d}" for t, d in scores))
+
+    # -- shutdown
+    def shutdown(self):
+        res = {"signal": None, "exit_seconds": None, "cleanup_line": False, "forced": False}
+        if self.emu_pid and Path(f"/proc/{self.emu_pid}").exists():
+            t = time.time()
+            os.kill(self.emu_pid, signal.SIGTERM)  # SIGINT is _exit(1) in this frontend
+            res["signal"] = "SIGTERM"
+            while Path(f"/proc/{self.emu_pid}").exists() and time.time() - t < self.a.shutdown_timeout:
+                time.sleep(0.25)
+            if Path(f"/proc/{self.emu_pid}").exists():
+                os.kill(self.emu_pid, signal.SIGKILL)
+                res["forced"] = True
+                time.sleep(1)
+            res["exit_seconds"] = round(time.time() - t, 1)
+        if self.gs:
+            try:
+                self.gs.wait(15)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.gs.pid, signal.SIGTERM)
+                try:
+                    self.gs.wait(10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(self.gs.pid, signal.SIGKILL)
+        if self.sampler:
+            self.sampler.terminate()
+            try:
+                self.sampler.wait(5)
+            except subprocess.TimeoutExpired:
+                self.sampler.kill()
+        if self.pad:
+            self.pad.close()
+            self.pad = None
+        if self.user and self.emu_log.exists():
+            shutil.copy2(self.emu_log, self.dir / "eden_log.txt")
+            res["cleanup_line"] = CLEANUP_LINE in (self.dir / "eden_log.txt").read_text(errors="replace")
+        if self.emu_pid:  # did it crash on the way out? (systemd-coredump records it even with cores off)
+            time.sleep(1)
+            try:
+                cd = subprocess.run(["coredumpctl", "--json=short", "--no-pager", "list", str(self.emu_pid)],
+                                    capture_output=True, text=True, timeout=20)
+                hits = json.loads(cd.stdout) if cd.returncode == 0 and cd.stdout.strip() else []
+                if hits:
+                    res["crash_signal"] = signal.Signals(hits[-1]["sig"]).name
+            except (subprocess.TimeoutExpired, ValueError, KeyError, OSError):
+                pass
+        csvs = sorted(p for p in self.dir.glob("*.csv") if not p.name.endswith("_summary.csv"))
+        if csvs:
+            csvs[-1].rename(self.dir / "mangohud.csv")
+            for s in self.dir.glob("*_summary.csv"):
+                s.rename(self.dir / "mangohud_summary.csv")
+        poll = self.dir / "screenshots/poll"
+        if poll.exists() and not self.a.keep_poll_shots:
+            shutil.rmtree(poll)
+        clean = res["cleanup_line"] and not res["forced"] and "crash_signal" not in res
+        self.step("shutdown", "clean" if clean else "unclean",
+                  json.dumps(res))
+        return res
+
+    def write_run_json(self, result, failed=None, shutdown=None):
+        self.info.update({"result": result, "failed_step": failed, "shutdown": shutdown, "steps": self.steps,
+                          "phases": self.phases, "log_wall_offset": self.log_offset,
+                          "mangohud_start_wall": self.mh_start, "launch_wall": self.t0,
+                          "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(self.a).items()}})
+        (self.dir / "run.json").write_text(json.dumps(self.info, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--binary", type=Path, default=DEF_BIN)
+    ap.add_argument("--game", type=Path, default=DEF_GAME)
+    ap.add_argument("--profile", type=Path, default=DEF_PROFILE, help="harness profile dir (portable user/)")
+    ap.add_argument("--out-root", type=Path, default=DEF_OUT)
+    ap.add_argument("--duration", type=float, default=120, help="in-game measurement seconds")
+    ap.add_argument("--heading-seconds", type=float, default=10, help="fps sample per heading")
+    ap.add_argument("--walk", type=float, default=3, help="seconds of left stick forward")
+    ap.add_argument("--turn-pulses", type=int, default=6, help="right-stick pulses per 90-degree turn")
+    ap.add_argument("--pulse", type=float, default=0.2, help="seconds per right-stick pulse")
+    ap.add_argument("--pulse-gap", type=float, default=0.3, help="seconds between pulses")
+    ap.add_argument("--rot-dir", type=float, default=1.0, help="right stick x deflection (+1 right, -1 left)")
+    ap.add_argument("--probe-steps", type=int, default=0, help="calibration: rotate in N small steps instead of measuring")
+    ap.add_argument("--probe-step", type=float, default=0.2, help="calibration: seconds per step")
+    ap.add_argument("--headless", action="store_true", help="gamescope headless backend (no window)")
+    ap.add_argument("--refresh-profile", action="store_true", help="recopy config/save/caches from the live dirs")
+    ap.add_argument("--keep-save", action="store_true", help="do not restore the seed save before the run")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                    help="emulator env (repeatable; K= removes a default). EDEN_NX2_* from the caller's env pass through")
+    ap.add_argument("--pin", action="append", default=[], metavar="KEY=VAL",
+                    help="extra per-game [Renderer] setting to pin (repeatable)")
+    ap.add_argument("--no-mangohud", action="store_true")
+    ap.add_argument("--mangohud-interval", type=int, default=100, help="ms per MangoHud CSV row")
+    ap.add_argument("--shots", choices=sorted(SHOT_BACKENDS), default="gamescope")
+    ap.add_argument("--width", type=int, default=1920)
+    ap.add_argument("--height", type=int, default=1080)
+    ap.add_argument("--boot-timeout", type=float, default=180)
+    ap.add_argument("--load-timeout", type=float, default=90)
+    ap.add_argument("--settle", type=float, default=4, help="seconds after the HUD appears before measuring")
+    ap.add_argument("--shutdown-timeout", type=float, default=60)
+    ap.add_argument("--wait-idle", type=float, default=0, help="wait up to N s for another instance to exit")
+    ap.add_argument("--min-mem-gib", type=float, default=40)
+    ap.add_argument("--keep-cores", action="store_true", help="allow core dumps of the emulator")
+    ap.add_argument("--keep-poll-shots", action="store_true")
+    a = ap.parse_args()
+    a.binary, a.game, a.profile = a.binary.resolve(), a.game.resolve(), a.profile.resolve()
+    os.nice(5)
+
+    run = Run(a)
+    run.preflight()
+    fp_before = live_fingerprint()
+    result, failed, sd = "ok", None, None
+    old_int = signal.getsignal(signal.SIGINT)
+
+    def interrupted(*_):
+        raise Abort("interrupted")
+
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        run.launch()
+        run.boot_to_game()
+        if a.probe_steps:
+            run.rotation_probe()
+        else:
+            run.measure()
+    except Abort as e:
+        result, failed = "failed", str(e)
+        run.step("abort", "fail", str(e))
+        if run.shots and run.emu_pid and Path(f"/proc/{run.emu_pid}").exists():
+            run.shot("last-state")
+        if run.mh_start and not a.no_mangohud:
+            run.mangohud(False)
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        sd = run.shutdown()
+        signal.signal(signal.SIGINT, old_int)
+        changed = [p for p, m in live_fingerprint().items() if fp_before.get(p) != m]
+        run.info["live_files_changed"] = changed[:20]
+        if changed:
+            run.say(f"WARNING: live emulator files changed during the run (another instance?): {changed[:5]}")
+        run.write_run_json(result, failed, sd)
+    s = analyze.analyze(run.dir)
+    print((run.dir / "summary.md").read_text())
+    print(f"run dir: {run.dir}")
+    return 0 if result == "ok" else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
