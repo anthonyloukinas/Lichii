@@ -117,6 +117,9 @@ struct ComputePipelineCacheEntry {
                                        const ComputePipelineCacheKey& key) const;
 };
 
+/// Clears the vertex attribute types from a task/mesh pipeline's key (it has no vertex input).
+void ClearMeshVertexInput(GraphicsPipelineCacheKey& key) noexcept;
+
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
@@ -182,6 +185,7 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    u64 vertex_attribute_types{}; ///< Unmasked attribute_types (mesh keys hold 0)
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

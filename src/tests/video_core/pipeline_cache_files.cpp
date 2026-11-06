@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -77,9 +78,107 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
+
+    // A lowered native program whose capture began with a trap guard prefix.
+    void SetGuardedNativeCode() {
+        auto lowered = std::make_shared<VideoCommon::LoweredNativeCode>();
+        lowered->code = code;
+        lowered->trap_prefix.resize(2);
+        lowered->source_size = 128 + 4 * sizeof(Shader::Ampere::Instruction);
+        lowered_native = std::move(lowered);
+    }
+    void SetUnboundInstructions() {
+        has_unbound_instructions = true;
+    }
 };
 
 } // Anonymous namespace
+
+TEST_CASE("A pipeline whose native program has a trap guard prefix is stored and loads back",
+          "[pipeline_cache_files][guarded_pipelines]") {
+    TempDir temp;
+    const auto path = temp.path / "guarded.bin";
+    Vulkan::GraphicsPipelineCacheKey key{};
+    key.unique_hashes[1] = 0x1111222233334444;
+    key.unique_hashes[5] = 0x5555666677778888;
+    key.state.dynamic_vertex_input.Assign(1);
+    SerializedEnvironment vertex{Shader::Stage::VertexB};
+    SerializedEnvironment fragment{Shader::Stage::Fragment};
+    vertex.SetGuardedNativeCode();
+    REQUIRE(vertex.CanBeSerialized());
+    REQUIRE(vertex.NotSerializableReason() == nullptr);
+    const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex, &fragment};
+    VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+
+    // Instructions read outside the capture still keep a pipeline out.
+    SerializedEnvironment unbound{Shader::Stage::VertexB};
+    unbound.SetUnboundInstructions();
+    REQUIRE(unbound.NotSerializableReason() != nullptr);
+    const std::array<const VideoCommon::GenericEnvironment*, 2> refused{&unbound, &fragment};
+    VideoCommon::SerializePipeline(key, refused, path, VideoCommon::VulkanPipelineCacheVersion);
+
+    size_t loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> restored) {
+            REQUIRE(restored.size() == 2);
+            REQUIRE(restored[0].ShaderStage() == Shader::Stage::VertexB);
+            REQUIRE(restored[1].ShaderStage() == Shader::Stage::Fragment);
+            REQUIRE(restored[0].ReadInstruction(0) == 0x123456789abcdef0);
+            REQUIRE(restored[0].ReadInstruction(8) == 0xfedcba9876543210);
+            REQUIRE(restored[0].ReadCbufValue(1, 16) == 0x1357);
+            Vulkan::GraphicsPipelineCacheKey restored_key;
+            file.read(reinterpret_cast<char*>(&restored_key), sizeof(restored_key));
+            REQUIRE(restored_key == key);
+            REQUIRE(restored_key.Hash() == key.Hash());
+            ++loaded;
+        });
+    REQUIRE(loaded == 1);
+}
+
+TEST_CASE("Task/mesh pipeline keys ignore leftover vertex attribute types, stored ones included",
+          "[pipeline_cache_files][mesh_key]") {
+    TempDir temp;
+    const auto path = temp.path / "mesh-key.bin";
+    Vulkan::GraphicsPipelineCacheKey stored{};
+    stored.unique_hashes[1] = 0x46cc6aaba42f700f;
+    stored.unique_hashes[3] = 0x7caf726f95774b01;
+    stored.unique_hashes[5] = 0x292b3848bd8c1dbf;
+    stored.state.dynamic_vertex_input.Assign(1);
+    stored.state.extended_dynamic_state_3_blend.Assign(1);
+    stored.state.attribute_types = 0x15000105;
+    auto live = stored;
+    live.state.attribute_types = 0x15310100;
+    REQUIRE(live.Hash() != stored.Hash());
+
+    // A record written before the change keeps the types it was built with.
+    SerializedEnvironment task{Shader::Stage::Task};
+    SerializedEnvironment mesh{Shader::Stage::Mesh};
+    SerializedEnvironment fragment{Shader::Stage::Fragment};
+    const std::array<const VideoCommon::GenericEnvironment*, 3> envs{&task, &mesh, &fragment};
+    VideoCommon::SerializePipeline(stored, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    Vulkan::GraphicsPipelineCacheKey restored{};
+    VideoCommon::LoadPipelines(
+        {}, path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> loaded) {
+            REQUIRE(loaded.size() == 3);
+            file.read(reinterpret_cast<char*>(&restored), sizeof(restored));
+        });
+    REQUIRE(restored == stored);
+    Vulkan::ClearMeshVertexInput(restored);
+    Vulkan::ClearMeshVertexInput(live);
+    REQUIRE(restored == live);
+    REQUIRE(restored.Hash() == live.Hash());
+    REQUIRE(restored.state.attribute_types == 0);
+
+    // Without dynamic vertex input the field holds the instancing divisors; it is left alone.
+    Vulkan::GraphicsPipelineCacheKey fixed{};
+    fixed.state.enabled_divisors = 0x3;
+    Vulkan::ClearMeshVertexInput(fixed);
+    REQUIRE(fixed.state.enabled_divisors == 0x3);
+}
 
 TEST_CASE("Task and mesh disk environments roundtrip all translation state and record boundaries",
           "[pipeline_cache_files][mesh_serialization]") {

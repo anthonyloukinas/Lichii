@@ -222,6 +222,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
     }
     last_shaders_valid = true;
+    last_shaders_mesh = mesh;
     return true;
 } catch (const Shader::Exception& error) {
     auto& native = maxwell3d->GetNativeMacroEngine();
