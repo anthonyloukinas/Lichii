@@ -6,6 +6,13 @@ It targets title `0400486024DEC000`, module `main`, build ID
 separate, default-on Add-On. Either can be disabled independently in Add-Ons;
 the existing disabled-add-on configuration persists that choice.
 
+In this line it is off by default: `Real-time speed (built-in)` hooks the same
+instruction, keeps the game at real speed down to 15 fps instead of 20 and
+measures host time, so CPU Boost or Overclock do not change it. Dynamic FPS
+applies only while Real-time speed is disabled in Add-Ons; otherwise the log
+says it is superseded. `EDEN_NX2_OOT_REAL_TIME=0` leaves Real-time speed out
+without enabling Dynamic FPS, so neither changes the game's step.
+
 ## Credit and source
 
 Dark, an Eglantine developer, wrote the routine. This port preserves the call and

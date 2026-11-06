@@ -1826,13 +1826,9 @@ private:
             }
             m_frame_trace.last_present = entered;
         }
-        // EDEN_NX2_OOT_REAL_TIME=0 never writes the delta, so the game keeps the patched-in 1.0
-        // (its old fixed step) with the patch still applied: for A/B timing and for routes
-        // scripted in frames. Unset or 1 writes the measured frame time.
-        static const bool oot_real_time = [] {
-            const char* value = std::getenv("EDEN_NX2_OOT_REAL_TIME");
-            return value == nullptr || value[0] != '0';
-        }();
+        // EDEN_NX2_OOT_REAL_TIME=0 leaves the built-in patch out (no delta address then); this
+        // check only guards a hook a mod installed identically.
+        const bool oot_real_time = Nx2OotTime::RealTimeFromEnv();
         // The presenting process: another client of this service never feeds or gets the delta.
         if (auto* const process = ctx.GetThread().GetOwnerProcess(); process != nullptr) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {

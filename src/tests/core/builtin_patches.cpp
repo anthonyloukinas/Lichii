@@ -306,7 +306,8 @@ std::vector<u8> MakeDynamicMain() {
 
 } // Anonymous namespace
 
-TEST_CASE("Built-in Dynamic FPS defaults on and can be disabled in Add-Ons", "[patch_manager]") {
+TEST_CASE("Built-in Dynamic FPS is off by default and selected by disabling Real-time speed",
+          "[patch_manager]") {
     PatchManagerTestContext context;
     const auto manager = context.Manager();
     const auto enabled = [&] {
@@ -316,10 +317,11 @@ TEST_CASE("Built-in Dynamic FPS defaults on and can be disabled in Add-Ons", "[p
         REQUIRE(it->type == FileSys::PatchType::Mod);
         return it->enabled;
     };
-    REQUIRE(enabled());
+    // Superseded by Real-time speed, which hooks the same instruction (see the test below).
+    REQUIRE_FALSE(enabled());
     auto nso = MakeDynamicMain();
-    // Real-time speed hooks the same instruction and comes first (see the test below).
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{RealTime}};
+    REQUIRE(enabled());
     auto patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(WordAt(patched, DynamicRoutineOffset) == 0x1E201828);
@@ -432,7 +434,7 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
 TEST_CASE("Built-in Real-time speed and Dynamic FPS never both apply", "[patch_manager]") {
     PatchManagerTestContext context;
     const auto nso = MakeDynamicMain();
-    SECTION("Both enabled: Real-time speed applies, Dynamic FPS is skipped") {
+    SECTION("Defaults: Real-time speed applies, Dynamic FPS is skipped") {
         const auto patched = context.Manager().PatchNSO(nso, "main");
         REQUIRE(WordAt(patched, DynamicCallOffset) == 0x14D57D48);
         REQUIRE(ModuleWord(patched, 0x3C461E4) == 0x1CFFFFE8);

@@ -63,6 +63,10 @@ struct BuiltinPatch {
     std::span<const BuiltinPatchRecord> records;
     size_t state_offset = 0;
     size_t state_size = 0;
+    /// Off by default: applies only while this other built-in is disabled in Add-Ons.
+    std::string_view superseded_by{};
+    /// Read once at startup; false skips the patch whatever the Add-Ons say.
+    bool (*environment_allows)() = nullptr;
 };
 
 constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
@@ -93,9 +97,8 @@ constexpr std::array<u8, 4> LittleEndianWord(u32 word) {
             static_cast<u8>(word >> 24)};
 }
 
-// Ocarina of Time's frame delta comes from the measured frame time (nx2_oot_time.h): the hook
-// replaces the same fdiv as Dynamic FPS, so at most one of the two applies (the first in
-// BUILTIN_PATCHES; the other then sees changed bytes and is skipped).
+// Ocarina of Time's frame delta comes from the measured frame time (nx2_oot_time.h). The hook
+// replaces the same fdiv as Dynamic FPS, which is therefore off while this one is enabled.
 constexpr std::array<u8, 12> REAL_TIME_STUB = [] {
     std::array<u8, 12> bytes{};
     const std::array<u32, 3> words{0x3F800000, // 1.0f, the delta the present path rewrites
@@ -127,15 +130,18 @@ constexpr std::array BUILTIN_PATCHES{
         .records = MAX_RESOLUTION_RECORDS,
     },
     // Ocarina of Time's frame delta comes from the measured frame time, so it doesn't run in slow
-    // motion below 60 fps: see nx2_oot_time.h. Listed before Dynamic FPS, which hooks the same
-    // instruction: with both enabled this one applies and Dynamic FPS is skipped.
+    // motion below 60 fps: see nx2_oot_time.h. EDEN_NX2_OOT_REAL_TIME=0 leaves it out (the
+    // game's own fixed step, for routes counted in frames).
     BuiltinPatch{
         .name = "Real-time speed (built-in)",
         .title_id = Service::Nx2OotTime::ProgramId,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = REAL_TIME_RECORDS,
+        .environment_allows = Service::Nx2OotTime::RealTimeFromEnv,
     },
+    // Hooks the same instruction as Real-time speed, which keeps the game at real speed down to
+    // 15 fps instead of 20 and measures host time, unaffected by the CPU clock settings.
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -144,6 +150,7 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
+        .superseded_by = "Real-time speed (built-in)",
     },
 };
 
@@ -569,6 +576,19 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+            continue;
+        }
+        if (!patch.superseded_by.empty() &&
+            std::find(disabled.cbegin(), disabled.cend(), patch.superseded_by) == disabled.cend()) {
+            LOG_INFO(Loader,
+                     "    - Skipping \"{}\": off by default, superseded by \"{}\" (disable that "
+                     "Add-On to use this one)",
+                     patch.name, patch.superseded_by);
+            continue;
+        }
+        if (patch.environment_allows != nullptr && !patch.environment_allows()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": turned off by its environment switch",
+                     patch.name);
             continue;
         }
         if (patch.build_id != build_id) {
@@ -1240,8 +1260,11 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
         if (patch.title_id != title_id) {
             continue;
         }
-        const auto patch_disabled =
-            std::find(disabled.begin(), disabled.end(), patch.name) != disabled.end();
+        const auto is_disabled = [&](std::string_view name) {
+            return std::find(disabled.begin(), disabled.end(), name) != disabled.end();
+        };
+        const bool patch_disabled = is_disabled(patch.name) || (!patch.superseded_by.empty() &&
+                                                                !is_disabled(patch.superseded_by));
         out.push_back({.enabled = !patch_disabled,
                        .name = std::string{patch.name},
                        .version = "IPS",

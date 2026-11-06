@@ -26,6 +26,16 @@ inline constexpr u32 ReturnInstruction = 0x172A82B8;    // b 0x6e6cc8
 
 inline constexpr float DefaultSnapBelow = 1.03f;
 
+/// EDEN_NX2_OOT_REAL_TIME=0, read once: the built-in patch is not applied, so the game keeps its
+/// own fixed step (slow motion below 60 fps; routes counted in frames).
+inline bool RealTimeFromEnv() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_REAL_TIME");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// EDEN_NX2_OOT_REAL_TIME_SNAP=<float>, read once: deltas below it are delivered as the fixed 1.0.
 /// Default 1.03 (58.3 fps), clamped to [1.0, 1.5].
 inline float SnapFromEnv() {
