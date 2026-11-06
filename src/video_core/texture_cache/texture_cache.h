@@ -2832,7 +2832,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         const Image& source = slot_images[aliased.id];
         if (new_image.info.type != ImageType::e2D || source.info.format != new_image.info.format ||
             source.info.astc_opaque != new_image.info.astc_opaque ||
-            True((source.flags | new_image.flags) & ImageFlagBits::UnwrittenSparse)) {
+            True((source.flags | new_image.flags) & ImageFlagBits::Unbacked)) {
             return false;
         }
         const u32 block_width = VideoCore::Surface::DefaultBlockWidth(new_image.info.format);
@@ -2876,6 +2876,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     } else if (copied_whole) {
         // What RefreshContents does, without the upload.
         new_image.flags &= ~ImageFlagBits::CpuModified;
+        new_image.dirty_layers.clear();
         if (False(new_image.flags & ImageFlagBits::Tracked)) {
             TrackImage(new_image, new_image_id);
         }
