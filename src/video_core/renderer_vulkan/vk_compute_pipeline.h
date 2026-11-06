@@ -86,9 +86,10 @@ public:
     static void TickUpscalerTrace();
 
 private:
-    /// Builds the pipeline once, on whichever thread gets here first (the build worker, or the
-    /// scheduler thread of the first dispatch that needs it).
-    void RunBuild(bool on_worker);
+    /// Builds the pipeline once, on whichever thread gets here first: the pipeline worker it was
+    /// queued on, the Vulkan scheduler thread of the first dispatch that needs it, or the creating
+    /// thread when there is no worker. `where` names that thread in the build's log line.
+    void RunBuild(const char* where);
 
     const Device& device;
     vk::PipelineCache& pipeline_cache;
@@ -114,7 +115,7 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
-    bool build_on_worker{false};
+    const char* build_thread{""};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

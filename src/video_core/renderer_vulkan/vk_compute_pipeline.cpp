@@ -297,7 +297,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                                create_start)
                          .count(),
-                     build_on_worker ? "build worker" : "thread that needs it",
+                     build_thread,
                      (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0 ? ", unoptimized"
                                                                                  : "");
         } catch (const vk::Exception& exception) {
@@ -334,19 +334,19 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }};
     build_task = std::move(func);
     if (thread_worker) {
-        thread_worker->QueueWork([this] { RunBuild(true); });
+        thread_worker->QueueWork([this] { RunBuild("pipeline worker"); });
     } else {
-        RunBuild(false);
+        RunBuild("creating thread");
     }
 }
 
-void ComputePipeline::RunBuild(bool on_worker) {
+void ComputePipeline::RunBuild(const char* where) {
     // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
     // waiting for the worker queue, which can hold hundreds of builds, to reach it.
     if (build_claimed.exchange(true)) {
         return;
     }
-    build_on_worker = on_worker;
+    build_thread = where;
     build_task();
     build_task = nullptr;
 }
@@ -614,9 +614,23 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
-            RunBuild(false);
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            const auto wait_start = std::chrono::steady_clock::now();
+            RunBuild("Vulkan scheduler thread");
+            {
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+            }
+            // Includes the create above when this thread ran it; once per pipeline at most.
+            const double waited = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - wait_start)
+                                      .count();
+            if (waited >= 1.0) {
+                LOG_INFO(Render_Vulkan,
+                         "Compute pipeline {:016x}: Vulkan scheduler thread held {:.1f} ms until "
+                         "it was built",
+                         shader_hash, waited);
+            }
         });
     }
 
