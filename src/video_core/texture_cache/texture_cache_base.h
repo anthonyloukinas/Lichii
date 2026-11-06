@@ -241,6 +241,18 @@ public:
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
+    /// EDEN_NX2_FAST_DRAW_VERIFY: cached feedback loop answers checked, wrong with the serials-only
+    /// key (a barrier missed, an extra one), and wrong with the views compared as well.
+    struct FeedbackStats {
+        u64 checked{};
+        u64 serial_missed{};
+        u64 serial_extra{};
+        u64 views_wrong{};
+    };
+    FeedbackStats TakeFeedbackStats() {
+        return std::exchange(feedback_stats, FeedbackStats{});
+    }
+
     [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
 
     /// Get the sampler from the graphics/compute descriptor table in the specified index
@@ -551,6 +563,10 @@ private:
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
+    /// The views of the cached feedback loop answer.
+    boost::container::small_vector<ImageViewId, 32> last_feedback_views;
+    FeedbackStats feedback_stats;
+    bool FeedbackLoopRequiresBarrier(std::span<const ImageViewInOut> views);
     bool feedback_depth_dirty = true;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;

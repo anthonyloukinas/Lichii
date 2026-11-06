@@ -527,6 +527,44 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 }
 
 template <class P>
+bool TextureCache<P>::FeedbackLoopRequiresBarrier(std::span<const ImageViewInOut> views) {
+    if (rt_active_mask == 0) {
+        return false;
+    }
+    const u32 depth_bit = 1u << NUM_RT;
+    const bool depth_active = (rt_active_mask & depth_bit) != 0;
+    for (const auto& view : views) {
+        if (!view.id) {
+            continue;
+        }
+
+        {
+            bool is_continue = false;
+            for (size_t i = 0; i < 8; ++i)
+                is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
+            if (is_continue)
+                continue;
+        }
+
+        if (depth_active && view.id == render_targets.depth_buffer_id)
+            continue;
+
+        const ImageId view_image_id = slot_image_views[view.id].image_id;
+        {
+            bool is_continue = false;
+            for (size_t i = 0; i < 8; ++i)
+                is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
+            if (is_continue)
+                continue;
+        }
+        if (depth_active && view_image_id == rt_depth_image_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;
@@ -545,8 +583,27 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
         }
     };
 
-    if (render_targets_serial == last_feedback_loop_serial &&
-        texture_bindings_serial == last_feedback_texture_serial) {
+    // The texture binding serial changes only with the descriptor tables, not with the handles
+    // or the pipeline, so the cached answer also needs the same views. EDEN_NX2_FEEDBACK_VIEWS=0:
+    // serials only, as before.
+    static const bool key_views = Nx2FastDraw::SwitchNotOff("EDEN_NX2_FEEDBACK_VIEWS");
+    const bool keep_views = key_views || Nx2FastDraw::g_verify;
+    const bool serials_hit = render_targets_serial == last_feedback_loop_serial &&
+                             texture_bindings_serial == last_feedback_texture_serial;
+    const bool views_hit =
+        serials_hit && keep_views &&
+        std::ranges::equal(views, last_feedback_views,
+                           [](const ImageViewInOut& view, ImageViewId id) { return view.id == id; });
+    if (Nx2FastDraw::g_verify && serials_hit) [[unlikely]] {
+        // EDEN_NX2_FAST_DRAW_VERIFY: each cached answer against one worked out again.
+        const bool fresh = FeedbackLoopRequiresBarrier(views);
+        ++feedback_stats.checked;
+        if (fresh != last_feedback_loop_result) {
+            ++(fresh ? feedback_stats.serial_missed : feedback_stats.serial_extra);
+            feedback_stats.views_wrong += views_hit ? 1 : 0;
+        }
+    }
+    if (key_views ? views_hit : serials_hit) {
         if (last_feedback_loop_result) {
             barrier();
         }
@@ -555,52 +612,16 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (render_targets_serial != last_feedback_loop_serial) {
         feedback_depth_dirty = true;
     }
-
-    if (rt_active_mask == 0) {
-        last_feedback_loop_serial = render_targets_serial;
-        last_feedback_texture_serial = texture_bindings_serial;
-        last_feedback_loop_result = false;
-        return;
-    }
-    const u32 depth_bit = 1u << NUM_RT;
-    const bool depth_active = (rt_active_mask & depth_bit) != 0;
-
-    const bool requires_barrier = [&] {
-        for (const auto& view : views) {
-            if (!view.id) {
-                continue;
-            }
-
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
-                if (is_continue)
-                    continue;
-            }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
-                continue;
-
-            const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
-                if (is_continue)
-                    continue;
-            }
-            if (depth_active && view_image_id == rt_depth_image_id) {
-                return true;
-            }
-        }
-
-        return false;
-    }();
-
+    const bool requires_barrier = FeedbackLoopRequiresBarrier(views);
     last_feedback_loop_serial = render_targets_serial;
     last_feedback_texture_serial = texture_bindings_serial;
     last_feedback_loop_result = requires_barrier;
+    if (keep_views) {
+        last_feedback_views.clear();
+        for (const auto& view : views) {
+            last_feedback_views.push_back(view.id);
+        }
+    }
     if (requires_barrier) {
         barrier();
     }

@@ -572,6 +572,14 @@ void RasterizerVulkan::ReportFastDraws() {
                  verified(HandleVerify::DeltaInvalidated), stale(HandleVerify::DeltaInvalidated),
                  verified(HandleVerify::DeltaOther), stale(HandleVerify::DeltaOther));
     }
+    if (VideoCommon::Nx2FastDraw::g_verify) {
+        const auto feedback = texture_cache.TakeFeedbackStats();
+        LOG_INFO(Render_Vulkan,
+                 "Feedback loop answers from the cache in this window: {} checked; serials only: {} "
+                 "barriers missed, {} extra; with the views: {} wrong",
+                 feedback.checked, feedback.serial_missed, feedback.serial_extra,
+                 feedback.views_wrong);
+    }
     if (VideoCommon::Nx2FastDraw::RechecksHandles()) {
         const auto rechecks = [&](GraphicsPipeline::RecheckResult result) {
             return static_cast<double>(stats.rechecks[static_cast<size_t>(result)]) / seconds;
