@@ -597,11 +597,12 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
                                                              texture_bindings_serial,
                                                              view_lifetime_epoch, view_ids, true);
     if (Nx2FastDraw::g_verify && serials_hit) [[unlikely]] {
-        // EDEN_NX2_FAST_DRAW_VERIFY: each cached answer against one worked out again.
+        // EDEN_NX2_FAST_DRAW_VERIFY: each cached answer against one worked out again. These count
+        // answers of the predicate, before the depth dirty gate, not barriers recorded.
         const bool fresh = FeedbackLoopRequiresBarrier(views);
         ++feedback_stats.checked;
         if (fresh != feedback_cache.Answer()) {
-            ++(fresh ? feedback_stats.serial_missed : feedback_stats.serial_extra);
+            ++(fresh ? feedback_stats.serial_false_negative : feedback_stats.serial_false_positive);
             feedback_stats.views_wrong += views_hit ? 1 : 0;
         }
     }

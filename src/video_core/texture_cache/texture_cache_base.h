@@ -242,12 +242,15 @@ public:
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
-    /// EDEN_NX2_FAST_DRAW_VERIFY: cached feedback loop answers checked, wrong with the serials-only
-    /// key (a barrier missed, an extra one), and wrong with the views compared as well.
+    /// EDEN_NX2_FAST_DRAW_VERIFY: cached feedback loop predicate answers checked, wrong with the
+    /// serials-only key (false negative: the fresh answer needs the feedback operation, false
+    /// positive: it does not), and wrong with the views and view lifetime compared as well. These
+    /// are answers before the depth dirty gate, not barriers recorded. With the view key on, the
+    /// serials-only count uses the cache as the view key refreshes it, not the old cache's history.
     struct FeedbackStats {
         u64 checked{};
-        u64 serial_missed{};
-        u64 serial_extra{};
+        u64 serial_false_negative{};
+        u64 serial_false_positive{};
         u64 views_wrong{};
     };
     /// The view lifetime epoch (diagnostics).

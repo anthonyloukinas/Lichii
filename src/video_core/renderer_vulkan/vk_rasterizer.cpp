@@ -575,10 +575,11 @@ void RasterizerVulkan::ReportFastDraws() {
     if (VideoCommon::Nx2FastDraw::g_verify) {
         const auto feedback = texture_cache.TakeFeedbackStats();
         LOG_INFO(Render_Vulkan,
-                 "Feedback loop answers from the cache in this window: {} checked; serials only: {} "
-                 "barriers missed, {} extra; with the views: {} wrong",
-                 feedback.checked, feedback.serial_missed, feedback.serial_extra,
-                 feedback.views_wrong);
+                 "Feedback loop cached predicate answers in this window: {} checked; serials only: "
+                 "{} false-negative, {} false-positive; with the views and view lifetime: {} wrong "
+                 "(view lifetime epoch {})",
+                 feedback.checked, feedback.serial_false_negative, feedback.serial_false_positive,
+                 feedback.views_wrong, texture_cache.ViewLifetimeEpoch());
     }
     if (VideoCommon::Nx2FastDraw::RechecksHandles()) {
         const auto rechecks = [&](GraphicsPipeline::RecheckResult result) {
