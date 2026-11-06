@@ -31,6 +31,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -213,8 +214,10 @@ private:
 
     /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
-    /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
-    std::unordered_set<u64> disk_pipelines;
+    /// again unless the stored capture failed to build. Each built pipeline holds driver memory
+    /// (title 1: 6.5k cached, a quarter used).
+    VideoCommon::DiskPipelineRecords disk_graphics;
+    VideoCommon::DiskPipelineRecords disk_compute; ///< The same for compute pipelines
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;

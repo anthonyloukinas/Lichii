@@ -8,6 +8,8 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
+#include <ios>
 #include <iosfwd>
 #include <limits>
 #include <memory>
@@ -224,6 +226,10 @@ public:
 
     void Deserialize(std::ifstream& file);
 
+    /// Moves past one environment in the layout Deserialize reads and returns its stage, or
+    /// nullopt when it would end past `end`.
+    static std::optional<Shader::Stage> Skip(std::ifstream& file, std::streamoff end);
+
     [[nodiscard]] size_t MemorySize() const;
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
@@ -292,8 +298,32 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
     SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
 }
 
+/// Newest-record-wins loading. The pipeline cache is append-only: a capture written again after
+/// the stored one failed to build follows it in the file, so of the records with the same key
+/// only the last one is loaded.
+struct PipelineRecordIndex {
+    size_t compute_key_size{};
+    size_t graphics_key_size{};
+    /// Identity of the key that ends a record (compute is true for a compute record).
+    std::function<u64(std::span<const char> key, bool compute)> identify;
+
+    /// Filled by LoadPipelines: the records stored per key identity, and how many older records
+    /// it skipped for a newer one.
+    ::Common::unordered_map<u64, u32> compute_records;
+    ::Common::unordered_map<u64, u32> graphics_records;
+    size_t superseded{};
+
+    [[nodiscard]] u32 Records(u64 identity, bool compute) const {
+        const auto& records = compute ? compute_records : graphics_records;
+        const auto it = records.find(identity);
+        return it == records.end() ? 1 : it->second;
+    }
+};
+
+/// With an index, a record whose key is stored again later in the file is skipped.
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
+    PipelineRecordIndex* index = nullptr);
 
 } // namespace VideoCommon

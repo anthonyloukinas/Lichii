@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
+#include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "shader_recompiler/exception.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
@@ -47,16 +54,24 @@ std::string ReadAll(const std::filesystem::path& file) {
 
 class SerializedEnvironment final : public VideoCommon::GenericEnvironment {
 public:
-    explicit SerializedEnvironment(Shader::Stage shader_stage) {
+    explicit SerializedEnvironment(Shader::Stage shader_stage, u32 cbuf_value = 0x1357,
+                                   bool classifies_pointer = false) {
         stage = shader_stage;
         code = {0x123456789abcdef0, 0xfedcba9876543210};
         cached_lowest = 0;
         cached_highest = sizeof(u64);
         mesh_registers = {0x12345678, 0x87654321, 0xabcdef01};
         std::memset(&mesh_primitive_header, 0x5a, sizeof(mesh_primitive_header));
+        gp_passthrough_mask.fill(0xa5a5a5a5);
         texture_bound = 2;
-        cbuf_values.emplace((u64{1} << 32) | 16, 0x1357);
+        cbuf_values.emplace((u64{1} << 32) | 16, cbuf_value);
         texture_types.emplace(3, Shader::TextureType::Color2D);
+        texture_pixel_formats.emplace(4, Shader::TexturePixelFormat{});
+        cbuf_replacements.emplace(5, Shader::ReplaceConstant{});
+        if (classifies_pointer) {
+            // The answer to IsCbufStorageBufferPointer(1, 16) a complete capture holds.
+            storage_pointer_types.emplace((u64{1} << 32) | 16, 1);
+        }
     }
 
     u32 ReadCbufValue(u32, u32) override {
@@ -221,6 +236,279 @@ TEST_CASE("Cancelled mesh loading preserves its disk cache and queues no work",
             FAIL("Cancelled load reached pipeline creation");
         });
     REQUIRE(ReadAll(path) == before);
+}
+
+namespace {
+
+constexpr u32 Version = VideoCommon::VulkanPipelineCacheVersion;
+
+/// A graphics key of another size than the compute key (u64), as in the Vulkan cache.
+struct GraphicsKey {
+    u64 id;
+    u64 state;
+};
+
+void WriteRecord(const std::filesystem::path& path, u64 key, bool compute, u32 value,
+                 bool complete, std::initializer_list<Shader::Stage> stages = {}) {
+    std::vector<std::unique_ptr<SerializedEnvironment>> owned;
+    std::vector<const VideoCommon::GenericEnvironment*> envs;
+    if (compute) {
+        owned.push_back(
+            std::make_unique<SerializedEnvironment>(Shader::Stage::Compute, value, complete));
+    }
+    for (const auto stage : stages) {
+        owned.push_back(std::make_unique<SerializedEnvironment>(stage, value, complete));
+    }
+    for (const auto& env : owned) {
+        envs.push_back(env.get());
+    }
+    if (compute) {
+        VideoCommon::SerializePipeline(key, envs, path, Version);
+    } else {
+        VideoCommon::SerializePipeline(GraphicsKey{key, ~key}, envs, path, Version);
+    }
+}
+
+void WriteCompute(const std::filesystem::path& path, u64 key, u32 value, bool complete = true) {
+    WriteRecord(path, key, true, value, complete);
+}
+
+void WriteGraphics(const std::filesystem::path& path, u64 key, u32 value, bool complete = true) {
+    WriteRecord(path, key, false, value, complete,
+                {Shader::Stage::VertexB, Shader::Stage::Geometry, Shader::Stage::Fragment});
+}
+
+VideoCommon::PipelineRecordIndex MakeIndex() {
+    return {
+        .compute_key_size = sizeof(u64),
+        .graphics_key_size = sizeof(GraphicsKey),
+        .identify = [](std::span<const char> bytes, bool) {
+            u64 id;
+            std::memcpy(&id, bytes.data(), sizeof(id));
+            return id;
+        },
+    };
+}
+
+/// What a translation of the capture needs: the cbuf value it reads and the pointer
+/// classification, which an incomplete capture lacks (FileEnvironment throws, as at boot).
+bool Translates(VideoCommon::FileEnvironment& env) {
+    try {
+        static_cast<void>(env.ReadCbufValue(1, 16));
+        static_cast<void>(env.IsCbufStorageBufferPointer(1, 16));
+        return true;
+    } catch (const Shader::Exception&) {
+        return false;
+    }
+}
+
+struct Loaded {
+    bool compute;
+    u64 key;
+    u32 value;
+    bool translates;
+};
+
+std::vector<Loaded> Load(const std::filesystem::path& path,
+                         VideoCommon::PipelineRecordIndex* index) {
+    std::vector<Loaded> loaded;
+    VideoCommon::LoadPipelines(
+        {}, path, Version,
+        [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
+            u64 key{};
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            REQUIRE(env.ShaderStage() == Shader::Stage::Compute);
+            loaded.push_back({true, key, env.ReadCbufValue(1, 16), Translates(env)});
+        },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> envs) {
+            GraphicsKey key{};
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            REQUIRE(key.state == ~key.id);
+            for (const auto& env : envs) {
+                if (env.ShaderStage() == Shader::Stage::Geometry) {
+                    REQUIRE(env.GpPassthroughMask()[7] == 0xa5a5a5a5);
+                }
+                if (env.ShaderStage() == Shader::Stage::Mesh) {
+                    REQUIRE(env.MeshRegisters()[2] == 0xabcdef01);
+                }
+            }
+            loaded.push_back({false, key.id, envs.front().ReadCbufValue(1, 16),
+                              std::ranges::all_of(envs, Translates)});
+        },
+        index);
+    return loaded;
+}
+
+/// One launch as the Vulkan cache runs it: load (newest record per key), build every loaded
+/// capture, then build every pipeline the game uses live and append what ClaimWrite allows.
+struct Launch {
+    size_t loaded{};
+    size_t failed{};
+    size_t written{};
+};
+
+Launch RunLaunch(const std::filesystem::path& path, std::span<const std::pair<u64, bool>> used,
+                 bool live_capture_complete) {
+    VideoCommon::DiskPipelineRecords compute_records;
+    VideoCommon::DiskPipelineRecords graphics_records;
+    auto index = MakeIndex();
+    Launch launch;
+    for (const Loaded& record : Load(path, &index)) {
+        auto& records = record.compute ? compute_records : graphics_records;
+        REQUIRE(records.NoteStored(record.key, index.Records(record.key, record.compute)));
+        ++launch.loaded;
+        if (!record.translates) {
+            records.NoteFailed(record.key);
+            ++launch.failed;
+        }
+    }
+    for (const auto& [key, compute] : used) {
+        auto& records = compute ? compute_records : graphics_records;
+        if (records.ClaimWrite(key) != VideoCommon::DiskPipelineRecords::Write::No) {
+            WriteRecord(path, key, compute, 2,
+                        live_capture_complete,
+                        compute ? std::initializer_list<Shader::Stage>{}
+                                : std::initializer_list<Shader::Stage>{
+                                      Shader::Stage::VertexB, Shader::Stage::Geometry,
+                                      Shader::Stage::Fragment});
+            ++launch.written;
+        }
+    }
+    return launch;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("The newest record of a pipeline key is the one loaded",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "records.bin";
+    WriteCompute(path, 1, 10);
+    WriteGraphics(path, 1, 20);
+    WriteRecord(path, 7, false, 70, true, {Shader::Stage::Task, Shader::Stage::Mesh});
+    WriteCompute(path, 1, 11);
+    WriteCompute(path, 2, 30);
+    WriteGraphics(path, 1, 21);
+    WriteCompute(path, 1, 12);
+
+    const auto values = [](const std::vector<Loaded>& loaded) {
+        std::vector<u32> result;
+        for (const auto& record : loaded) {
+            result.push_back(record.value);
+        }
+        return result;
+    };
+    // Without an index every record is read, as before (and as the OpenGL cache reads).
+    REQUIRE(values(Load(path, nullptr)) == std::vector<u32>{10, 20, 70, 11, 30, 21, 12});
+    auto index = MakeIndex();
+    REQUIRE(values(Load(path, &index)) == std::vector<u32>{70, 30, 21, 12});
+    REQUIRE(index.superseded == 3);
+    REQUIRE(index.Records(1, true) == 3);
+    REQUIRE(index.Records(2, true) == 1);
+    REQUIRE(index.Records(1, false) == 2);
+    REQUIRE(index.Records(7, false) == 1);
+    REQUIRE(index.Records(99, true) == 1);
+}
+
+TEST_CASE("A damaged record still ends the indexed load as before",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "damaged.bin";
+    WriteCompute(path, 1, 10);
+    WriteCompute(path, 1, 11);
+    WriteGraphics(path, 3, 30);
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+    auto index = MakeIndex();
+    std::vector<u32> values;
+    VideoCommon::LoadPipelines(
+        {}, path, Version,
+        [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
+            file.seekg(sizeof(u64), std::ios::cur);
+            values.push_back(env.ReadCbufValue(1, 16));
+        },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment>) {
+            GraphicsKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            FAIL("A cut record reached pipeline creation");
+        },
+        &index);
+    REQUIRE(values == std::vector<u32>{11});
+    // The loader deletes a damaged cache, as it did without the index.
+    REQUIRE_FALSE(std::filesystem::exists(path));
+}
+
+TEST_CASE("A capture that fails to build is replaced by the live build and then loads",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "repair.bin";
+    // Incomplete captures of a compute and a graphics pipeline, as an older build wrote them,
+    // and a complete one that must stay as it is.
+    WriteCompute(path, 1, 1, false);
+    WriteGraphics(path, 1, 1, false);
+    WriteGraphics(path, 5, 1, true);
+    const std::array<std::pair<u64, bool>, 4> used{{{1, true}, {1, false}, {5, false}, {9, true}}};
+
+    const Launch first = RunLaunch(path, used, true);
+    CHECK(first.loaded == 3);
+    CHECK(first.failed == 2);
+    // The two replacements and the new compute pipeline 9; graphics 5 is not written again.
+    CHECK(first.written == 3);
+    const auto size = std::filesystem::file_size(path);
+
+    const Launch second = RunLaunch(path, used, true);
+    CHECK(second.loaded == 4);
+    CHECK(second.failed == 0);
+    CHECK(second.written == 0);
+    CHECK(std::filesystem::file_size(path) == size);
+    auto index = MakeIndex();
+    for (const Loaded& record : Load(path, &index)) {
+        CHECK(record.translates);
+        CHECK(record.value == (record.key == 5 ? 1u : 2u));
+    }
+}
+
+TEST_CASE("A capture that keeps failing does not grow the cache on every launch",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "bounded.bin";
+    WriteCompute(path, 1, 1, false);
+    WriteGraphics(path, 1, 1, false);
+    const std::array<std::pair<u64, bool>, 2> used{{{1, true}, {1, false}}};
+    std::vector<std::uintmax_t> sizes;
+    size_t written = 0;
+    for (int launch = 0; launch < 10; ++launch) {
+        const Launch result = RunLaunch(path, used, false);
+        CHECK(result.failed == 2);
+        written += result.written;
+        sizes.push_back(std::filesystem::file_size(path));
+    }
+    // At most MaxRecordsPerKey records per key: one original and three replacements each.
+    CHECK(written == 2 * (VideoCommon::DiskPipelineRecords::MaxRecordsPerKey - 1));
+    CHECK(sizes.back() == sizes[VideoCommon::DiskPipelineRecords::MaxRecordsPerKey - 2]);
+    auto index = MakeIndex();
+    static_cast<void>(Load(path, &index));
+    CHECK(index.Records(1, true) == VideoCommon::DiskPipelineRecords::MaxRecordsPerKey);
+    CHECK(index.Records(1, false) == VideoCommon::DiskPipelineRecords::MaxRecordsPerKey);
+}
+
+TEST_CASE("Disk pipeline records allow one replacement per failure",
+          "[pipeline_cache_files][repair]") {
+    using Write = VideoCommon::DiskPipelineRecords::Write;
+    VideoCommon::DiskPipelineRecords records;
+    REQUIRE(records.NoteStored(1, 1));
+    REQUIRE_FALSE(records.NoteStored(1, 1));
+    CHECK(records.ClaimWrite(1) == Write::No);
+    records.NoteFailed(1);
+    CHECK(records.ClaimWrite(1) == Write::Replacement);
+    CHECK(records.ClaimWrite(1) == Write::No);
+    CHECK(records.ClaimWrite(2) == Write::New);
+    CHECK(records.ClaimWrite(2) == Write::No);
+    REQUIRE(records.NoteStored(3, VideoCommon::DiskPipelineRecords::MaxRecordsPerKey));
+    records.NoteFailed(3);
+    CHECK(records.ClaimWrite(3) == Write::No);
+    // A failure of a pipeline the cache does not hold changes nothing.
+    records.NoteFailed(4);
+    CHECK(records.ClaimWrite(4) == Write::New);
 }
 
 TEST_CASE("Pipeline cache names are version-suffixed per build", "[pipeline_cache_files]") {

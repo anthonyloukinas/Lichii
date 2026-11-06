@@ -1125,6 +1125,57 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
+std::optional<Shader::Stage> FileEnvironment::Skip(std::ifstream& file, std::streamoff end) {
+    // code size, then the entry counts of the five maps, in Deserialize's order
+    std::array<u64, 6> counts{};
+    file.read(reinterpret_cast<char*>(counts.data()), sizeof(counts));
+    file.seekg(sizeof(local_memory_size) + sizeof(texture_bound) + sizeof(start_address) +
+                   sizeof(read_lowest) + sizeof(read_highest) + sizeof(viewport_transform_state),
+               std::ios::cur);
+    Shader::Stage stage{};
+    file.read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    const auto entry_size = []<typename Map>(std::type_identity<Map>) -> u64 {
+        return sizeof(typename Map::key_type) + sizeof(typename Map::mapped_type);
+    };
+    const std::array<u64, 6> element_sizes{
+        1,
+        entry_size(std::type_identity<decltype(texture_types)>{}),
+        entry_size(std::type_identity<decltype(texture_pixel_formats)>{}),
+        entry_size(std::type_identity<decltype(cbuf_values)>{}),
+        entry_size(std::type_identity<decltype(storage_pointer_types)>{}),
+        entry_size(std::type_identity<decltype(cbuf_replacements)>{}),
+    };
+    u64 tail = 0;
+    if (stage == Shader::Stage::Compute) {
+        tail = sizeof(workgroup_size) + sizeof(shared_memory_size);
+    } else {
+        tail = sizeof(sph);
+        if (stage == Shader::Stage::Geometry) {
+            tail += sizeof(gp_passthrough_mask);
+        }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            tail += sizeof(mesh_registers) + sizeof(mesh_primitive_header);
+        }
+    }
+    const std::streamoff position = file.tellg();
+    if (position < 0 || position > end) {
+        return std::nullopt;
+    }
+    u64 remaining = static_cast<u64>(end - position);
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (counts[i] > remaining / element_sizes[i]) {
+            return std::nullopt;
+        }
+        remaining -= counts[i] * element_sizes[i];
+    }
+    if (tail > remaining) {
+        return std::nullopt;
+    }
+    remaining -= tail;
+    file.seekg(end - static_cast<std::streamoff>(remaining));
+    return stage;
+}
+
 size_t FileEnvironment::MemorySize() const {
     const auto map_bytes = [](const auto& map) {
         return (map.bucket_count() + 1) *
@@ -1264,10 +1315,86 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+namespace {
+struct IndexedRecord {
+    std::streamoff end;
+    bool newest;
+};
+
+/// Finds where each record ends and whether a later record has the same key. Stops at a record
+/// cut short or damaged; the records from there on are read as without an index (the loader
+/// meets the damage as before).
+std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, std::ifstream& file,
+                                                std::streamoff end, PipelineRecordIndex& index) {
+    struct Scanned {
+        std::streamoff end;
+        u64 identity;
+        bool compute;
+    };
+    std::vector<Scanned> scanned;
+    const std::streamoff begin = file.tellg();
+    std::vector<char> key;
+    try {
+        while (static_cast<std::streamoff>(file.tellg()) != end && !stop_loading.stop_requested()) {
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs == 0) {
+                break;
+            }
+            std::optional<Shader::Stage> first_stage;
+            bool complete = true;
+            for (u32 env = 0; env < num_envs; ++env) {
+                const auto stage = FileEnvironment::Skip(file, end);
+                if (!stage) {
+                    complete = false;
+                    break;
+                }
+                if (!first_stage) {
+                    first_stage = stage;
+                }
+            }
+            if (!complete) {
+                break;
+            }
+            const bool compute = *first_stage == Shader::Stage::Compute;
+            key.resize(compute ? index.compute_key_size : index.graphics_key_size);
+            file.read(key.data(), static_cast<std::streamsize>(key.size()));
+            scanned.push_back({
+                .end = file.tellg(),
+                .identity = index.identify(std::span<const char>{key}, compute),
+                .compute = compute,
+            });
+        }
+    } catch (const std::ios_base::failure&) {
+    }
+    file.clear();
+    file.seekg(begin);
+
+    ::Common::unordered_map<u64, size_t> newest_compute;
+    ::Common::unordered_map<u64, size_t> newest_graphics;
+    for (size_t i = 0; i < scanned.size(); ++i) {
+        const Scanned& record = scanned[i];
+        (record.compute ? newest_compute : newest_graphics)[record.identity] = i;
+        ++(record.compute ? index.compute_records : index.graphics_records)[record.identity];
+    }
+    std::vector<IndexedRecord> records(scanned.size());
+    for (size_t i = 0; i < scanned.size(); ++i) {
+        const Scanned& record = scanned[i];
+        const auto& newest = record.compute ? newest_compute : newest_graphics;
+        records[i] = {.end = record.end, .newest = newest.at(record.identity) == i};
+        if (!records[i].newest) {
+            ++index.superseded;
+        }
+    }
+    return records;
+}
+} // Anonymous namespace
+
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) try {
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
+    PipelineRecordIndex* index) try {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -1296,10 +1423,20 @@ void LoadPipelines(
         }
         return;
     }
+    std::vector<IndexedRecord> records;
+    if (index) {
+        records = IndexPipelineRecords(stop_loading, file, end, *index);
+    }
+    size_t record = 0;
     while (file.tellg() != end) {
         if (stop_loading.stop_requested()) {
             return;
         }
+        if (record < records.size() && !records[record].newest) {
+            file.seekg(records[record++].end);
+            continue;
+        }
+        ++record;
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
         std::vector<FileEnvironment> envs(num_envs);

@@ -4,8 +4,10 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 
 #include <fmt/format.h>
 
@@ -91,5 +93,58 @@ inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
     }
     return true;
 }
+
+/// Which pipelines the transferable cache holds, so that a live build is appended only when the
+/// cache has no record for it, or when the stored capture failed to build (it lacks an answer
+/// the translation now asks for). Such a replacement follows the old record and is the one
+/// loaded later (LoadPipelines with a PipelineRecordIndex). Thread-safe: failures are noted by
+/// the boot and background build workers.
+class DiskPipelineRecords {
+public:
+    /// No replacement is written once a key has this many records (one that keeps failing does
+    /// not grow the file on every launch).
+    static constexpr u32 MaxRecordsPerKey = 4;
+
+    enum class Write { No, New, Replacement };
+
+    /// The cache holds `records` records for this key, of which the newest was loaded. False when
+    /// the key was noted already.
+    bool NoteStored(u64 key, u32 records) {
+        std::scoped_lock lock{mutex};
+        return keys.try_emplace(key, State{.records = records}).second;
+    }
+
+    /// The stored capture of this key failed to build.
+    void NoteFailed(u64 key) {
+        std::scoped_lock lock{mutex};
+        const auto it = keys.find(key);
+        if (it != keys.end() && it->second.records < MaxRecordsPerKey) {
+            it->second.failed = true;
+        }
+    }
+
+    /// A live build of this key succeeded: whether its capture is to be appended to the cache.
+    Write ClaimWrite(u64 key) {
+        std::scoped_lock lock{mutex};
+        const auto [it, inserted] = keys.try_emplace(key, State{.records = 1});
+        if (inserted) {
+            return Write::New;
+        }
+        if (!it->second.failed) {
+            return Write::No;
+        }
+        it->second.failed = false;
+        ++it->second.records;
+        return Write::Replacement;
+    }
+
+private:
+    struct State {
+        u32 records{};
+        bool failed{};
+    };
+    std::mutex mutex;
+    std::unordered_map<u64, State> keys;
+};
 
 } // namespace VideoCommon
