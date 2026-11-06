@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
+#include <initializer_list>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -18,11 +20,12 @@
 #include "video_core/nx2_hot_pages.h"
 
 // BufferCache::BindHostVertexBuffers runs HotEpochOrder's steps on the real memory tracker. These
-// tests run the same templates and tracker with a model of the rest: one vertex slot over one
-// page, its host buffer, and for a repacked slot the repacked copy the runtime assembles only when
-// the slot's dirty flag is set (vk_buffer_cache.cpp BindVertexBuffers). The model's steps mirror
-// BufferCache's (VertexBindSteps, SynchronizeBuffer's own epoch check, MarkVertexBuffersStale,
-// RefreshRepackedVertexBuffers); the Vulkan runtime and the rasterizer are not exercised.
+// tests run the same templates and tracker with a model of the rest: vertex slots over one page
+// each, their host buffer, and for a repacked slot the repacked copy the runtime assembles only
+// when the slot's dirty flag is set (vk_buffer_cache.cpp BindVertexBuffers). The model's steps
+// mirror BufferCache's (VertexBindSteps, SynchronizeBuffer's own epoch check,
+// MarkVertexBuffersStale, RefreshRepackedVertexBuffers); the Vulkan runtime and the rasterizer are
+// not exercised.
 
 namespace {
 
@@ -68,38 +71,48 @@ private:
 using MemoryTracker = VideoCommon::MemoryTrackerBase<RasterizerInterface>;
 
 struct HotPagesOn {
-    HotPagesOn() {
+    HotPagesOn() : previous{VideoCommon::Nx2HotPages::g_enabled} {
         VideoCommon::Nx2HotPages::g_enabled = true;
     }
     ~HotPagesOn() {
-        VideoCommon::Nx2HotPages::g_enabled = false;
+        VideoCommon::Nx2HotPages::g_enabled = previous;
     }
+    bool previous;
 };
 
-/// One vertex slot (index 0) over VERTEX_PAGE, bound once and never rebound.
+/// Vertex slots bound once and never rebound: slot i over the page at VERTEX_PAGE + i * PAGE.
 struct VertexModel {
-    struct Slot {};
+    struct Slot {
+        u32 index;
+    };
 
-    explicit VertexModel(bool repacked_) : repacked{repacked_} {
+    explicit VertexModel(std::initializer_list<bool> repacked_slots)
+        : repacked{repacked_slots}, dirty(repacked.size()),
+          repacked_copy(repacked.size(), std::vector<u8>(PAGE, 0)) {
         applied = VideoCommon::Nx2HotPages::g_epoch.load();
+    }
+
+    [[nodiscard]] static DAddr Page(u32 index) noexcept {
+        return VERTEX_PAGE + index * PAGE;
     }
 
     // HotEpochOrder steps (BufferCache::VertexBindSteps).
     void ApplyPendingHotEpoch() {
-        if (VideoCommon::HotEpochOrder::Pending(tracker, applied)) {
-            ApplyHotEpoch();
-        }
+        VideoCommon::HotEpochOrder::ApplyIfPending(tracker, applied, [this] { ApplyHotEpoch(); });
     }
     void RefreshRepackedVertexBuffers() {
-        if (std::exchange(stale, false) && repacked) {
-            dirty = true;
+        const u32 mask = std::exchange(stale, 0);
+        for (u32 index = 0; index < repacked.size(); ++index) {
+            if (((mask >> index) & 1) != 0 && repacked[index]) {
+                dirty[index] = true;
+            }
         }
     }
-    bool Synchronize(const Slot&) {
+    bool Synchronize(const Slot& slot) {
         // SynchronizeBuffer applies the epoch itself first.
         ApplyHotEpoch();
         bool uploaded = false;
-        tracker.ForEachUploadRange(VERTEX_PAGE, PAGE, [&](u64 addr, u64 size) {
+        tracker.ForEachUploadRange(Page(slot.index), PAGE, [&](u64 addr, u64 size) {
             const u64 offset = addr - VERTEX_PAGE;
             std::memcpy(host.data() + offset, guest.data() + offset, size);
             uploaded = true;
@@ -111,8 +124,8 @@ struct VertexModel {
     bool IsSynchronized(u32 index) const {
         return tracker.IsSynchronized(index);
     }
-    void WatchSynchronized(u32 index, const Slot&) {
-        tracker.WatchSynchronized(index, VERTEX_PAGE, PAGE);
+    void WatchSynchronized(u32 index, const Slot& slot) {
+        tracker.WatchSynchronized(index, Page(slot.index), PAGE);
     }
     void NoteSync() {}
     void NoteSkip() {
@@ -120,65 +133,112 @@ struct VertexModel {
     }
     void NoteMismatch() {}
 
-    // BufferCache::ApplyHotEpoch with MarkVertexBuffersStale for the one slot.
+    // BufferCache::ApplyHotEpoch with MarkVertexBuffersStale.
     void ApplyHotEpoch() {
         epochs_marked += VideoCommon::HotEpochOrder::Apply(tracker, applied, [&](u64 addr, u64 size) {
-            if (addr < VERTEX_PAGE + PAGE && VERTEX_PAGE < addr + size) {
-                stale = true;
+            for (u32 index = 0; index < repacked.size(); ++index) {
+                if (addr < Page(index) + PAGE && Page(index) < addr + size) {
+                    stale |= 1U << index;
+                    ever_stale |= 1U << index;
+                }
             }
         });
     }
 
-    /// BindHostVertexBuffers for the slot, then what the draw reads.
-    std::vector<u8> Draw(bool buffer_skip, bool verify = false) {
+    /// BindHostVertexBuffers' optimized loop. `before_slots` runs between the prologue and the
+    /// first slot (an epoch the front publishes while the back binds).
+    void Draw(bool buffer_skip, bool verify = false, const std::function<void()>& before_slots = {}) {
         VideoCommon::HotEpochOrder::PrepareVertexBindings(*this);
-        VideoCommon::HotEpochOrder::SynchronizeVertexBuffer(*this, 0, Slot{}, buffer_skip,
-                                                            verify);
-        if (dirty) {
-            dirty = false;
-            if (repacked) {
-                repacked_copy = host;
+        if (before_slots) {
+            before_slots();
+        }
+        for (u32 index = 0; index < repacked.size(); ++index) {
+            VideoCommon::HotEpochOrder::SynchronizeVertexBuffer(*this, index, Slot{index},
+                                                                buffer_skip, verify);
+            if (dirty[index]) {
+                dirty[index] = false;
+                if (repacked[index]) {
+                    const auto source = host.begin() + (Page(index) - VERTEX_PAGE);
+                    std::copy(source, source + PAGE, repacked_copy[index].begin());
+                }
             }
         }
-        return repacked ? repacked_copy : host;
     }
 
-    /// The guest rewrites the page; nothing traps a write to a hot page.
-    void GuestWrite(u8 value) {
-        std::ranges::fill(guest, value);
+    /// What the last draw read through slot `index`.
+    [[nodiscard]] std::vector<u8> Reads(u32 index) const {
+        if (repacked[index]) {
+            return repacked_copy[index];
+        }
+        const auto source = host.begin() + (Page(index) - VERTEX_PAGE);
+        return {source, source + PAGE};
+    }
+    /// The guest's bytes under slot `index`.
+    [[nodiscard]] std::vector<u8> Guest(u32 index) const {
+        const auto source = guest.begin() + (Page(index) - VERTEX_PAGE);
+        return {source, source + PAGE};
     }
 
-    /// The guest writes the page three times after its uploads: the third makes it hot
-    /// (memory_tracker.cpp MakeHot), then the guest publishes it, a draw binds the slot and
-    /// another one draws with it unchanged (the slot is clean, no stale bit left).
-    void BindHot(bool buffer_skip) {
+    /// The guest rewrites slot `index`'s page. Nothing traps a write to a hot page; a write to a
+    /// protected one marks it CPU-modified (`trapped`).
+    void GuestWrite(u32 index, u8 value, bool trapped = false) {
+        const auto begin = guest.begin() + (Page(index) - VERTEX_PAGE);
+        std::fill(begin, begin + PAGE, value);
+        if (trapped) {
+            tracker.MarkRegionAsCpuModified(Page(index), PAGE);
+        }
+    }
+
+    /// The guest writes slot `index`'s page three times after its uploads: the third makes it hot
+    /// (memory_tracker.cpp MakeHot).
+    void MakeHot(u32 index) {
         for (int i = 0; i < 4; ++i) {
             if (i != 0) {
-                tracker.MarkRegionAsCpuModified(VERTEX_PAGE + 8, 8);
+                tracker.MarkRegionAsCpuModified(Page(index) + 8, 8);
             }
-            tracker.ForEachUploadRange(VERTEX_PAGE, PAGE, [](u64, u64) {});
+            tracker.ForEachUploadRange(Page(index), PAGE, [](u64, u64) {});
         }
         REQUIRE(tracker.HasHotPages());
-        REQUIRE(rasterizer.Count(VERTEX_PAGE) == 0);
-        GuestWrite(0x11);
+        REQUIRE(rasterizer.Count(Page(index)) == 0);
+    }
+
+    /// Slots in `hot` are made hot, the others are uploaded once and stay protected. Then the
+    /// guest writes the hot ones and publishes them, a draw binds every slot and another one draws
+    /// with them unchanged (all clean, no stale bit left).
+    void BindHot(bool buffer_skip, u32 hot = 1) {
+        for (u32 index = 0; index < repacked.size(); ++index) {
+            if (((hot >> index) & 1) != 0) {
+                MakeHot(index);
+                GuestWrite(index, 0x11);
+            } else {
+                tracker.ForEachUploadRange(Page(index), PAGE, [](u64, u64) {});
+                REQUIRE(rasterizer.Count(Page(index)) == 1);
+            }
+        }
         VideoCommon::Nx2HotPages::BumpEpoch();
-        dirty = true; // a new binding
-        REQUIRE(Draw(buffer_skip) == guest);
-        REQUIRE(Draw(buffer_skip) == guest);
+        std::fill(dirty.begin(), dirty.end(), true); // new bindings
+        for (int draw = 0; draw < 2; ++draw) {
+            Draw(buffer_skip);
+            for (u32 index = 0; index < repacked.size(); ++index) {
+                REQUIRE(Reads(index) == Guest(index));
+            }
+        }
         REQUIRE_FALSE(VideoCommon::HotEpochOrder::Pending(tracker, applied));
-        REQUIRE_FALSE(stale);
-        REQUIRE_FALSE(dirty);
+        REQUIRE(stale == 0);
+        REQUIRE(std::find(dirty.begin(), dirty.end(), true) == dirty.end());
+        ever_stale = 0;
     }
 
     RasterizerInterface rasterizer;
     MemoryTracker tracker{rasterizer};
-    std::vector<u8> guest = std::vector<u8>(PAGE, 0);
-    std::vector<u8> host = std::vector<u8>(PAGE, 0);
-    std::vector<u8> repacked_copy = std::vector<u8>(PAGE, 0);
+    std::vector<bool> repacked;
+    std::vector<bool> dirty;
+    std::vector<std::vector<u8>> repacked_copy;
+    std::vector<u8> guest = std::vector<u8>(2 * PAGE, 0);
+    std::vector<u8> host = std::vector<u8>(2 * PAGE, 0);
     u64 applied{};
-    bool repacked{};
-    bool stale{};
-    bool dirty{};
+    u32 stale{};
+    u32 ever_stale{};
     u64 epochs_marked{};
     int syncs{};
     int uploads{};
@@ -194,15 +254,69 @@ TEST_CASE("HotEpochOrder: a repacked vertex slot on a rewritten hot page is reas
     model.BindHot(false);
 
     // Same bindings and layout: the dirty flag is clean until the epoch makes the slot stale.
-    model.GuestWrite(0x22);
+    model.GuestWrite(0, 0x22);
     VideoCommon::Nx2HotPages::BumpEpoch();
-    REQUIRE(model.Draw(false) == model.guest);
+    model.Draw(false);
+    REQUIRE(model.Reads(0) == model.Guest(0));
     REQUIRE(model.epochs_marked == 2);
 
     // No epoch, no write: nothing uploaded or reassembled.
     const int uploads = model.uploads;
-    REQUIRE(model.Draw(false) == model.guest);
+    model.Draw(false);
+    REQUIRE(model.Reads(0) == model.Guest(0));
     REQUIRE(model.uploads == uploads);
+}
+
+TEST_CASE("HotEpochOrder: a repacked slot on a hot page after a slot on a protected page",
+          "[video_core]") {
+    // Slot 0 on a protected page the guest also wrote, slot 1 repacked on the next page, hot.
+    // Before the fix slot 0's upload applied the epoch, after the refresh had read the stale bits.
+    HotPagesOn on;
+    for (const bool buffer_skip : {false, true}) {
+        VertexModel model{false, true};
+        model.BindHot(buffer_skip, 0b10);
+        const u64 marked = model.epochs_marked;
+
+        model.GuestWrite(0, 0x55, true);
+        model.GuestWrite(1, 0x66);
+        VideoCommon::Nx2HotPages::BumpEpoch();
+        model.Draw(buffer_skip);
+        REQUIRE(model.Reads(0) == model.Guest(0));
+        REQUIRE(model.Reads(1) == model.Guest(1));
+        REQUIRE(model.epochs_marked == marked + 1);
+        // The hot run covers slot 1's page only.
+        REQUIRE(model.ever_stale == 0b10);
+        REQUIRE(model.rasterizer.Count(VertexModel::Page(0)) == 1);
+        REQUIRE(model.rasterizer.Count(VertexModel::Page(1)) == 0);
+    }
+}
+
+TEST_CASE("HotEpochOrder: an epoch published while the slots bind is caught up by the next draw",
+          "[video_core]") {
+    // The prologue checks the epoch once. One bumped after it (the front thread, mid-bind) is
+    // applied by a later upload or the next draw's prologue: an accepted lag of one draw.
+    HotPagesOn on;
+    for (const bool repacked : {false, true}) {
+        for (const bool buffer_skip : {false, true}) {
+            VertexModel model{repacked};
+            model.BindHot(buffer_skip);
+            const auto old_bytes = model.Guest(0);
+
+            model.Draw(buffer_skip, false, [&] {
+                model.GuestWrite(0, 0x77);
+                VideoCommon::Nx2HotPages::BumpEpoch();
+            });
+            // Uploaded at once when the slot's upload runs and nothing is reassembled;
+            // otherwise this draw reads the bytes from before the epoch.
+            const bool at_once = !repacked && !buffer_skip;
+            REQUIRE(model.Reads(0) == (at_once ? model.Guest(0) : old_bytes));
+
+            model.Draw(buffer_skip);
+            REQUIRE(model.Reads(0) == model.Guest(0));
+            REQUIRE_FALSE(VideoCommon::HotEpochOrder::Pending(model.tracker, model.applied));
+            REQUIRE(model.stale == 0);
+        }
+    }
 }
 
 TEST_CASE("HotEpochOrder: EDEN_NX2_BUFFER_SKIP uploads a rewritten hot vertex page",
@@ -213,14 +327,16 @@ TEST_CASE("HotEpochOrder: EDEN_NX2_BUFFER_SKIP uploads a rewritten hot vertex pa
 
     // Synchronized and no epoch: the upload is skipped (the second draw of BindHot was too).
     const int syncs = model.syncs;
-    REQUIRE(model.Draw(true) == model.guest);
+    model.Draw(true);
+    REQUIRE(model.Reads(0) == model.Guest(0));
     REQUIRE(model.syncs == syncs);
     REQUIRE(model.skips == 2);
 
     // The guest rewrites it and publishes it: the epoch ends the synchronized range first.
-    model.GuestWrite(0x33);
+    model.GuestWrite(0, 0x33);
     VideoCommon::Nx2HotPages::BumpEpoch();
-    REQUIRE(model.Draw(true) == model.guest);
+    model.Draw(true);
+    REQUIRE(model.Reads(0) == model.Guest(0));
     REQUIRE(model.skips == 2);
     REQUIRE(model.IsSynchronized(0));
 }
@@ -236,7 +352,7 @@ TEST_CASE("HotEpochOrder: an epoch applied before the draw (fast draws) is not a
             const int uploads = model.uploads;
 
             // RasterizerVulkan::TakeReusableDraw applies a pending epoch before the draw.
-            model.GuestWrite(0x44);
+            model.GuestWrite(0, 0x44);
             VideoCommon::Nx2HotPages::BumpEpoch();
             REQUIRE(VideoCommon::HotEpochOrder::Pending(model.tracker, model.applied));
             model.ApplyHotEpoch();
@@ -244,7 +360,8 @@ TEST_CASE("HotEpochOrder: an epoch applied before the draw (fast draws) is not a
             REQUIRE_FALSE(VideoCommon::HotEpochOrder::Pending(model.tracker, model.applied));
 
             // The draw marks nothing more and uploads once.
-            REQUIRE(model.Draw(buffer_skip) == model.guest);
+            model.Draw(buffer_skip);
+            REQUIRE(model.Reads(0) == model.Guest(0));
             REQUIRE(model.epochs_marked == marked + 1);
             REQUIRE(model.uploads == uploads + 1);
         }
