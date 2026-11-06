@@ -372,6 +372,7 @@ private:
         u64 binding_mismatches{};
         /// Handle rechecks: delta draws by result; with verify, draws checked and mismatches.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::RecheckResult::Count)> rechecks{};
+        u64 handle_data_rechecks{}; ///< delta draws rechecking for handle data (not computed)
         u64 recheck_verified{};
         u64 recheck_predicted_full{};
         u64 recheck_mismatches{};

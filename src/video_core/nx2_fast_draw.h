@@ -79,9 +79,13 @@ inline bool SwitchOn(const char* name) {
 /// delta draws, which always recheck.
 inline const bool g_computed_delta = SwitchOn("EDEN_NX2_FAST_DRAW_COMPUTED");
 
+/// EDEN_NX2_FAST_DRAW_HANDLE_DATA=1: constant buffer data written over, or a bind of, a constant
+/// buffer the pipeline reads handles from makes the delta draw recheck instead of a full draw.
+inline const bool g_handle_data_delta = SwitchOn("EDEN_NX2_FAST_DRAW_HANDLE_DATA");
+
 /// Whether any delta draw can recheck handles (full draws then keep the raw handles).
 inline bool RechecksHandles() {
-    return g_computed_delta;
+    return g_computed_delta || g_handle_data_delta;
 }
 
 /// EDEN_NX2_BUFFER_SKIP=1: the buffer cache keeps vertex buffer lookups while their registers and

@@ -360,24 +360,38 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
         return full(FullDraw::DeltaPipeline);
     }
     const bool recheck = FastDraw::g_computed_delta && draw.pipeline->HasComputedHandles();
-    const auto& handles = draw.pipeline->HandleConstantBuffers();
-    for (size_t stage = 0; stage < handles.size(); ++stage) {
-        if ((delta.binds[stage] & handles[stage]) != 0) {
-            return full(FullDraw::HandleBind);
-        }
-        if (delta.num_writes == 0) {
-            continue;
-        }
-        const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
-        for (u32 mask = handles[stage]; mask != 0; mask &= mask - 1) {
-            const auto& cbuf = cbufs[std::countr_zero(mask)];
-            for (u32 write = 0; write < delta.num_writes; ++write) {
-                if (delta.write_begin[write] < cbuf.address + cbuf.size &&
-                    cbuf.address < delta.write_end[write]) {
-                    return full(FullDraw::HandleData);
+    const auto handles_touched = [&]() -> std::optional<FullDraw> {
+        const auto& handles = draw.pipeline->HandleConstantBuffers();
+        for (size_t stage = 0; stage < handles.size(); ++stage) {
+            if ((delta.binds[stage] & handles[stage]) != 0) {
+                return FullDraw::HandleBind;
+            }
+            if (delta.num_writes == 0) {
+                continue;
+            }
+            const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+            for (u32 mask = handles[stage]; mask != 0; mask &= mask - 1) {
+                const auto& cbuf = cbufs[std::countr_zero(mask)];
+                for (u32 write = 0; write < delta.num_writes; ++write) {
+                    if (delta.write_begin[write] < cbuf.address + cbuf.size &&
+                        cbuf.address < delta.write_end[write]) {
+                        return FullDraw::HandleData;
+                    }
                 }
             }
         }
+        return std::nullopt;
+    };
+    if (recheck && FastDraw::g_handle_data_delta) {
+        // The recheck reads every handle anyway.
+        return {draw.pipeline, true, delta.vertex_buffers, true};
+    }
+    if (const std::optional<FullDraw> touched = handles_touched()) {
+        if (!FastDraw::g_handle_data_delta) {
+            return full(*touched);
+        }
+        ++fast_draw_stats.handle_data_rechecks;
+        return {draw.pipeline, true, delta.vertex_buffers, true};
     }
     return {draw.pipeline, true, delta.vertex_buffers, recheck};
 }
@@ -493,12 +507,12 @@ void RasterizerVulkan::ReportFastDraws() {
         };
         LOG_INFO(Render_Vulkan,
                  "Fast draw handle rechecks per second: {:.0f} kept, {:.0f} resolved again, {:.0f} "
-                 "buffer handle changed | verify totals: {} checked, {} predicted full, {} "
-                 "mismatches",
+                 "buffer handle changed; {:.0f} rechecks for handle data | verify totals: {} checked, {} "
+                 "predicted full, {} mismatches",
                  rechecks(GraphicsPipeline::RecheckResult::Kept),
                  rechecks(GraphicsPipeline::RecheckResult::Resolved),
                  rechecks(GraphicsPipeline::RecheckResult::BufferHandleChanged),
-                 stats.recheck_verified, stats.recheck_predicted_full, stats.recheck_mismatches);
+                 static_cast<double>(stats.handle_data_rechecks) / seconds, stats.recheck_verified, stats.recheck_predicted_full, stats.recheck_mismatches);
     }
     static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
         ineligible_names{"indirect",       "mesh",          "not built",     "writes images",
