@@ -84,6 +84,11 @@ inline bool SwitchNotOff(const char* name) {
 inline const bool g_check_invalidated_handles =
     SwitchNotOff("EDEN_NX2_FAST_DRAW_CHECK_INVALIDATED");
 
+/// Handles computed from storage buffers can change without any 3D state change (a draw or a
+/// copy writing the storage): a reused draw of such a pipeline reads its handles again and is
+/// resolved in full if one changed. =0 reuses without looking.
+inline const bool g_check_reused_handles = SwitchNotOff("EDEN_NX2_FAST_DRAW_CHECK_REUSED");
+
 /// With EDEN_NX2_FAST_DRAW=2. A delta draw that rechecks handles reads every texture and image
 /// handle of the pipeline again and keeps the views and samplers of the unchanged ones; changed
 /// texture and image handles are resolved again, a changed texture buffer handle makes the draw

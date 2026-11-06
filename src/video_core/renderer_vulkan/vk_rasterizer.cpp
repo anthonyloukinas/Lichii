@@ -363,6 +363,10 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
         return false;
     };
     if (delta.Empty()) {
+        if (FastDraw::g_check_reused_handles && draw.pipeline->HasComputedHandles() &&
+            !check_handles(HandleCheck::ReusedComputed)) {
+            return full(FullDraw::HandlesChanged);
+        }
         return {draw.pipeline, false};
     }
     if (delta.vertex_input) {
