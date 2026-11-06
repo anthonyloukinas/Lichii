@@ -187,9 +187,11 @@ struct Delta {
     bool index_buffer{};
     bool vertex_buffers{};
     bool invalidated{};
+    bool vertex_input{}; ///< EDEN_NX2_FAST_DRAW_VERTEX_INPUT
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && !index_buffer && !vertex_buffers && !invalidated &&
+               !vertex_input &&
                (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
     }
 };
@@ -208,6 +210,21 @@ inline void NoteIndexBuffer(u32 method) {
 inline void NoteVertexBuffer(u32 method) {
     if (g_delta_enabled) {
         g_delta.vertex_buffers = true;
+    } else {
+        Break(Reason::Register, method);
+    }
+}
+
+/// EDEN_NX2_FAST_DRAW_VERTEX_INPUT=1 (with =2): a vertex stream's stride or enable, or a vertex
+/// attribute format, is a light change. The delta draw keeps the pipeline only while it uses
+/// dynamic vertex input and extended dynamic state, the attributes' type classes (the vertex
+/// part of its key) are the ones the last draw resolved with and no binding needs the 69-byte
+/// repack; it binds the vertex buffers again.
+inline const bool g_vertex_input_delta = SwitchOn("EDEN_NX2_FAST_DRAW_VERTEX_INPUT");
+
+inline void NoteVertexInput(u32 method) {
+    if (g_delta_enabled && g_vertex_input_delta) {
+        g_delta.vertex_input = true;
     } else {
         Break(Reason::Register, method);
     }

@@ -68,6 +68,7 @@
 #include "video_core/nx2_target_trace.h"
 #include "common/nx2_sample_profile.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -355,6 +356,14 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
     if (delta.Empty()) {
         return {draw.pipeline, false};
     }
+    if (delta.vertex_input) {
+        const auto& regs = maxwell3d->regs;
+        if (!draw.pipeline->HasDynamicVertexInput() || !draw.pipeline->UsesExtendedDynamicState() ||
+            VertexAttributeTypes(regs) != draw.attribute_types || VertexRepackMask(regs) != 0) {
+            return full(FullDraw::VertexInput);
+        }
+    }
+    const bool vertex_buffers = delta.vertex_buffers || delta.vertex_input;
     if (!draw.pipeline->TakesDeltaDraws()) {
         ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
         return full(FullDraw::DeltaPipeline);
@@ -384,16 +393,16 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
     };
     if (recheck && FastDraw::g_handle_data_delta) {
         // The recheck reads every handle anyway.
-        return {draw.pipeline, true, delta.vertex_buffers, true};
+        return {draw.pipeline, true, vertex_buffers, true, delta.vertex_input};
     }
     if (const std::optional<FullDraw> touched = handles_touched()) {
         if (!FastDraw::g_handle_data_delta) {
             return full(*touched);
         }
         ++fast_draw_stats.handle_data_rechecks;
-        return {draw.pipeline, true, delta.vertex_buffers, true};
+        return {draw.pipeline, true, vertex_buffers, true, delta.vertex_input};
     }
-    return {draw.pipeline, true, delta.vertex_buffers, recheck};
+    return {draw.pipeline, true, vertex_buffers, recheck, delta.vertex_input};
 }
 
 void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
@@ -439,6 +448,9 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
         .render_pass = scheduler.RenderPassSerial(),
         .topology = topology,
         .is_indexed = is_indexed,
+        .attribute_types = VideoCommon::Nx2FastDraw::g_vertex_input_delta
+                               ? VertexAttributeTypes(maxwell3d->regs)
+                               : 0,
     };
 }
 
@@ -493,14 +505,23 @@ void RasterizerVulkan::ReportFastDraws() {
              "draw, {:.0f} different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} "
              "render pass or pipeline changed, {:.0f} index buffer changed buffers, {:.0f} "
              "pipeline takes no delta draws, {:.0f} handle buffer bound, {:.0f} handle data "
-             "written, {:.0f} uniform buffers changed buffers, {:.0f} buffer handle changed",
+             "written, {:.0f} uniform buffers changed buffers, {:.0f} buffer handle changed, "
+             "{:.0f} vertex input change kept no pipeline",
              static_cast<double>(stats.reused) / seconds,
              static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
              per_second(FullDraw::IndexBuffers), per_second(FullDraw::DeltaPipeline),
              per_second(FullDraw::HandleBind), per_second(FullDraw::HandleData),
-             per_second(FullDraw::DeltaBuffers), per_second(FullDraw::HandlesChanged));
+             per_second(FullDraw::DeltaBuffers), per_second(FullDraw::HandlesChanged),
+             per_second(FullDraw::VertexInput));
+    if (VideoCommon::Nx2FastDraw::g_vertex_input_delta) {
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw vertex input per second: {:.0f} delta draws after a change | verify "
+                 "totals: {} checked, {} pipeline mismatches",
+                 static_cast<double>(stats.vertex_input_deltas) / seconds,
+                 stats.vertex_input_verified, stats.vertex_input_pipeline_mismatches);
+    }
     if (VideoCommon::Nx2FastDraw::RechecksHandles()) {
         const auto rechecks = [&](GraphicsPipeline::RecheckResult result) {
             return static_cast<double>(stats.rechecks[static_cast<size_t>(result)]) / seconds;
@@ -793,6 +814,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (verify_pipeline != nullptr) {
         ++fast_draw_stats.verified;
         fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
+        if (verify_take.vertex_input) {
+            ++fast_draw_stats.vertex_input_verified;
+            fast_draw_stats.vertex_input_pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
+        }
     }
     if (!pipeline) {
         report_failure("no pipeline");
@@ -855,6 +880,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         ++fast_draw_stats.reused;
     } else if (path == DrawPath::Delta) {
         ++fast_draw_stats.delta;
+        fast_draw_stats.vertex_input_deltas += take.vertex_input ? 1 : 0;
     } else {
         // update engine as channel may be different.
         pipeline->SetEngine(maxwell3d, gpu_memory);

@@ -395,6 +395,8 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         default:
             if (IsFastDrawVertexBuffer(method)) {
                 VideoCommon::Nx2FastDraw::NoteVertexBuffer(method);
+            } else if (IsFastDrawVertexInput(method)) {
+                VideoCommon::Nx2FastDraw::NoteVertexInput(method);
             } else {
                 VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
             }
@@ -496,6 +498,16 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
     constexpr u32 limit_words = sizeof(Regs::VertexStreamLimit) / sizeof(u32);
     return (method >= sizes && method < sizes + Regs::NumVertexArrays * 2) ||
            (method >= limits && method < limits + Regs::NumVertexArrays * limit_words);
+}
+
+bool Maxwell3D::IsFastDrawVertexInput(u32 method) {
+    constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
+    constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
+    if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
+        return (method - streams) % stream_words == 0; // stride and enable
+    }
+    constexpr u32 attributes = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    return method >= attributes && method < attributes + Regs::NumVertexAttributes;
 }
 
 bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {

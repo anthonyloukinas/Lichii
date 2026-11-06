@@ -3299,6 +3299,8 @@ public:
     /// Methods with side effects no draw binding depends on (EDEN_NX2_FAST_DRAW_NEUTRAL).
     static bool IsFastDrawNeutralMethod(u32 method);
     static bool IsFastDrawVertexBuffer(u32 method);
+    /// Vertex stream strides and enables, vertex attribute formats (EDEN_NX2_FAST_DRAW_VERTEX_INPUT).
+    static bool IsFastDrawVertexInput(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
 
     /// Handles a write to the CB_DATA[i] register.

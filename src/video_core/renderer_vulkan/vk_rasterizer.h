@@ -326,6 +326,7 @@ private:
         u64 render_pass{};
         Maxwell::PrimitiveTopology topology{};
         bool is_indexed{};
+        u64 attribute_types{}; ///< EDEN_NX2_FAST_DRAW_VERTEX_INPUT: VertexAttributeTypes then
     };
     enum class FullDraw : u8 {
         NoCandidate,
@@ -339,6 +340,7 @@ private:
         HandleData,
         DeltaBuffers,
         HandlesChanged,
+        VertexInput,
         Count,
     };
     /// Why a fully resolved draw can't be reused by the next one.
@@ -372,6 +374,9 @@ private:
         u64 binding_mismatches{};
         /// Handle rechecks: delta draws by result; with verify, draws checked and mismatches.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::RecheckResult::Count)> rechecks{};
+        u64 vertex_input_deltas{};
+        u64 vertex_input_verified{};
+        u64 vertex_input_pipeline_mismatches{};
         u64 handle_data_rechecks{}; ///< delta draws rechecking for handle data (not computed)
         u64 recheck_verified{};
         u64 recheck_predicted_full{};
@@ -390,6 +395,7 @@ private:
         bool delta{};                 ///< light changes since: ConfigureDelta
         bool vertex_buffers{};        ///< a delta draw binds the vertex buffers again
         bool recheck_handles{};       ///< a delta draw reads the handles again
+        bool vertex_input{};          ///< vertex input changed (vertex buffers bound again)
     };
     /// The pipeline the draw can reuse with what the previous draw bound, if any.
     ReusableTake TakeReusableDraw(bool is_indexed, bool is_indirect);
