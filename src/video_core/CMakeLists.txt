@@ -280,6 +280,7 @@ add_library(video_core STATIC
     surface.h
     texture_cache/accelerated_swizzle.cpp
     texture_cache/accelerated_swizzle.h
+    texture_cache/clear_coverage.h
     texture_cache/decode_bc.cpp
     texture_cache/decode_bc.h
     texture_cache/descriptor_table.h
