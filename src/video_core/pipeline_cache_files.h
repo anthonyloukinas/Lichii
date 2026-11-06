@@ -4,12 +4,17 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <utility>
 
 #include <fmt/format.h>
 
 #include "common/common_types.h"
+#include "common/unique_function.h"
 
 namespace VideoCommon {
 
@@ -91,5 +96,171 @@ inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
     }
     return true;
 }
+
+/// Whether a synchronous build (build_in_parallel false) gave a pipeline the driver accepted. A
+/// failed build still leaves its wrapper: graphics catches the failure in its build and reports
+/// Failed(); compute catches the driver's rejection and holds no handle (IsBound() false).
+template <typename Pipeline>
+[[nodiscard]] bool PipelineBuilt(const Pipeline* pipeline) {
+    if (pipeline == nullptr) {
+        return false;
+    }
+    if constexpr (requires { pipeline->Failed(); }) {
+        return pipeline->IsBuilt() && !pipeline->Failed();
+    } else {
+        return pipeline->IsBound();
+    }
+}
+
+/// Which pipelines the transferable cache holds, so that a live build is appended only when the
+/// cache has no record for it, or when the stored capture failed to build (it lacks an answer
+/// the translation now asks for). Such a replacement follows the old record and is the one
+/// loaded later (LoadPipelines with a PipelineRecordIndex). It is appended only if it builds as a
+/// later boot reads it back (AppendCheckedPipeline), so a capture that keeps failing is never
+/// written again, however many older records the key has. Thread-safe: stored captures are built
+/// by the boot and background workers while the GPU thread builds live. Keys are told apart by
+/// their own equality; KeyHash only looks them up.
+template <typename Key, typename KeyHash = std::hash<Key>>
+class DiskPipelineRecords {
+public:
+    /// Deferred: the stored capture is still being built; the live capture is kept and written
+    /// as a replacement if that build fails.
+    enum class Write { No, New, Replacement, Deferred };
+
+    /// Queues the write of a live capture (called once, with New or Replacement).
+    using Writer = Common::UniqueFunction<void, Write>;
+
+    /// A build of the stored capture of a key, from StartBuild. Finish reports its outcome; one
+    /// destroyed unfinished (cancelled, or never run because the GPU thread took the key first)
+    /// reports nothing about the capture.
+    class Build {
+    public:
+        Build() = default;
+        Build(DiskPipelineRecords* records_, const Key& key_) : records{records_}, key{key_} {}
+        Build(Build&& other) noexcept
+            : records{std::exchange(other.records, nullptr)}, key{other.key} {}
+        Build& operator=(Build&&) = delete;
+        Build(const Build&) = delete;
+        Build& operator=(const Build&) = delete;
+        ~Build() {
+            if (records) {
+                records->EndBuild(key, Outcome::Unknown);
+            }
+        }
+
+        /// built: the stored capture gave a pipeline. A failure runs a deferred live write.
+        void Finish(bool built) {
+            if (auto* const owner = std::exchange(records, nullptr)) {
+                owner->EndBuild(key, built ? Outcome::Built : Outcome::Failed);
+            }
+        }
+
+    private:
+        DiskPipelineRecords* records{};
+        Key key{};
+    };
+
+    /// The cache holds a record of this key (the newest was loaded). False when the key was noted
+    /// already.
+    bool NoteStored(const Key& key) {
+        std::scoped_lock lock{mutex};
+        return keys.try_emplace(key).second;
+    }
+
+    /// The stored capture of this key failed to build.
+    void NoteFailed(const Key& key) {
+        EndBuild(key, Outcome::Failed);
+    }
+
+    /// The stored capture of this key is about to be built on another thread.
+    [[nodiscard]] Build StartBuild(const Key& key) {
+        std::scoped_lock lock{mutex};
+        if (const auto it = keys.find(key); it != keys.end()) {
+            ++it->second.building;
+        }
+        return Build{this, key};
+    }
+
+    /// A live build of this key succeeded: whether its capture is to be appended to the cache.
+    /// New and Replacement: the caller runs writer. Deferred: writer was taken and runs if the
+    /// stored capture's build in flight fails (never on the calling thread's account, so the GPU
+    /// thread does not wait for it). One replacement per noted failure.
+    Write ClaimWrite(const Key& key, Writer& writer) {
+        std::scoped_lock lock{mutex};
+        const auto [it, inserted] = keys.try_emplace(key);
+        State& state = it->second;
+        if (inserted) {
+            return Write::New;
+        }
+        if (state.failed) {
+            state.failed = false;
+            return Write::Replacement;
+        }
+        if (state.building != 0 && !state.deferred && writer) {
+            state.deferred = std::move(writer);
+            return Write::Deferred;
+        }
+        return Write::No;
+    }
+
+    Write ClaimWrite(const Key& key) {
+        Writer none;
+        return ClaimWrite(key, none);
+    }
+
+    /// The write ClaimWrite granted stored nothing (the capture cannot be stored, or the file
+    /// failed): a later live build of the key may claim it again.
+    void ReturnWrite(const Key& key, Write write) {
+        std::scoped_lock lock{mutex};
+        if (write == Write::New) {
+            keys.erase(key);
+        } else if (write == Write::Replacement) {
+            const auto it = keys.find(key);
+            if (it != keys.end()) {
+                it->second.failed = true;
+            }
+        }
+    }
+
+private:
+    enum class Outcome { Unknown, Built, Failed };
+
+    void EndBuild(const Key& key, Outcome outcome) {
+        Writer writer;
+        {
+            std::scoped_lock lock{mutex};
+            const auto it = keys.find(key);
+            if (it == keys.end()) {
+                return;
+            }
+            State& state = it->second;
+            if (state.building != 0) {
+                --state.building;
+            }
+            if (outcome == Outcome::Failed) {
+                if (state.deferred) {
+                    writer = std::move(state.deferred);
+                } else {
+                    state.failed = true;
+                }
+            }
+            if (state.building == 0) {
+                // Built, or not built at all: the live capture is not needed.
+                state.deferred = {};
+            }
+        }
+        if (writer) {
+            writer(Write::Replacement);
+        }
+    }
+
+    struct State {
+        u32 building{};
+        bool failed{};
+        Writer deferred;
+    };
+    std::mutex mutex;
+    std::unordered_map<Key, State, KeyHash> keys;
+};
 
 } // namespace VideoCommon

@@ -67,6 +67,8 @@ struct BuiltinPatch {
     std::string_view superseded_by{};
     /// Read once at startup; false skips the patch whatever the Add-Ons say.
     bool (*environment_allows)() = nullptr;
+    /// The setting that makes environment_allows false, as Add-Ons names it.
+    std::string_view environment_switch{};
 };
 
 constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
@@ -139,6 +141,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = REAL_TIME_RECORDS,
         .environment_allows = Service::Nx2OotTime::RealTimeFromEnv,
+        .environment_switch = "EDEN_NX2_OOT_REAL_TIME=0",
     },
     // Hooks the same instruction as Real-time speed, which keeps the game at real speed down to
     // 15 fps instead of 20 and measures host time, unaffected by the CPU clock settings.
@@ -1458,6 +1461,73 @@ PatchManager::Metadata PatchManager::ParseControlNCA(const NCA& nca) const {
         return metadata;
     const FileSys::PatchManager pm_update{FileSys::GetUpdateTitleID(application_id), system.GetFileSystemController(), system.GetContentProvider()};
     return pm_update.GetControlMetadata();
+}
+
+std::vector<std::string> ConflictingBuiltinPatches(u64 title_id, std::string_view name) {
+    const auto patch = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& candidate) {
+        return candidate.title_id == title_id && candidate.name == name;
+    });
+    if (patch == BUILTIN_PATCHES.end()) {
+        return {};
+    }
+    const auto overlaps = [](const BuiltinPatchRecord& a, const BuiltinPatchRecord& b) {
+        return a.module_offset < b.module_offset + b.bytes.size() &&
+               b.module_offset < a.module_offset + a.bytes.size();
+    };
+    std::vector<std::string> conflicts;
+    for (const auto& other : BUILTIN_PATCHES) {
+        if (&other == &*patch || other.title_id != title_id || other.module != patch->module ||
+            other.build_id != patch->build_id) {
+            continue;
+        }
+        const bool conflict = std::ranges::any_of(patch->records, [&](const auto& record) {
+            return std::ranges::any_of(other.records, [&](const auto& theirs) {
+                return overlaps(record, theirs);
+            });
+        });
+        if (conflict) {
+            conflicts.emplace_back(other.name);
+        }
+    }
+    return conflicts;
+}
+
+void KeepSupersededBuiltinEntries(u64 title_id, std::vector<std::string>& disabled,
+                                  const std::vector<std::string>& previous) {
+    const auto contains = [](const std::vector<std::string>& names, std::string_view name) {
+        return std::ranges::find(names, name) != names.end();
+    };
+    for (const auto& patch : BUILTIN_PATCHES) {
+        if (patch.title_id != title_id || patch.superseded_by.empty() ||
+            contains(disabled, patch.superseded_by)) {
+            continue;
+        }
+        std::erase(disabled, patch.name);
+        if (contains(previous, patch.name)) {
+            disabled.emplace_back(patch.name);
+        }
+    }
+}
+
+std::string BuiltinPatchEnvironmentNote(u64 title_id, std::string_view name,
+                                        std::optional<bool> environment_allows) {
+    const auto patch = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& candidate) {
+        return candidate.title_id == title_id && candidate.name == name;
+    });
+    if (patch == BUILTIN_PATCHES.end() || patch->environment_allows == nullptr ||
+        environment_allows.value_or(patch->environment_allows())) {
+        return {};
+    }
+    std::string note = fmt::format("Not applied: {} is set for this session, which turns it off "
+                                   "whatever this list says.",
+                                   patch->environment_switch);
+    for (const auto& other : BUILTIN_PATCHES) {
+        if (other.title_id == title_id && other.superseded_by == name) {
+            note += fmt::format(" \"{}\" does not apply either while this entry is ticked.",
+                                other.name);
+        }
+    }
+    return note;
 }
 
 } // namespace FileSys

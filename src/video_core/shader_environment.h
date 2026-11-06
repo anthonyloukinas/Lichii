@@ -6,14 +6,19 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
+#include <functional>
+#include <ios>
 #include <iosfwd>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -224,6 +229,10 @@ public:
 
     void Deserialize(std::ifstream& file);
 
+    /// Moves past one environment in the layout Deserialize reads and returns its stage, or
+    /// nullopt when it would end past `end`.
+    static std::optional<Shader::Stage> Skip(std::ifstream& file, std::streamoff end);
+
     [[nodiscard]] size_t MemorySize() const;
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
@@ -282,18 +291,93 @@ private:
     u32 viewport_transform_state = 1;
 };
 
-void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+/// Appends a record. True only once it is complete on disk (flushed and closed without error).
+/// False when nothing was written: an environment cannot be stored, or the write failed (the file
+/// is then cut back to its earlier records).
+bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version);
 
 template <typename Key, typename Envs>
     requires std::is_trivially_copyable_v<Key>
         && std::has_unique_object_representations_v<Key>
-void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename, u32 cache_version) {
-    SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
+bool SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename, u32 cache_version) {
+    return SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
 }
 
+/// Result of AppendCheckedPipeline.
+enum class CheckedWrite {
+    Written,         ///< The record was appended.
+    NotSerializable, ///< An environment cannot be stored; nothing was written.
+    Rejected,        ///< check refused the capture as read back; nothing was appended.
+    Failed,          ///< Writing or reading back failed; the cache keeps its earlier records.
+};
+
+/// Appends a record like SerializePipeline, but only after reading it back from a scratch file
+/// beside the cache and passing the environments as a later boot would load them to check.
+CheckedWrite AppendCheckedPipeline(std::span<const char> key,
+                                   std::span<const GenericEnvironment* const> envs,
+                                   const std::filesystem::path& filename, u32 cache_version,
+                                   Common::UniqueFunction<bool, std::span<FileEnvironment>> check);
+
+template <typename Key, typename Envs>
+    requires std::is_trivially_copyable_v<Key> && std::has_unique_object_representations_v<Key>
+CheckedWrite AppendCheckedPipeline(const Key& key, const Envs& envs,
+                                   const std::filesystem::path& filename, u32 cache_version,
+                                   Common::UniqueFunction<bool, std::span<FileEnvironment>> check) {
+    return AppendCheckedPipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)),
+                                 std::span(envs.data(), envs.size()), filename, cache_version,
+                                 std::move(check));
+}
+
+/// Newest-record-wins loading. The pipeline cache is append-only: a capture written again after
+/// the stored one failed to build follows it in the file, so of the records with the same key
+/// only the last one is loaded.
+struct PipelineRecordIndex {
+    /// The part of a stored key that decides equality (graphics keys compare only their first
+    /// Size() bytes, compute keys all of them), and the hash it is looked up by. Records are told
+    /// apart by those bytes; equal hashes alone never merge two keys.
+    struct Identity {
+        u64 hash;
+        size_t size;
+    };
+    struct RecordKey {
+        u64 hash;
+        std::string bytes;
+        bool operator==(const RecordKey&) const = default;
+    };
+    struct RecordKeyHash {
+        size_t operator()(const RecordKey& key) const noexcept {
+            return static_cast<size_t>(key.hash);
+        }
+    };
+
+    size_t compute_key_size{};
+    size_t graphics_key_size{};
+    /// compute is true for the key of a compute record.
+    std::function<Identity(std::span<const char> key, bool compute)> identify;
+
+    /// Filled by LoadPipelines: the records stored per key, and how many older records it
+    /// skipped for a newer one.
+    std::unordered_map<RecordKey, u32, RecordKeyHash> compute_records;
+    std::unordered_map<RecordKey, u32, RecordKeyHash> graphics_records;
+    size_t superseded{};
+
+    [[nodiscard]] RecordKey Key(std::span<const char> key, bool compute) const {
+        const Identity identity = identify(key, compute);
+        return {identity.hash, std::string(key.data(), std::min(identity.size, key.size()))};
+    }
+
+    [[nodiscard]] u32 Records(std::span<const char> key, bool compute) const {
+        const auto& records = compute ? compute_records : graphics_records;
+        const auto it = records.find(Key(key, compute));
+        return it == records.end() ? 1 : it->second;
+    }
+};
+
+/// With an index, a record whose key is stored again later in the file is skipped.
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
+    PipelineRecordIndex* index = nullptr);
 
 } // namespace VideoCommon

@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -128,5 +130,24 @@ private:
     const Service::FileSystem::FileSystemController& fs_controller;
     const ContentProvider& content_provider;
 };
+
+/// The built-in patches that write the same code as this one (same module and build), so at most
+/// one of them can apply: ticking one in Add-Ons unticks these.
+[[nodiscard]] std::vector<std::string> ConflictingBuiltinPatches(u64 title_id,
+                                                                 std::string_view name);
+
+/// Adjusts the disabled Add-Ons built from the Add-Ons list, where every unticked entry is
+/// disabled. A built-in that another built-in supersedes applies only while that one is
+/// disabled, so while it stays enabled the superseded entry keeps what `previous` said instead of
+/// becoming an explicit disable (which would decide what happens when the other is disabled).
+void KeepSupersededBuiltinEntries(u64 title_id, std::vector<std::string>& disabled,
+                                  const std::vector<std::string>& previous);
+
+/// Why a built-in patch does not apply in this session although Add-Ons may list it ticked: its
+/// environment switch is off (EDEN_NX2_OOT_REAL_TIME=0 for Real-time speed). Empty when the
+/// switch allows it. Shown on its Add-Ons row only; the saved choice is not changed.
+/// environment_allows replaces the switch's reading (tests).
+[[nodiscard]] std::string BuiltinPatchEnvironmentNote(
+    u64 title_id, std::string_view name, std::optional<bool> environment_allows = std::nullopt);
 
 } // namespace FileSys

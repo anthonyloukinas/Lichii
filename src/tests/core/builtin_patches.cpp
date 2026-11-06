@@ -447,3 +447,178 @@ TEST_CASE("Built-in Real-time speed and Dynamic FPS never both apply", "[patch_m
         REQUIRE(ModuleWord(patched, 0x3C461E0) == 0);
     }
 }
+
+namespace {
+
+// The desktop Add-Ons dialog (configure_per_game_addons.cpp) without Qt: one checkbox per listed
+// add-on, ticked as LoadConfiguration ticks it; ticking one unticks the built-ins that write the
+// same code; applying disables every unticked entry, then keeps superseded built-in entries.
+class AddonsDialog {
+public:
+    explicit AddonsDialog(const FileSys::PatchManager& manager) {
+        const auto& disabled = Settings::values.disabled_addons[OcarinaTitleId];
+        for (const auto& patch : manager.GetPatches()) {
+            const bool listed_disabled = std::ranges::find(disabled, patch.name) != disabled.end();
+            const bool is_mod = patch.type == FileSys::PatchType::Mod;
+            items.emplace_back(patch.name, !listed_disabled && (!is_mod || patch.enabled));
+        }
+    }
+
+    bool Ticked(std::string_view name) {
+        return Item(name);
+    }
+
+    void Tick(std::string_view name, bool ticked) {
+        Item(name) = ticked;
+        if (!ticked) {
+            return;
+        }
+        for (const auto& other : FileSys::ConflictingBuiltinPatches(OcarinaTitleId, name)) {
+            Item(other) = false;
+        }
+    }
+
+    void Apply() {
+        std::vector<std::string> disabled;
+        for (const auto& [name, ticked] : items) {
+            if (!ticked) {
+                disabled.push_back(name);
+            }
+        }
+        auto& saved = Settings::values.disabled_addons[OcarinaTitleId];
+        FileSys::KeepSupersededBuiltinEntries(OcarinaTitleId, disabled, saved);
+        saved = disabled;
+    }
+
+private:
+    bool& Item(std::string_view name) {
+        const auto it = std::ranges::find(items, name, &std::pair<std::string, bool>::first);
+        REQUIRE(it != items.end());
+        return it->second;
+    }
+
+    std::vector<std::pair<std::string, bool>> items;
+};
+
+enum class SpeedPatch { None, RealTime, DynamicFps };
+
+SpeedPatch AppliedSpeedPatch(const FileSys::PatchManager& manager) {
+    const u32 word = WordAt(manager.PatchNSO(MakeDynamicMain(), "main"), DynamicCallOffset);
+    if (word == 0x14D57D48) {
+        return SpeedPatch::RealTime;
+    }
+    REQUIRE((word == DynamicCallInstruction || word == DynamicOriginalInstruction));
+    return word == DynamicCallInstruction ? SpeedPatch::DynamicFps : SpeedPatch::None;
+}
+
+bool SavedDisabled(std::string_view name) {
+    const auto& saved = Settings::values.disabled_addons[OcarinaTitleId];
+    return std::ranges::find(saved, name) != saved.end();
+}
+
+} // Anonymous namespace
+
+TEST_CASE("Real-time speed and Dynamic FPS write the same code and exclude each other",
+          "[patch_manager][addons]") {
+    REQUIRE(FileSys::ConflictingBuiltinPatches(OcarinaTitleId, RealTime) ==
+            std::vector<std::string>{std::string{DynamicFps}});
+    REQUIRE(FileSys::ConflictingBuiltinPatches(OcarinaTitleId, DynamicFps) ==
+            std::vector<std::string>{std::string{RealTime}});
+    REQUIRE(FileSys::ConflictingBuiltinPatches(OcarinaTitleId, MaxResolution).empty());
+    REQUIRE(FileSys::ConflictingBuiltinPatches(OtherTitleId, RealTime).empty());
+    REQUIRE(FileSys::ConflictingBuiltinPatches(OcarinaTitleId, "UserMod").empty());
+}
+
+TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only real choices",
+          "[patch_manager][addons]") {
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+
+    // Defaults: Real-time speed ticked, Dynamic FPS unticked, and saving changes nothing.
+    {
+        AddonsDialog dialog{manager};
+        REQUIRE(dialog.Ticked(RealTime));
+        REQUIRE_FALSE(dialog.Ticked(DynamicFps));
+        REQUIRE(dialog.Ticked(MaxResolution));
+        dialog.Apply();
+        REQUIRE(Settings::values.disabled_addons[OcarinaTitleId].empty());
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::RealTime);
+    }
+    // Ticking Dynamic FPS unticks Real-time speed.
+    {
+        AddonsDialog dialog{manager};
+        dialog.Tick(DynamicFps, true);
+        REQUIRE_FALSE(dialog.Ticked(RealTime));
+        dialog.Apply();
+        REQUIRE(SavedDisabled(RealTime));
+        REQUIRE_FALSE(SavedDisabled(DynamicFps));
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::DynamicFps);
+    }
+    // ...and ticking Real-time speed again unticks Dynamic FPS without saving it as disabled.
+    {
+        AddonsDialog dialog{manager};
+        REQUIRE_FALSE(dialog.Ticked(RealTime));
+        REQUIRE(dialog.Ticked(DynamicFps));
+        dialog.Tick(RealTime, true);
+        REQUIRE_FALSE(dialog.Ticked(DynamicFps));
+        dialog.Apply();
+        REQUIRE(Settings::values.disabled_addons[OcarinaTitleId].empty());
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::RealTime);
+    }
+    // Both unticked: neither applies, and the list shows both unticked again.
+    {
+        AddonsDialog dialog{manager};
+        dialog.Tick(RealTime, false);
+        dialog.Apply();
+        REQUIRE(SavedDisabled(RealTime));
+        REQUIRE(SavedDisabled(DynamicFps));
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::None);
+        AddonsDialog reloaded{manager};
+        REQUIRE_FALSE(reloaded.Ticked(RealTime));
+        REQUIRE_FALSE(reloaded.Ticked(DynamicFps));
+        reloaded.Tick(DynamicFps, true);
+        reloaded.Apply();
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::DynamicFps);
+    }
+    // An explicit Dynamic FPS disable saved earlier survives while Real-time speed is enabled.
+    {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
+        AddonsDialog dialog{manager};
+        REQUIRE(dialog.Ticked(RealTime));
+        REQUIRE_FALSE(dialog.Ticked(DynamicFps));
+        dialog.Apply();
+        REQUIRE(Settings::values.disabled_addons[OcarinaTitleId] ==
+                std::vector<std::string>{std::string{DynamicFps}});
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::RealTime);
+        AddonsDialog unticked{manager};
+        unticked.Tick(RealTime, false);
+        unticked.Apply();
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::None);
+    }
+}
+
+TEST_CASE("Add-Ons says when the environment switch turns Real-time speed off",
+          "[patch_manager][addons]") {
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    Settings::values.disabled_addons[OcarinaTitleId] = {};
+
+    // EDEN_NX2_OOT_REAL_TIME=0: the row stays ticked as saved, and it says neither speed patch
+    // applies.
+    const auto note = FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, RealTime, false);
+    REQUIRE(note.find("EDEN_NX2_OOT_REAL_TIME=0") != std::string::npos);
+    REQUIRE(note.find(DynamicFps) != std::string::npos);
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, DynamicFps, false).empty());
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, MaxResolution, false).empty());
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OtherTitleId, RealTime, false).empty());
+    // Switch on (also how the tests run): no note.
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, RealTime, true).empty());
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, RealTime).empty());
+
+    // Opening and applying the list with the note shown saves nothing new.
+    AddonsDialog dialog{manager};
+    REQUIRE(dialog.Ticked(RealTime));
+    REQUIRE_FALSE(dialog.Ticked(DynamicFps));
+    dialog.Apply();
+    REQUIRE(Settings::values.disabled_addons[OcarinaTitleId].empty());
+}

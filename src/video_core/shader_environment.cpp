@@ -1125,6 +1125,57 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
+std::optional<Shader::Stage> FileEnvironment::Skip(std::ifstream& file, std::streamoff end) {
+    // code size, then the entry counts of the five maps, in Deserialize's order
+    std::array<u64, 6> counts{};
+    file.read(reinterpret_cast<char*>(counts.data()), sizeof(counts));
+    file.seekg(sizeof(local_memory_size) + sizeof(texture_bound) + sizeof(start_address) +
+                   sizeof(read_lowest) + sizeof(read_highest) + sizeof(viewport_transform_state),
+               std::ios::cur);
+    Shader::Stage stage{};
+    file.read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    const auto entry_size = []<typename Map>(std::type_identity<Map>) -> u64 {
+        return sizeof(typename Map::key_type) + sizeof(typename Map::mapped_type);
+    };
+    const std::array<u64, 6> element_sizes{
+        1,
+        entry_size(std::type_identity<decltype(texture_types)>{}),
+        entry_size(std::type_identity<decltype(texture_pixel_formats)>{}),
+        entry_size(std::type_identity<decltype(cbuf_values)>{}),
+        entry_size(std::type_identity<decltype(storage_pointer_types)>{}),
+        entry_size(std::type_identity<decltype(cbuf_replacements)>{}),
+    };
+    u64 tail = 0;
+    if (stage == Shader::Stage::Compute) {
+        tail = sizeof(workgroup_size) + sizeof(shared_memory_size);
+    } else {
+        tail = sizeof(sph);
+        if (stage == Shader::Stage::Geometry) {
+            tail += sizeof(gp_passthrough_mask);
+        }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            tail += sizeof(mesh_registers) + sizeof(mesh_primitive_header);
+        }
+    }
+    const std::streamoff position = file.tellg();
+    if (position < 0 || position > end) {
+        return std::nullopt;
+    }
+    u64 remaining = static_cast<u64>(end - position);
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (counts[i] > remaining / element_sizes[i]) {
+            return std::nullopt;
+        }
+        remaining -= counts[i] * element_sizes[i];
+    }
+    if (tail > remaining) {
+        return std::nullopt;
+    }
+    remaining -= tail;
+    file.seekg(end - static_cast<std::streamoff>(remaining));
+    return stage;
+}
+
 size_t FileEnvironment::MemorySize() const {
     const auto map_bytes = [](const auto& map) {
         return (map.bucket_count() + 1) *
@@ -1232,42 +1283,221 @@ std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u3
     return it->second;
 }
 
-void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
-                       const std::filesystem::path& filename, u32 cache_version) try {
+namespace {
+/// Appends one record (and the header to a new file), entirely or not at all: the write counts
+/// only once the stream has been flushed and closed without error. On a failure the file is cut
+/// back to its length before the append, so its earlier records stay loadable; a new file is
+/// removed. Only if cutting back fails is the file removed, as before (the loader would discard
+/// it for the damaged tail anyway).
+template <typename WriteRecord>
+bool AppendRecord(const std::filesystem::path& filename, u32 cache_version,
+                  WriteRecord&& write_record) {
     std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
-    file.exceptions(std::ifstream::failbit);
     if (!file.is_open()) {
         LOG_ERROR(Common_Filesystem, "Failed to open pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
-        return;
+        return false;
     }
-    if (file.tellp() == 0) {
-        // Write header
-        file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
-            .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+    const std::streamoff start = file.tellp();
+    if (start < 0) {
+        return false;
     }
-    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
-        return;
+    try {
+        file.exceptions(std::ios::failbit | std::ios::badbit);
+        if (start == 0) {
+            file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+        }
+        write_record(file);
+        file.flush();
+        file.close();
+        return true;
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "Writing to pipeline cache file {} failed: {}",
+                  Common::FS::PathToUTF8String(filename), e.what());
     }
-    const u32 num_envs{static_cast<u32>(envs.size())};
-    file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
-    for (const GenericEnvironment* const env : envs) {
-        env->Serialize(file);
+    // Drop what is still buffered before cutting back.
+    file.exceptions(std::ios::goodbit);
+    file.close();
+    std::error_code error;
+    if (start == 0) {
+        std::filesystem::remove(filename, error);
+    } else {
+        std::filesystem::resize_file(filename, static_cast<std::uintmax_t>(start), error);
     }
-    file.write(key.data(), key.size_bytes());
-
-} catch (const std::ios_base::failure& e) {
-    LOG_ERROR(Common_Filesystem, "{}", e.what());
-    if (!Common::FS::RemoveFile(filename)) {
-        LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
-                  Common::FS::PathToUTF8String(filename));
+    if (error) {
+        LOG_ERROR(Common_Filesystem, "Failed to restore pipeline cache file {}: {}",
+                  Common::FS::PathToUTF8String(filename), error.message());
+        if (!Common::FS::RemoveFile(filename)) {
+            LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+                      Common::FS::PathToUTF8String(filename));
+        }
     }
+    return false;
 }
+} // Anonymous namespace
+
+bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+                       const std::filesystem::path& filename, u32 cache_version) {
+    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        return false;
+    }
+    return AppendRecord(filename, cache_version, [&](std::ofstream& file) {
+        const u32 num_envs{static_cast<u32>(envs.size())};
+        file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
+        for (const GenericEnvironment* const env : envs) {
+            env->Serialize(file);
+        }
+        file.write(key.data(), key.size_bytes());
+    });
+}
+
+CheckedWrite AppendCheckedPipeline(std::span<const char> key,
+                                   std::span<const GenericEnvironment* const> envs,
+                                   const std::filesystem::path& filename, u32 cache_version,
+                                   Common::UniqueFunction<bool, std::span<FileEnvironment>> check) {
+    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        return CheckedWrite::NotSerializable;
+    }
+    constexpr std::streamoff header_size = sizeof(MAGIC_NUMBER) + sizeof(u32);
+    auto scratch = filename;
+    scratch += ".candidate";
+    std::error_code error;
+    std::filesystem::remove(scratch, error);
+    if (!SerializePipeline(key, envs, scratch, cache_version)) {
+        std::filesystem::remove(scratch, error);
+        return CheckedWrite::Failed;
+    }
+
+    std::string record;
+    std::vector<FileEnvironment> loaded;
+    try {
+        std::ifstream file(scratch, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            return CheckedWrite::Failed;
+        }
+        file.exceptions(std::ifstream::failbit);
+        const std::streamoff end = file.tellg();
+        if (end <= header_size) {
+            file.close();
+            std::filesystem::remove(scratch, error);
+            return CheckedWrite::Failed;
+        }
+        record.resize(static_cast<size_t>(end - header_size));
+        file.seekg(header_size);
+        file.read(record.data(), static_cast<std::streamsize>(record.size()));
+        file.seekg(header_size);
+        u32 num_envs{};
+        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+        loaded.resize(num_envs);
+        for (FileEnvironment& env : loaded) {
+            env.Deserialize(file);
+        }
+        std::string stored_key(key.size(), '\0');
+        file.read(stored_key.data(), static_cast<std::streamsize>(stored_key.size()));
+        if (num_envs != envs.size() || static_cast<std::streamoff>(file.tellg()) != end ||
+            !std::ranges::equal(stored_key, key)) {
+            file.close();
+            std::filesystem::remove(scratch, error);
+            return CheckedWrite::Failed;
+        }
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "{}", e.what());
+        std::filesystem::remove(scratch, error);
+        return CheckedWrite::Failed;
+    }
+    std::filesystem::remove(scratch, error);
+    if (!check(std::span<FileEnvironment>{loaded})) {
+        return CheckedWrite::Rejected;
+    }
+    const bool written = AppendRecord(filename, cache_version, [&](std::ofstream& file) {
+        file.write(record.data(), static_cast<std::streamsize>(record.size()));
+    });
+    return written ? CheckedWrite::Written : CheckedWrite::Failed;
+}
+
+namespace {
+struct IndexedRecord {
+    std::streamoff end;
+    bool newest;
+};
+
+/// Finds where each record ends and whether a later record has the same key. Stops at a record
+/// cut short or damaged; the records from there on are read as without an index (the loader
+/// meets the damage as before).
+std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, std::ifstream& file,
+                                                std::streamoff end, PipelineRecordIndex& index) {
+    struct Scanned {
+        std::streamoff end;
+        PipelineRecordIndex::RecordKey key;
+        bool compute;
+    };
+    std::vector<Scanned> scanned;
+    const std::streamoff begin = file.tellg();
+    std::vector<char> key;
+    try {
+        while (static_cast<std::streamoff>(file.tellg()) != end && !stop_loading.stop_requested()) {
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs == 0) {
+                break;
+            }
+            std::optional<Shader::Stage> first_stage;
+            bool complete = true;
+            for (u32 env = 0; env < num_envs; ++env) {
+                const auto stage = FileEnvironment::Skip(file, end);
+                if (!stage) {
+                    complete = false;
+                    break;
+                }
+                if (!first_stage) {
+                    first_stage = stage;
+                }
+            }
+            if (!complete) {
+                break;
+            }
+            const bool compute = *first_stage == Shader::Stage::Compute;
+            key.resize(compute ? index.compute_key_size : index.graphics_key_size);
+            file.read(key.data(), static_cast<std::streamsize>(key.size()));
+            scanned.push_back({
+                .end = file.tellg(),
+                .key = index.Key(std::span<const char>{key}, compute),
+                .compute = compute,
+            });
+        }
+    } catch (const std::ios_base::failure&) {
+    }
+    file.clear();
+    file.seekg(begin);
+
+    using Newest = std::unordered_map<PipelineRecordIndex::RecordKey, size_t,
+                                      PipelineRecordIndex::RecordKeyHash>;
+    Newest newest_compute;
+    Newest newest_graphics;
+    for (size_t i = 0; i < scanned.size(); ++i) {
+        const Scanned& record = scanned[i];
+        (record.compute ? newest_compute : newest_graphics)[record.key] = i;
+        ++(record.compute ? index.compute_records : index.graphics_records)[record.key];
+    }
+    std::vector<IndexedRecord> records(scanned.size());
+    for (size_t i = 0; i < scanned.size(); ++i) {
+        const Scanned& record = scanned[i];
+        const auto& newest = record.compute ? newest_compute : newest_graphics;
+        records[i] = {.end = record.end, .newest = newest.at(record.key) == i};
+        if (!records[i].newest) {
+            ++index.superseded;
+        }
+    }
+    return records;
+}
+} // Anonymous namespace
 
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) try {
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
+    PipelineRecordIndex* index) try {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -1296,10 +1526,20 @@ void LoadPipelines(
         }
         return;
     }
+    std::vector<IndexedRecord> records;
+    if (index) {
+        records = IndexPipelineRecords(stop_loading, file, end, *index);
+    }
+    size_t record = 0;
     while (file.tellg() != end) {
         if (stop_loading.stop_requested()) {
             return;
         }
+        if (record < records.size() && !records[record].newest) {
+            file.seekg(records[record++].end);
+            continue;
+        }
+        ++record;
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
         std::vector<FileEnvironment> envs(num_envs);

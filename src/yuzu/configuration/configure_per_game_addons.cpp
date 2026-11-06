@@ -87,6 +87,22 @@ ConfigurePerGameAddons::ConfigurePerGameAddons(Core::System& system_, QWidget* p
 ConfigurePerGameAddons::~ConfigurePerGameAddons() = default;
 
 void ConfigurePerGameAddons::OnItemChanged(QStandardItem* item) {
+    if (item->checkState() == Qt::Checked) {
+        // Built-ins that write the same code never both apply: show the one ticked last.
+        const auto conflicts =
+            FileSys::ConflictingBuiltinPatches(title_id, item->text().toStdString());
+        for (const auto& row : list_items) {
+            QStandardItem* const other = row.front();
+            if (other != item && other->checkState() == Qt::Checked &&
+                std::ranges::find(conflicts, other->text().toStdString()) != conflicts.end()) {
+                disconnect(item_model, &QStandardItemModel::itemChanged, this,
+                           &ConfigurePerGameAddons::OnItemChanged);
+                other->setCheckState(Qt::Unchecked);
+                connect(item_model, &QStandardItemModel::itemChanged, this,
+                        &ConfigurePerGameAddons::OnItemChanged);
+            }
+        }
+    }
     if (update_items.size() > 1 && item->checkState() == Qt::Checked) {
         auto it = std::find(update_items.begin(), update_items.end(), item);
         if (it != update_items.end()) {
@@ -121,6 +137,7 @@ void ConfigurePerGameAddons::ApplyConfiguration() {
     }
 
     auto current = Settings::values.disabled_addons[title_id];
+    FileSys::KeepSupersededBuiltinEntries(title_id, disabled_addons, current);
     std::sort(disabled_addons.begin(), disabled_addons.end());
     std::sort(current.begin(), current.end());
     if (disabled_addons != current) {
@@ -347,7 +364,8 @@ void ConfigurePerGameAddons::LoadConfiguration() {
                 std::find(disabled.begin(), disabled.end(), name.toStdString()) != disabled.end();
         }
 
-        bool should_enable = !patch_disabled;
+        // A built-in superseded by another enabled one does not apply, and is listed unticked.
+        bool should_enable = !patch_disabled && (!is_mod || patch.enabled);
 
         if (patch.type == FileSys::PatchType::Update) {
             if (should_enable) {
@@ -362,8 +380,21 @@ void ConfigurePerGameAddons::LoadConfiguration() {
 
         first_item->setCheckState(should_enable ? Qt::Checked : Qt::Unchecked);
 
-        list_items.push_back(QList<QStandardItem*>{
-            first_item, new QStandardItem{QString::fromStdString(patch.version)}});
+        auto* const version_item = new QStandardItem{QString::fromStdString(patch.version)};
+        if (is_mod) {
+            // A built-in that its environment switch turns off keeps its saved tick; the row says
+            // that it does not apply in this session.
+            const auto note =
+                FileSys::BuiltinPatchEnvironmentNote(title_id, name.toStdString());
+            if (!note.empty()) {
+                const QString tip = QString::fromStdString(note);
+                first_item->setToolTip(tip);
+                version_item->setToolTip(tip);
+                version_item->setText(tr("%1 (off in this session)").arg(version_item->text()));
+            }
+        }
+
+        list_items.push_back(QList<QStandardItem*>{first_item, version_item});
         item_model->appendRow(list_items.back());
     }
 
