@@ -291,14 +291,16 @@ private:
     u32 viewport_transform_state = 1;
 };
 
-void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+/// Appends a record. False when nothing was written: an environment cannot be stored, or the
+/// file failed (it is then removed).
+bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version);
 
 template <typename Key, typename Envs>
     requires std::is_trivially_copyable_v<Key>
         && std::has_unique_object_representations_v<Key>
-void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename, u32 cache_version) {
-    SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
+bool SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename, u32 cache_version) {
+    return SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
 }
 
 /// Result of AppendCheckedPipeline.

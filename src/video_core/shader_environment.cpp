@@ -1283,14 +1283,14 @@ std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u3
     return it->second;
 }
 
-void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version) try {
     std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
     file.exceptions(std::ifstream::failbit);
     if (!file.is_open()) {
         LOG_ERROR(Common_Filesystem, "Failed to open pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
-        return;
+        return false;
     }
     if (file.tellp() == 0) {
         // Write header
@@ -1298,7 +1298,7 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
             .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
     }
     if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
-        return;
+        return false;
     }
     const u32 num_envs{static_cast<u32>(envs.size())};
     file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
@@ -1306,6 +1306,7 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
         env->Serialize(file);
     }
     file.write(key.data(), key.size_bytes());
+    return true;
 
 } catch (const std::ios_base::failure& e) {
     LOG_ERROR(Common_Filesystem, "{}", e.what());
@@ -1313,6 +1314,7 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
         LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
     }
+    return false;
 }
 
 CheckedWrite AppendCheckedPipeline(std::span<const char> key,

@@ -1837,7 +1837,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
             }
         }
         if (write == Write::New) {
-            SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION);
+            if (!SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION)) {
+                disk_graphics.ReturnWrite(key, write);
+            }
             return;
         }
         // The stored capture failed to build: append this one only if it builds as read back.
@@ -1854,6 +1856,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                                               false) != nullptr;
             });
         LogReplacement("graphics", key.Hash(), result);
+        if (result == VideoCommon::CheckedWrite::NotSerializable ||
+            result == VideoCommon::CheckedWrite::Failed) {
+            disk_graphics.ReturnWrite(key, write);
+        }
     });
     QueueVulkanPipelineCacheFlush();
     return pipeline;
@@ -1900,7 +1906,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     serialization_thread.QueueWork([this, key, write, env_ = std::move(env)] {
         const std::array<const GenericEnvironment*, 1> envs{&env_};
         if (write == Write::New) {
-            SerializePipeline(key, envs, pipeline_cache_filename, CACHE_VERSION);
+            if (!SerializePipeline(key, envs, pipeline_cache_filename, CACHE_VERSION)) {
+                disk_compute.ReturnWrite(key, write);
+            }
             return;
         }
         // The stored capture failed to build: append this one only if it builds as read back.
@@ -1912,6 +1920,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                            .pipeline != nullptr;
             });
         LogReplacement("compute", key.Hash(), result);
+        if (result == VideoCommon::CheckedWrite::NotSerializable ||
+            result == VideoCommon::CheckedWrite::Failed) {
+            disk_compute.ReturnWrite(key, write);
+        }
     });
     QueueVulkanPipelineCacheFlush();
     return entry;

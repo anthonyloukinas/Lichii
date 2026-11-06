@@ -745,3 +745,27 @@ TEST_CASE("Pipeline keys with the same hash stay apart in the index and the disk
     CHECK(records.ClaimWrite(2) == Write::Replacement);
     CHECK(records.ClaimWrite(5) == Write::New);
 }
+
+TEST_CASE("A write that stores nothing gives its claim back", "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "returned.bin";
+    using Write = VideoCommon::DiskPipelineRecords<u64>::Write;
+    VideoCommon::DiskPipelineRecords<u64> records;
+    Capture unstorable{true, 2, true, {}};
+    unstorable.owned.front()->MakeUnserializable();
+
+    REQUIRE(records.ClaimWrite(2) == Write::New);
+    REQUIRE_FALSE(VideoCommon::SerializePipeline(u64{2}, unstorable.envs, path, Version));
+    records.ReturnWrite(2, Write::New);
+    REQUIRE(records.ClaimWrite(2) == Write::New);
+    REQUIRE(VideoCommon::SerializePipeline(u64{2}, Capture{true, 2, true, {}}.envs, path, Version));
+    CHECK(records.ClaimWrite(2) == Write::No);
+
+    REQUIRE(records.NoteStored(1));
+    records.NoteFailed(1);
+    REQUIRE(records.ClaimWrite(1) == Write::Replacement);
+    REQUIRE(AppendChecked(path, 1, true, unstorable) == VideoCommon::CheckedWrite::NotSerializable);
+    records.ReturnWrite(1, Write::Replacement);
+    CHECK(records.ClaimWrite(1) == Write::Replacement);
+    CHECK(records.ClaimWrite(1) == Write::No);
+}

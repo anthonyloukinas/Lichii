@@ -139,6 +139,20 @@ public:
         return Write::Replacement;
     }
 
+    /// The write ClaimWrite granted stored nothing (the capture cannot be stored, or the file
+    /// failed): a later live build of the key may claim it again.
+    void ReturnWrite(const Key& key, Write write) {
+        std::scoped_lock lock{mutex};
+        if (write == Write::New) {
+            keys.erase(key);
+        } else if (write == Write::Replacement) {
+            const auto it = keys.find(key);
+            if (it != keys.end()) {
+                it->second.failed = true;
+            }
+        }
+    }
+
 private:
     struct State {
         bool failed{};
