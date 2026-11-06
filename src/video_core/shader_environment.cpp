@@ -1328,7 +1328,7 @@ std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, st
                                                 std::streamoff end, PipelineRecordIndex& index) {
     struct Scanned {
         std::streamoff end;
-        u64 identity;
+        PipelineRecordIndex::RecordKey key;
         bool compute;
     };
     std::vector<Scanned> scanned;
@@ -1361,7 +1361,7 @@ std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, st
             file.read(key.data(), static_cast<std::streamsize>(key.size()));
             scanned.push_back({
                 .end = file.tellg(),
-                .identity = index.identify(std::span<const char>{key}, compute),
+                .key = index.Key(std::span<const char>{key}, compute),
                 .compute = compute,
             });
         }
@@ -1370,18 +1370,20 @@ std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, st
     file.clear();
     file.seekg(begin);
 
-    ::Common::unordered_map<u64, size_t> newest_compute;
-    ::Common::unordered_map<u64, size_t> newest_graphics;
+    using Newest = std::unordered_map<PipelineRecordIndex::RecordKey, size_t,
+                                      PipelineRecordIndex::RecordKeyHash>;
+    Newest newest_compute;
+    Newest newest_graphics;
     for (size_t i = 0; i < scanned.size(); ++i) {
         const Scanned& record = scanned[i];
-        (record.compute ? newest_compute : newest_graphics)[record.identity] = i;
-        ++(record.compute ? index.compute_records : index.graphics_records)[record.identity];
+        (record.compute ? newest_compute : newest_graphics)[record.key] = i;
+        ++(record.compute ? index.compute_records : index.graphics_records)[record.key];
     }
     std::vector<IndexedRecord> records(scanned.size());
     for (size_t i = 0; i < scanned.size(); ++i) {
         const Scanned& record = scanned[i];
         const auto& newest = record.compute ? newest_compute : newest_graphics;
-        records[i] = {.end = record.end, .newest = newest.at(record.identity) == i};
+        records[i] = {.end = record.end, .newest = newest.at(record.key) == i};
         if (!records[i].newest) {
             ++index.superseded;
         }

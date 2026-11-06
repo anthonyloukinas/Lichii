@@ -464,6 +464,12 @@ void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info)
              IndirectPointersMode());
 }
 
+/// The bytes of a pipeline key as the transferable cache stores them.
+template <typename Key>
+std::span<const char> KeyBytes(const Key& key) {
+    return {reinterpret_cast<const char*>(&key), sizeof(key)};
+}
+
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -1001,28 +1007,28 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     VideoCommon::PipelineRecordIndex record_index{
         .compute_key_size = sizeof(ComputePipelineCacheKey),
         .graphics_key_size = sizeof(GraphicsPipelineCacheKey),
-        .identify = [](std::span<const char> bytes, bool compute) -> u64 {
+        .identify = [](std::span<const char> bytes,
+                       bool compute) -> VideoCommon::PipelineRecordIndex::Identity {
             if (compute) {
                 ComputePipelineCacheKey key;
                 std::memcpy(&key, bytes.data(), sizeof(key));
-                return key.Hash();
+                return {key.Hash(), sizeof(key)};
             }
             GraphicsPipelineCacheKey key;
             std::memcpy(&key, bytes.data(), sizeof(key));
-            return key.Hash();
+            return {key.Hash(), key.Size()};
         },
     };
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-        const u64 hash = key.Hash();
-        disk_compute.NoteStored(hash, record_index.Records(hash, true));
+        disk_compute.NoteStored(key, record_index.Records(KeyBytes(key), true));
 
-        workers.QueueWork([this, key, hash, env_ = std::move(env), &state, &callback]() mutable {
+        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
             auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
             if (!entry.pipeline) {
-                disk_compute.NoteFailed(hash);
+                disk_compute.NoteFailed(key);
             }
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
@@ -1076,7 +1082,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
 
         const u64 hash = key.Hash();
-        if (!disk_graphics.NoteStored(hash, record_index.Records(hash, false))) {
+        if (!disk_graphics.NoteStored(key, record_index.Records(KeyBytes(key), false))) {
             return;
         }
         if (!preload_all &&
@@ -1088,7 +1094,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 capture_bytes += env.MemorySize();
             }
             if (background_pipelines.Add(
-                    key, capture_bytes, [this, key, hash, envs = std::move(envs)]() mutable {
+                    key, capture_bytes, [this, key, envs = std::move(envs)]() mutable {
                         ShaderPools pools;
                         boost::container::static_vector<Shader::Environment*,
                                                         Maxwell::MaxShaderProgram>
@@ -1099,7 +1105,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         auto pipeline =
                             CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
                         if (!pipeline) {
-                            disk_graphics.NoteFailed(hash);
+                            disk_graphics.NoteFailed(key);
                         }
                         if (pipeline && pipeline->Failed()) {
                             return std::unique_ptr<GraphicsPipeline>{};
@@ -1112,7 +1118,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         ++queued_graphics;
 
-        workers.QueueWork([this, key, hash, envs_ = std::move(envs), &state, &callback]() mutable {
+        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
@@ -1121,7 +1127,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
             if (!pipeline) {
-                disk_graphics.NoteFailed(hash);
+                disk_graphics.NoteFailed(key);
             }
 
             std::scoped_lock lock{state.mutex};
@@ -1797,7 +1803,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    const auto write = disk_graphics.ClaimWrite(graphics_key.Hash());
+    const auto write = disk_graphics.ClaimWrite(graphics_key);
     if (write == VideoCommon::DiskPipelineRecords::Write::No) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();
@@ -1854,7 +1860,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     if (!entry.pipeline || pipeline_cache_filename.empty()) {
         return entry;
     }
-    const auto write = disk_compute.ClaimWrite(key.Hash());
+    const auto write = disk_compute.ClaimWrite(key);
     if (write == VideoCommon::DiskPipelineRecords::Write::No) {
         QueueVulkanPipelineCacheFlush();
         return entry;

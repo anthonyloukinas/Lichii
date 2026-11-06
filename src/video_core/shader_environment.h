@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <functional>
@@ -15,7 +16,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -302,20 +305,43 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
 /// the stored one failed to build follows it in the file, so of the records with the same key
 /// only the last one is loaded.
 struct PipelineRecordIndex {
+    /// The part of a stored key that decides equality (graphics keys compare only their first
+    /// Size() bytes, compute keys all of them), and the hash it is looked up by. Records are told
+    /// apart by those bytes; equal hashes alone never merge two keys.
+    struct Identity {
+        u64 hash;
+        size_t size;
+    };
+    struct RecordKey {
+        u64 hash;
+        std::string bytes;
+        bool operator==(const RecordKey&) const = default;
+    };
+    struct RecordKeyHash {
+        size_t operator()(const RecordKey& key) const noexcept {
+            return static_cast<size_t>(key.hash);
+        }
+    };
+
     size_t compute_key_size{};
     size_t graphics_key_size{};
-    /// Identity of the key that ends a record (compute is true for a compute record).
-    std::function<u64(std::span<const char> key, bool compute)> identify;
+    /// compute is true for the key of a compute record.
+    std::function<Identity(std::span<const char> key, bool compute)> identify;
 
-    /// Filled by LoadPipelines: the records stored per key identity, and how many older records
-    /// it skipped for a newer one.
-    ::Common::unordered_map<u64, u32> compute_records;
-    ::Common::unordered_map<u64, u32> graphics_records;
+    /// Filled by LoadPipelines: the records stored per key, and how many older records it
+    /// skipped for a newer one.
+    std::unordered_map<RecordKey, u32, RecordKeyHash> compute_records;
+    std::unordered_map<RecordKey, u32, RecordKeyHash> graphics_records;
     size_t superseded{};
 
-    [[nodiscard]] u32 Records(u64 identity, bool compute) const {
+    [[nodiscard]] RecordKey Key(std::span<const char> key, bool compute) const {
+        const Identity identity = identify(key, compute);
+        return {identity.hash, std::string(key.data(), std::min(identity.size, key.size()))};
+    }
+
+    [[nodiscard]] u32 Records(std::span<const char> key, bool compute) const {
         const auto& records = compute ? compute_records : graphics_records;
-        const auto it = records.find(identity);
+        const auto it = records.find(Key(key, compute));
         return it == records.end() ? 1 : it->second;
     }
 };

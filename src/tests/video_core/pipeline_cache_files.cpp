@@ -278,17 +278,33 @@ void WriteGraphics(const std::filesystem::path& path, u64 key, u32 value, bool c
                 {Shader::Stage::VertexB, Shader::Stage::Geometry, Shader::Stage::Fragment});
 }
 
-VideoCommon::PipelineRecordIndex MakeIndex() {
+/// colliding: every key hashes the same, so only the key bytes tell records apart.
+VideoCommon::PipelineRecordIndex MakeIndex(bool colliding = false) {
     return {
         .compute_key_size = sizeof(u64),
         .graphics_key_size = sizeof(GraphicsKey),
-        .identify = [](std::span<const char> bytes, bool) {
+        .identify = [colliding](std::span<const char> bytes,
+                                bool) -> VideoCommon::PipelineRecordIndex::Identity {
             u64 id;
             std::memcpy(&id, bytes.data(), sizeof(id));
-            return id;
+            return {colliding ? 0x5eed : id, bytes.size()};
         },
     };
 }
+
+u32 Records(const VideoCommon::PipelineRecordIndex& index, u64 id, bool compute) {
+    const GraphicsKey graphics{id, ~id};
+    return compute ? index.Records({reinterpret_cast<const char*>(&id), sizeof(id)}, true)
+                   : index.Records({reinterpret_cast<const char*>(&graphics), sizeof(graphics)},
+                                   false);
+}
+
+/// A lookup hash under which all keys collide.
+struct SameHash {
+    size_t operator()(u64) const noexcept {
+        return 0x5eed;
+    }
+};
 
 /// What a translation of the capture needs: the cbuf value it reads and the pointer
 /// classification, which an incomplete capture lacks (FileEnvironment throws, as at boot).
@@ -349,13 +365,13 @@ struct Launch {
 
 Launch RunLaunch(const std::filesystem::path& path, std::span<const std::pair<u64, bool>> used,
                  bool live_capture_complete) {
-    VideoCommon::DiskPipelineRecords compute_records;
-    VideoCommon::DiskPipelineRecords graphics_records;
+    VideoCommon::DiskPipelineRecords<u64> compute_records;
+    VideoCommon::DiskPipelineRecords<u64> graphics_records;
     auto index = MakeIndex();
     Launch launch;
     for (const Loaded& record : Load(path, &index)) {
         auto& records = record.compute ? compute_records : graphics_records;
-        REQUIRE(records.NoteStored(record.key, index.Records(record.key, record.compute)));
+        REQUIRE(records.NoteStored(record.key, Records(index, record.key, record.compute)));
         ++launch.loaded;
         if (!record.translates) {
             records.NoteFailed(record.key);
@@ -364,7 +380,7 @@ Launch RunLaunch(const std::filesystem::path& path, std::span<const std::pair<u6
     }
     for (const auto& [key, compute] : used) {
         auto& records = compute ? compute_records : graphics_records;
-        if (records.ClaimWrite(key) != VideoCommon::DiskPipelineRecords::Write::No) {
+        if (records.ClaimWrite(key) != VideoCommon::DiskPipelineRecords<u64>::Write::No) {
             WriteRecord(path, key, compute, 2,
                         live_capture_complete,
                         compute ? std::initializer_list<Shader::Stage>{}
@@ -403,11 +419,11 @@ TEST_CASE("The newest record of a pipeline key is the one loaded",
     auto index = MakeIndex();
     REQUIRE(values(Load(path, &index)) == std::vector<u32>{70, 30, 21, 12});
     REQUIRE(index.superseded == 3);
-    REQUIRE(index.Records(1, true) == 3);
-    REQUIRE(index.Records(2, true) == 1);
-    REQUIRE(index.Records(1, false) == 2);
-    REQUIRE(index.Records(7, false) == 1);
-    REQUIRE(index.Records(99, true) == 1);
+    REQUIRE(Records(index, 1, true) == 3);
+    REQUIRE(Records(index, 2, true) == 1);
+    REQUIRE(Records(index, 1, false) == 2);
+    REQUIRE(Records(index, 7, false) == 1);
+    REQUIRE(Records(index, 99, true) == 1);
 }
 
 TEST_CASE("A damaged record still ends the indexed load as before",
@@ -483,18 +499,18 @@ TEST_CASE("A capture that keeps failing does not grow the cache on every launch"
         sizes.push_back(std::filesystem::file_size(path));
     }
     // At most MaxRecordsPerKey records per key: one original and three replacements each.
-    CHECK(written == 2 * (VideoCommon::DiskPipelineRecords::MaxRecordsPerKey - 1));
-    CHECK(sizes.back() == sizes[VideoCommon::DiskPipelineRecords::MaxRecordsPerKey - 2]);
+    CHECK(written == 2 * (VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey - 1));
+    CHECK(sizes.back() == sizes[VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey - 2]);
     auto index = MakeIndex();
     static_cast<void>(Load(path, &index));
-    CHECK(index.Records(1, true) == VideoCommon::DiskPipelineRecords::MaxRecordsPerKey);
-    CHECK(index.Records(1, false) == VideoCommon::DiskPipelineRecords::MaxRecordsPerKey);
+    CHECK(Records(index, 1, true) == VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey);
+    CHECK(Records(index, 1, false) == VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey);
 }
 
 TEST_CASE("Disk pipeline records allow one replacement per failure",
           "[pipeline_cache_files][repair]") {
-    using Write = VideoCommon::DiskPipelineRecords::Write;
-    VideoCommon::DiskPipelineRecords records;
+    using Write = VideoCommon::DiskPipelineRecords<u64>::Write;
+    VideoCommon::DiskPipelineRecords<u64> records;
     REQUIRE(records.NoteStored(1, 1));
     REQUIRE_FALSE(records.NoteStored(1, 1));
     CHECK(records.ClaimWrite(1) == Write::No);
@@ -503,7 +519,7 @@ TEST_CASE("Disk pipeline records allow one replacement per failure",
     CHECK(records.ClaimWrite(1) == Write::No);
     CHECK(records.ClaimWrite(2) == Write::New);
     CHECK(records.ClaimWrite(2) == Write::No);
-    REQUIRE(records.NoteStored(3, VideoCommon::DiskPipelineRecords::MaxRecordsPerKey));
+    REQUIRE(records.NoteStored(3, VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey));
     records.NoteFailed(3);
     CHECK(records.ClaimWrite(3) == Write::No);
     // A failure of a pipeline the cache does not hold changes nothing.
@@ -608,4 +624,36 @@ TEST_CASE("Cached compute failures retain their cause and the current dispatch a
     CHECK(entry->second.failure.empty());
     CHECK(entry->second.Get(false, 0x2120633c00, other) == nullptr);
     REQUIRE_THROWS_AS(entry->second.Get(true, 0x2120633c00, other), Shader::RuntimeError);
+}
+
+TEST_CASE("Pipeline keys with the same hash stay apart in the index and the disk records",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "collide.bin";
+    WriteCompute(path, 1, 10);
+    WriteCompute(path, 2, 20);
+    WriteGraphics(path, 3, 30);
+    WriteGraphics(path, 4, 40);
+    WriteCompute(path, 1, 11);
+    auto index = MakeIndex(true);
+    std::vector<std::pair<u64, u32>> loaded;
+    for (const Loaded& record : Load(path, &index)) {
+        loaded.emplace_back(record.key, record.value);
+    }
+    // Only the older record of compute key 1 gives way; keys 2, 3 and 4 share its hash but not
+    // its bytes, so all of them load.
+    REQUIRE(loaded == std::vector<std::pair<u64, u32>>{{2, 20}, {3, 30}, {4, 40}, {1, 11}});
+    REQUIRE(index.superseded == 1);
+    REQUIRE(Records(index, 1, true) == 2);
+    REQUIRE(Records(index, 2, true) == 1);
+    REQUIRE(Records(index, 3, false) == 1);
+
+    using Write = VideoCommon::DiskPipelineRecords<u64, SameHash>::Write;
+    VideoCommon::DiskPipelineRecords<u64, SameHash> records;
+    REQUIRE(records.NoteStored(1, 1));
+    REQUIRE(records.NoteStored(2, 1));
+    records.NoteFailed(2);
+    CHECK(records.ClaimWrite(1) == Write::No);
+    CHECK(records.ClaimWrite(2) == Write::Replacement);
+    CHECK(records.ClaimWrite(5) == Write::New);
 }

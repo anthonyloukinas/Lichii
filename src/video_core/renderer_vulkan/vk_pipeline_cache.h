@@ -216,8 +216,8 @@ private:
     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
     /// again unless the stored capture failed to build. Each built pipeline holds driver memory
     /// (title 1: 6.5k cached, a quarter used).
-    VideoCommon::DiskPipelineRecords disk_graphics;
-    VideoCommon::DiskPipelineRecords disk_compute; ///< The same for compute pipelines
+    VideoCommon::DiskPipelineRecords<GraphicsPipelineCacheKey> disk_graphics;
+    VideoCommon::DiskPipelineRecords<ComputePipelineCacheKey> disk_compute; ///< The same for compute
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
