@@ -21,6 +21,8 @@ inline constexpr u64 LoadDeltaOffset = 0x3C461E4;
 inline constexpr u64 ReturnOffset = 0x3C461E8;
 inline constexpr u64 HookOffset = 0x6E6CC4;
 inline constexpr u32 HookInstruction = 0x14D57D48; // b 0x3c461e4
+inline constexpr u32 LoadDeltaInstruction = 0x1CFFFFE8; // ldr s8, 0x3c461e0
+inline constexpr u32 ReturnInstruction = 0x172A82B8;    // b 0x6e6cc8
 
 inline constexpr float DefaultSnapBelow = 1.1f;
 

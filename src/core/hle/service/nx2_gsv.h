@@ -1829,11 +1829,12 @@ private:
             const char* value = std::getenv("EDEN_NX2_OOT_REAL_TIME");
             return value == nullptr || value[0] != '0';
         }();
-        if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
+        // The presenting process: another client of this service never feeds or gets the delta.
+        if (auto* const process = ctx.GetThread().GetOwnerProcess(); process != nullptr) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
                 const float delta = m_oot_frame_delta.Update(entered);
                 if (oot_real_time) {
-                    system.ApplicationMemory().Write32(address, std::bit_cast<u32>(delta));
+                    process->GetMemory().Write32(address, std::bit_cast<u32>(delta));
                 }
                 m_stats.oot_last = delta;
                 m_stats.oot_min = (std::min)(m_stats.oot_min, delta);
