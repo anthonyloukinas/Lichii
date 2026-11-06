@@ -98,38 +98,37 @@ inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
 /// Which pipelines the transferable cache holds, so that a live build is appended only when the
 /// cache has no record for it, or when the stored capture failed to build (it lacks an answer
 /// the translation now asks for). Such a replacement follows the old record and is the one
-/// loaded later (LoadPipelines with a PipelineRecordIndex). Thread-safe: failures are noted by
-/// the boot and background build workers. Keys are told apart by their own equality; KeyHash
-/// only looks them up.
+/// loaded later (LoadPipelines with a PipelineRecordIndex). It is appended only if it builds as a
+/// later boot reads it back (AppendCheckedPipeline), so a capture that keeps failing is never
+/// written again, however many older records the key has. Thread-safe: failures are noted by the
+/// boot and background build workers. Keys are told apart by their own equality; KeyHash only
+/// looks them up.
 template <typename Key, typename KeyHash = std::hash<Key>>
 class DiskPipelineRecords {
 public:
-    /// No replacement is written once a key has this many records (one that keeps failing does
-    /// not grow the file on every launch).
-    static constexpr u32 MaxRecordsPerKey = 4;
-
     enum class Write { No, New, Replacement };
 
-    /// The cache holds `records` records for this key, of which the newest was loaded. False when
-    /// the key was noted already.
-    bool NoteStored(const Key& key, u32 records) {
+    /// The cache holds a record of this key (the newest was loaded). False when the key was noted
+    /// already.
+    bool NoteStored(const Key& key) {
         std::scoped_lock lock{mutex};
-        return keys.try_emplace(key, State{.records = records}).second;
+        return keys.try_emplace(key).second;
     }
 
     /// The stored capture of this key failed to build.
     void NoteFailed(const Key& key) {
         std::scoped_lock lock{mutex};
         const auto it = keys.find(key);
-        if (it != keys.end() && it->second.records < MaxRecordsPerKey) {
+        if (it != keys.end()) {
             it->second.failed = true;
         }
     }
 
     /// A live build of this key succeeded: whether its capture is to be appended to the cache.
+    /// One replacement per noted failure.
     Write ClaimWrite(const Key& key) {
         std::scoped_lock lock{mutex};
-        const auto [it, inserted] = keys.try_emplace(key, State{.records = 1});
+        const auto [it, inserted] = keys.try_emplace(key);
         if (inserted) {
             return Write::New;
         }
@@ -137,13 +136,11 @@ public:
             return Write::No;
         }
         it->second.failed = false;
-        ++it->second.records;
         return Write::Replacement;
     }
 
 private:
     struct State {
-        u32 records{};
         bool failed{};
     };
     std::mutex mutex;

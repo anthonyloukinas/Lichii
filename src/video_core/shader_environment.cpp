@@ -1315,6 +1315,83 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+CheckedWrite AppendCheckedPipeline(std::span<const char> key,
+                                   std::span<const GenericEnvironment* const> envs,
+                                   const std::filesystem::path& filename, u32 cache_version,
+                                   Common::UniqueFunction<bool, std::span<FileEnvironment>> check) {
+    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        return CheckedWrite::NotSerializable;
+    }
+    constexpr std::streamoff header_size = sizeof(MAGIC_NUMBER) + sizeof(u32);
+    auto scratch = filename;
+    scratch += ".candidate";
+    std::error_code error;
+    std::filesystem::remove(scratch, error);
+    SerializePipeline(key, envs, scratch, cache_version);
+
+    std::string record;
+    std::vector<FileEnvironment> loaded;
+    try {
+        std::ifstream file(scratch, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            return CheckedWrite::Failed;
+        }
+        file.exceptions(std::ifstream::failbit);
+        const std::streamoff end = file.tellg();
+        if (end <= header_size) {
+            file.close();
+            std::filesystem::remove(scratch, error);
+            return CheckedWrite::Failed;
+        }
+        record.resize(static_cast<size_t>(end - header_size));
+        file.seekg(header_size);
+        file.read(record.data(), static_cast<std::streamsize>(record.size()));
+        file.seekg(header_size);
+        u32 num_envs{};
+        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+        loaded.resize(num_envs);
+        for (FileEnvironment& env : loaded) {
+            env.Deserialize(file);
+        }
+        std::string stored_key(key.size(), '\0');
+        file.read(stored_key.data(), static_cast<std::streamsize>(stored_key.size()));
+        if (num_envs != envs.size() || static_cast<std::streamoff>(file.tellg()) != end ||
+            !std::ranges::equal(stored_key, key)) {
+            file.close();
+            std::filesystem::remove(scratch, error);
+            return CheckedWrite::Failed;
+        }
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "{}", e.what());
+        std::filesystem::remove(scratch, error);
+        return CheckedWrite::Failed;
+    }
+    std::filesystem::remove(scratch, error);
+    if (!check(std::span<FileEnvironment>{loaded})) {
+        return CheckedWrite::Rejected;
+    }
+    try {
+        std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
+        if (!file.is_open()) {
+            return CheckedWrite::Failed;
+        }
+        file.exceptions(std::ifstream::failbit);
+        if (file.tellp() == 0) {
+            file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+        }
+        file.write(record.data(), static_cast<std::streamsize>(record.size()));
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "{}", e.what());
+        if (!Common::FS::RemoveFile(filename)) {
+            LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+                      Common::FS::PathToUTF8String(filename));
+        }
+        return CheckedWrite::Failed;
+    }
+    return CheckedWrite::Written;
+}
+
 namespace {
 struct IndexedRecord {
     std::streamoff end;

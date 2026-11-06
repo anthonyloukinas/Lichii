@@ -301,6 +301,31 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
     SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
 }
 
+/// Result of AppendCheckedPipeline.
+enum class CheckedWrite {
+    Written,         ///< The record was appended.
+    NotSerializable, ///< An environment cannot be stored; nothing was written.
+    Rejected,        ///< check refused the capture as read back; nothing was appended.
+    Failed,          ///< Writing or reading back failed (as SerializePipeline, the cache may be removed).
+};
+
+/// Appends a record like SerializePipeline, but only after reading it back from a scratch file
+/// beside the cache and passing the environments as a later boot would load them to check.
+CheckedWrite AppendCheckedPipeline(std::span<const char> key,
+                                   std::span<const GenericEnvironment* const> envs,
+                                   const std::filesystem::path& filename, u32 cache_version,
+                                   Common::UniqueFunction<bool, std::span<FileEnvironment>> check);
+
+template <typename Key, typename Envs>
+    requires std::is_trivially_copyable_v<Key> && std::has_unique_object_representations_v<Key>
+CheckedWrite AppendCheckedPipeline(const Key& key, const Envs& envs,
+                                   const std::filesystem::path& filename, u32 cache_version,
+                                   Common::UniqueFunction<bool, std::span<FileEnvironment>> check) {
+    return AppendCheckedPipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)),
+                                 std::span(envs.data(), envs.size()), filename, cache_version,
+                                 std::move(check));
+}
+
 /// Newest-record-wins loading. The pipeline cache is append-only: a capture written again after
 /// the stored one failed to build follows it in the file, so of the records with the same key
 /// only the last one is loaded.

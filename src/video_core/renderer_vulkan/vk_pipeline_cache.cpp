@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_set>
 #include <thread>
 #include <vector>
@@ -71,6 +72,7 @@ using Shader::Maxwell::ConvertLegacyToGeneric;
 using Shader::Maxwell::GenerateGeometryPassthrough;
 using Shader::Maxwell::MergeDualVertexPrograms;
 using Shader::Maxwell::TranslateProgram;
+using VideoCommon::AppendCheckedPipeline;
 using VideoCommon::ComputeEnvironment;
 using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
@@ -464,10 +466,25 @@ void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info)
              IndirectPointersMode());
 }
 
-/// The bytes of a pipeline key as the transferable cache stores them.
-template <typename Key>
-std::span<const char> KeyBytes(const Key& key) {
-    return {reinterpret_cast<const char*>(&key), sizeof(key)};
+void LogReplacement(std::string_view kind, u64 hash, VideoCommon::CheckedWrite result) {
+    switch (result) {
+    case VideoCommon::CheckedWrite::Written:
+        LOG_INFO(Render_Vulkan, "Replaced the cached capture of {} pipeline {:016x}, which failed "
+                 "to build", kind, hash);
+        break;
+    case VideoCommon::CheckedWrite::Rejected:
+        LOG_WARNING(Render_Vulkan, "Kept the cached capture of {} pipeline {:016x}: the live "
+                    "capture fails to build from the cache as well", kind, hash);
+        break;
+    case VideoCommon::CheckedWrite::NotSerializable:
+        LOG_INFO(Render_Vulkan, "The live capture of {} pipeline {:016x} cannot be stored", kind,
+                 hash);
+        break;
+    case VideoCommon::CheckedWrite::Failed:
+        LOG_ERROR(Render_Vulkan, "Writing the replacement capture of {} pipeline {:016x} failed",
+                  kind, hash);
+        break;
+    }
 }
 
 } // Anonymous namespace
@@ -1022,7 +1039,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-        disk_compute.NoteStored(key, record_index.Records(KeyBytes(key), true));
+        disk_compute.NoteStored(key);
 
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
@@ -1082,7 +1099,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
 
         const u64 hash = key.Hash();
-        if (!disk_graphics.NoteStored(key, record_index.Records(KeyBytes(key), false))) {
+        if (!disk_graphics.NoteStored(key)) {
             return;
         }
         if (!preload_all &&
@@ -1804,17 +1821,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         return pipeline;
     }
     const auto write = disk_graphics.ClaimWrite(graphics_key);
-    if (write == VideoCommon::DiskPipelineRecords::Write::No) {
+    using Write = decltype(disk_graphics)::Write;
+    if (write == Write::No) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();
         return pipeline;
     }
-    if (write == VideoCommon::DiskPipelineRecords::Write::Replacement) {
-        LOG_INFO(Render_Vulkan,
-                 "Replacing the cached capture of graphics pipeline {:016x}, which failed to build",
-                 graphics_key.Hash());
-    }
-    serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
+    serialization_thread.QueueWork([this, key = graphics_key, write,
+                                    envs = std::move(environments.envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
         for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -1822,7 +1836,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                 env_ptrs.push_back(&envs[index]);
             }
         }
-        SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION);
+        if (write == Write::New) {
+            SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION);
+            return;
+        }
+        // The stored capture failed to build: append this one only if it builds as read back.
+        const auto result = AppendCheckedPipeline(
+            key, env_ptrs, pipeline_cache_filename, CACHE_VERSION,
+            [this, &key](std::span<FileEnvironment> loaded) {
+                ShaderPools pools;
+                boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram>
+                    loaded_ptrs;
+                for (auto& env : loaded) {
+                    loaded_ptrs.push_back(&env);
+                }
+                return CreateGraphicsPipeline(pools, key, MakeSpan(loaded_ptrs), nullptr,
+                                              false) != nullptr;
+            });
+        LogReplacement("graphics", key.Hash(), result);
     });
     QueueVulkanPipelineCacheFlush();
     return pipeline;
@@ -1861,18 +1892,26 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         return entry;
     }
     const auto write = disk_compute.ClaimWrite(key);
-    if (write == VideoCommon::DiskPipelineRecords::Write::No) {
+    using Write = decltype(disk_compute)::Write;
+    if (write == Write::No) {
         QueueVulkanPipelineCacheFlush();
         return entry;
     }
-    if (write == VideoCommon::DiskPipelineRecords::Write::Replacement) {
-        LOG_INFO(Render_Vulkan,
-                 "Replacing the cached capture of compute pipeline {:016x}, which failed to build",
-                 key.Hash());
-    }
-    serialization_thread.QueueWork([this, key, env_ = std::move(env)] {
-        SerializePipeline(key, std::array<const GenericEnvironment*, 1>{&env_},
-                          pipeline_cache_filename, CACHE_VERSION);
+    serialization_thread.QueueWork([this, key, write, env_ = std::move(env)] {
+        const std::array<const GenericEnvironment*, 1> envs{&env_};
+        if (write == Write::New) {
+            SerializePipeline(key, envs, pipeline_cache_filename, CACHE_VERSION);
+            return;
+        }
+        // The stored capture failed to build: append this one only if it builds as read back.
+        const auto result = AppendCheckedPipeline(
+            key, envs, pipeline_cache_filename, CACHE_VERSION,
+            [this, &key](std::span<FileEnvironment> loaded) {
+                ShaderPools pools;
+                return CreateComputePipeline(pools, key, loaded.front(), nullptr, false)
+                           .pipeline != nullptr;
+            });
+        LogReplacement("compute", key.Hash(), result);
     });
     QueueVulkanPipelineCacheFlush();
     return entry;

@@ -74,6 +74,10 @@ public:
         }
     }
 
+    void MakeUnserializable() {
+        has_unbound_instructions = true;
+    }
+
     u32 ReadCbufValue(u32, u32) override {
         return 0;
     }
@@ -248,25 +252,49 @@ struct GraphicsKey {
     u64 state;
 };
 
-void WriteRecord(const std::filesystem::path& path, u64 key, bool compute, u32 value,
-                 bool complete, std::initializer_list<Shader::Stage> stages = {}) {
+constexpr std::initializer_list<Shader::Stage> GraphicsStages{
+    Shader::Stage::VertexB, Shader::Stage::Geometry, Shader::Stage::Fragment};
+
+/// The environments of one pipeline as a live build captures them.
+struct Capture {
     std::vector<std::unique_ptr<SerializedEnvironment>> owned;
     std::vector<const VideoCommon::GenericEnvironment*> envs;
+
+    Capture(bool compute, u32 value, bool complete, std::initializer_list<Shader::Stage> stages) {
+        if (compute) {
+            owned.push_back(
+                std::make_unique<SerializedEnvironment>(Shader::Stage::Compute, value, complete));
+        }
+        for (const auto stage : stages) {
+            owned.push_back(std::make_unique<SerializedEnvironment>(stage, value, complete));
+        }
+        for (const auto& env : owned) {
+            envs.push_back(env.get());
+        }
+    }
+};
+
+void WriteRecord(const std::filesystem::path& path, u64 key, bool compute, u32 value,
+                 bool complete, std::initializer_list<Shader::Stage> stages = {}) {
+    const Capture capture{compute, value, complete, stages};
     if (compute) {
-        owned.push_back(
-            std::make_unique<SerializedEnvironment>(Shader::Stage::Compute, value, complete));
-    }
-    for (const auto stage : stages) {
-        owned.push_back(std::make_unique<SerializedEnvironment>(stage, value, complete));
-    }
-    for (const auto& env : owned) {
-        envs.push_back(env.get());
-    }
-    if (compute) {
-        VideoCommon::SerializePipeline(key, envs, path, Version);
+        VideoCommon::SerializePipeline(key, capture.envs, path, Version);
     } else {
-        VideoCommon::SerializePipeline(GraphicsKey{key, ~key}, envs, path, Version);
+        VideoCommon::SerializePipeline(GraphicsKey{key, ~key}, capture.envs, path, Version);
     }
+}
+
+bool TranslatesAll(std::span<VideoCommon::FileEnvironment> envs);
+
+/// What the Vulkan cache does with a replacement: append it only if it builds as read back.
+VideoCommon::CheckedWrite AppendChecked(const std::filesystem::path& path, u64 key, bool compute,
+                                        const Capture& capture) {
+    if (compute) {
+        return VideoCommon::AppendCheckedPipeline(key, capture.envs, path, Version,
+                                                  &TranslatesAll);
+    }
+    return VideoCommon::AppendCheckedPipeline(GraphicsKey{key, ~key}, capture.envs, path, Version,
+                                              &TranslatesAll);
 }
 
 void WriteCompute(const std::filesystem::path& path, u64 key, u32 value, bool complete = true) {
@@ -318,6 +346,10 @@ bool Translates(VideoCommon::FileEnvironment& env) {
     }
 }
 
+bool TranslatesAll(std::span<VideoCommon::FileEnvironment> envs) {
+    return std::ranges::all_of(envs, Translates);
+}
+
 struct Loaded {
     bool compute;
     u64 key;
@@ -361,6 +393,7 @@ struct Launch {
     size_t loaded{};
     size_t failed{};
     size_t written{};
+    size_t rejected{};
 };
 
 Launch RunLaunch(const std::filesystem::path& path, std::span<const std::pair<u64, bool>> used,
@@ -371,7 +404,7 @@ Launch RunLaunch(const std::filesystem::path& path, std::span<const std::pair<u6
     Launch launch;
     for (const Loaded& record : Load(path, &index)) {
         auto& records = record.compute ? compute_records : graphics_records;
-        REQUIRE(records.NoteStored(record.key, Records(index, record.key, record.compute)));
+        REQUIRE(records.NoteStored(record.key));
         ++launch.loaded;
         if (!record.translates) {
             records.NoteFailed(record.key);
@@ -380,14 +413,22 @@ Launch RunLaunch(const std::filesystem::path& path, std::span<const std::pair<u6
     }
     for (const auto& [key, compute] : used) {
         auto& records = compute ? compute_records : graphics_records;
-        if (records.ClaimWrite(key) != VideoCommon::DiskPipelineRecords<u64>::Write::No) {
-            WriteRecord(path, key, compute, 2,
-                        live_capture_complete,
-                        compute ? std::initializer_list<Shader::Stage>{}
-                                : std::initializer_list<Shader::Stage>{
-                                      Shader::Stage::VertexB, Shader::Stage::Geometry,
-                                      Shader::Stage::Fragment});
+        using Write = VideoCommon::DiskPipelineRecords<u64>::Write;
+        const Write write = records.ClaimWrite(key);
+        if (write == Write::No) {
+            continue;
+        }
+        const Capture capture{compute, 2, live_capture_complete,
+                              compute ? std::initializer_list<Shader::Stage>{} : GraphicsStages};
+        if (write == Write::New) {
+            WriteRecord(path, key, compute, 2, live_capture_complete,
+                        compute ? std::initializer_list<Shader::Stage>{} : GraphicsStages);
             ++launch.written;
+        } else if (AppendChecked(path, key, compute, capture) ==
+                   VideoCommon::CheckedWrite::Written) {
+            ++launch.written;
+        } else {
+            ++launch.rejected;
         }
     }
     return launch;
@@ -489,39 +530,86 @@ TEST_CASE("A capture that keeps failing does not grow the cache on every launch"
     const auto path = temp.path / "bounded.bin";
     WriteCompute(path, 1, 1, false);
     WriteGraphics(path, 1, 1, false);
+    const auto size = std::filesystem::file_size(path);
     const std::array<std::pair<u64, bool>, 2> used{{{1, true}, {1, false}}};
-    std::vector<std::uintmax_t> sizes;
-    size_t written = 0;
     for (int launch = 0; launch < 10; ++launch) {
+        // The live capture fails as read back too, so it is checked once per launch and never
+        // appended.
         const Launch result = RunLaunch(path, used, false);
         CHECK(result.failed == 2);
-        written += result.written;
-        sizes.push_back(std::filesystem::file_size(path));
+        CHECK(result.rejected == 2);
+        CHECK(result.written == 0);
+        CHECK(std::filesystem::file_size(path) == size);
     }
-    // At most MaxRecordsPerKey records per key: one original and three replacements each.
-    CHECK(written == 2 * (VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey - 1));
-    CHECK(sizes.back() == sizes[VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey - 2]);
+}
+
+TEST_CASE("Older duplicate records do not use up the repair of a key",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "legacy.bin";
+    // Four records per key, as the old compute path left them (one per live build), the newest
+    // missing the answer the translation now asks for.
+    for (u32 value = 0; value < 4; ++value) {
+        WriteCompute(path, 1, value, false);
+        WriteGraphics(path, 1, value, false);
+    }
+    const std::array<std::pair<u64, bool>, 2> used{{{1, true}, {1, false}}};
+    const Launch first = RunLaunch(path, used, true);
+    CHECK(first.loaded == 2);
+    CHECK(first.failed == 2);
+    CHECK(first.written == 2); // exactly one replacement per key
+    CHECK(first.rejected == 0);
+    const auto size = std::filesystem::file_size(path);
+
+    const Launch second = RunLaunch(path, used, true);
+    CHECK(second.failed == 0);
+    CHECK(second.written == 0);
+    CHECK(std::filesystem::file_size(path) == size);
     auto index = MakeIndex();
-    static_cast<void>(Load(path, &index));
-    CHECK(Records(index, 1, true) == VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey);
-    CHECK(Records(index, 1, false) == VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey);
+    for (const Loaded& record : Load(path, &index)) {
+        CHECK(record.translates);
+        CHECK(record.value == 2);
+    }
+    CHECK(Records(index, 1, true) == 5);
+    CHECK(Records(index, 1, false) == 5);
+}
+
+TEST_CASE("A checked append writes nothing for a capture it cannot store or that fails",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "checked.bin";
+    WriteCompute(path, 1, 1, false);
+    const auto size = std::filesystem::file_size(path);
+    {
+        Capture capture{true, 2, true, {}};
+        capture.owned.front()->MakeUnserializable();
+        CHECK(AppendChecked(path, 1, true, capture) == VideoCommon::CheckedWrite::NotSerializable);
+    }
+    CHECK(AppendChecked(path, 1, true, Capture{true, 2, false, {}}) ==
+          VideoCommon::CheckedWrite::Rejected);
+    CHECK(std::filesystem::file_size(path) == size);
+    CHECK(AppendChecked(path, 1, true, Capture{true, 2, true, {}}) ==
+          VideoCommon::CheckedWrite::Written);
+    CHECK_FALSE(std::filesystem::exists(path.string() + ".candidate"));
+    auto index = MakeIndex();
+    const auto loaded = Load(path, &index);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded.front().translates);
+    CHECK(loaded.front().value == 2);
 }
 
 TEST_CASE("Disk pipeline records allow one replacement per failure",
           "[pipeline_cache_files][repair]") {
     using Write = VideoCommon::DiskPipelineRecords<u64>::Write;
     VideoCommon::DiskPipelineRecords<u64> records;
-    REQUIRE(records.NoteStored(1, 1));
-    REQUIRE_FALSE(records.NoteStored(1, 1));
+    REQUIRE(records.NoteStored(1));
+    REQUIRE_FALSE(records.NoteStored(1));
     CHECK(records.ClaimWrite(1) == Write::No);
     records.NoteFailed(1);
     CHECK(records.ClaimWrite(1) == Write::Replacement);
     CHECK(records.ClaimWrite(1) == Write::No);
     CHECK(records.ClaimWrite(2) == Write::New);
     CHECK(records.ClaimWrite(2) == Write::No);
-    REQUIRE(records.NoteStored(3, VideoCommon::DiskPipelineRecords<u64>::MaxRecordsPerKey));
-    records.NoteFailed(3);
-    CHECK(records.ClaimWrite(3) == Write::No);
     // A failure of a pipeline the cache does not hold changes nothing.
     records.NoteFailed(4);
     CHECK(records.ClaimWrite(4) == Write::New);
@@ -650,8 +738,8 @@ TEST_CASE("Pipeline keys with the same hash stay apart in the index and the disk
 
     using Write = VideoCommon::DiskPipelineRecords<u64, SameHash>::Write;
     VideoCommon::DiskPipelineRecords<u64, SameHash> records;
-    REQUIRE(records.NoteStored(1, 1));
-    REQUIRE(records.NoteStored(2, 1));
+    REQUIRE(records.NoteStored(1));
+    REQUIRE(records.NoteStored(2));
     records.NoteFailed(2);
     CHECK(records.ClaimWrite(1) == Write::No);
     CHECK(records.ClaimWrite(2) == Write::Replacement);
