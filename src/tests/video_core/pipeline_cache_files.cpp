@@ -120,45 +120,48 @@ public:
 
 } // Anonymous namespace
 
-TEST_CASE("A pipeline whose native program has a trap guard prefix is stored and loads back",
+// Only compute programs keep a trap guard prefix (LowerNativeCode rejects one in any other stage);
+// ShaderCache::ComputeShader checks the guard against the live constants before a pipeline is
+// looked up. This covers storage eligibility only: the prefix no longer keeps the record out.
+TEST_CASE("A compute pipeline whose native program has a trap guard prefix is stored and loads back",
           "[pipeline_cache_files][guarded_pipelines]") {
     TempDir temp;
     const auto path = temp.path / "guarded.bin";
-    Vulkan::GraphicsPipelineCacheKey key{};
-    key.unique_hashes[1] = 0x1111222233334444;
-    key.unique_hashes[5] = 0x5555666677778888;
-    key.state.dynamic_vertex_input.Assign(1);
-    SerializedEnvironment vertex{Shader::Stage::VertexB};
-    SerializedEnvironment fragment{Shader::Stage::Fragment};
-    vertex.SetGuardedNativeCode();
-    REQUIRE(vertex.CanBeSerialized());
-    REQUIRE(vertex.NotSerializableReason() == nullptr);
-    const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex, &fragment};
-    VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    const Vulkan::ComputePipelineCacheKey key{
+        .unique_hash = 0x1111222233334444,
+        .shared_memory_size = 0x400,
+        .workgroup_size = {64, 1, 1},
+    };
+    SerializedEnvironment compute{Shader::Stage::Compute};
+    compute.SetGuardedNativeCode();
+    REQUIRE(compute.CanBeSerialized());
+    REQUIRE(compute.NotSerializableReason() == nullptr);
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&compute};
+    REQUIRE(VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion));
 
     // Instructions read outside the capture still keep a pipeline out.
-    SerializedEnvironment unbound{Shader::Stage::VertexB};
+    SerializedEnvironment unbound{Shader::Stage::Compute};
     unbound.SetUnboundInstructions();
     REQUIRE(unbound.NotSerializableReason() != nullptr);
-    const std::array<const VideoCommon::GenericEnvironment*, 2> refused{&unbound, &fragment};
-    VideoCommon::SerializePipeline(key, refused, path, VideoCommon::VulkanPipelineCacheVersion);
+    const std::array<const VideoCommon::GenericEnvironment*, 1> refused{&unbound};
+    REQUIRE_FALSE(
+        VideoCommon::SerializePipeline(key, refused, path, VideoCommon::VulkanPipelineCacheVersion));
 
     size_t loaded = 0;
     VideoCommon::LoadPipelines(
         {}, path, VideoCommon::VulkanPipelineCacheVersion,
-        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
-        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> restored) {
-            REQUIRE(restored.size() == 2);
-            REQUIRE(restored[0].ShaderStage() == Shader::Stage::VertexB);
-            REQUIRE(restored[1].ShaderStage() == Shader::Stage::Fragment);
-            REQUIRE(restored[0].ReadInstruction(0) == 0x123456789abcdef0);
-            REQUIRE(restored[0].ReadInstruction(8) == 0xfedcba9876543210);
-            REQUIRE(restored[0].ReadCbufValue(1, 16) == 0x1357);
-            Vulkan::GraphicsPipelineCacheKey restored_key;
+        [&](std::ifstream& file, VideoCommon::FileEnvironment restored) {
+            REQUIRE(restored.ShaderStage() == Shader::Stage::Compute);
+            REQUIRE(restored.ReadInstruction(0) == 0x123456789abcdef0);
+            REQUIRE(restored.ReadInstruction(8) == 0xfedcba9876543210);
+            REQUIRE(restored.ReadCbufValue(1, 16) == 0x1357);
+            Vulkan::ComputePipelineCacheKey restored_key;
             file.read(reinterpret_cast<char*>(&restored_key), sizeof(restored_key));
             REQUIRE(restored_key == key);
-            REQUIRE(restored_key.Hash() == key.Hash());
             ++loaded;
+        },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {
+            FAIL("Unexpected graphics record");
         });
     REQUIRE(loaded == 1);
 }
