@@ -802,9 +802,8 @@ private:
         BufferCache& cache;
 
         void ApplyPendingHotEpoch() {
-            if (cache.HotEpochPending()) [[unlikely]] {
-                cache.ApplyHotEpoch();
-            }
+            HotEpochOrder::ApplyIfPending(cache.memory_tracker, cache.hot_applied_epoch,
+                                          [this] { cache.ApplyHotEpoch(); });
         }
         void RefreshRepackedVertexBuffers() {
             cache.RefreshRepackedVertexBuffers();

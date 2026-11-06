@@ -45,6 +45,15 @@ HOT_EPOCH_ORDER_INLINE u64 Apply(Tracker& tracker, u64& applied, OnRun&& on_run)
     return tracker.MarkHotPagesWritten(on_run);
 }
 
+/// PrepareVertexBindings' ApplyPendingHotEpoch step: apply() (BufferCache::ApplyHotEpoch) when
+/// Pending, so the unchanged-epoch path stays a load and a compare.
+template <typename Tracker, typename ApplyFn>
+HOT_EPOCH_ORDER_INLINE void ApplyIfPending(const Tracker& tracker, u64 applied, ApplyFn&& apply) {
+    if (Pending(tracker, applied)) [[unlikely]] {
+        apply();
+    }
+}
+
 /// Before BufferCache::BindHostVertexBuffers looks at any slot. The epoch sets the stale bits of
 /// repacked slots and clears the synchronized ranges (EDEN_NX2_BUFFER_SKIP), so it goes first:
 /// applied only by a slot's upload (SynchronizeBuffer), it came after the refresh had read the
