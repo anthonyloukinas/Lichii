@@ -200,6 +200,19 @@ public:
         return has_computed_handles;
     }
 
+    [[nodiscard]] bool HasHandles() const noexcept {
+        return num_image_elements != 0;
+    }
+
+    /// With fast draws: whether every texture and image handle reads as it did at the last full
+    /// Configure (compares only).
+    [[nodiscard]] bool HandlesUnchanged();
+
+    /// With fast draws: the raw handles the last full Configure read, in its order.
+    [[nodiscard]] std::span<const u32> RawHandles() const noexcept {
+        return raw_handles;
+    }
+
     /// Why TakesDeltaDraws is false (diagnostics).
     enum class DeltaBlocker : u8 {
         None,
@@ -331,8 +344,9 @@ private:
     bool has_computed_handles{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
-    /// The raw handle of each element of delta_views (handle rechecks).
-    std::vector<u32> delta_raw_handles;
+    /// The raw handle of each view element at the last full Configure (with fast draws); kept in
+    /// step with delta_views by RecheckHandles.
+    std::vector<u32> raw_handles;
     RecheckResult last_recheck{};
 
     vk::DescriptorSetLayout descriptor_set_layout;

@@ -72,6 +72,18 @@ inline bool SwitchOn(const char* name) {
     return value != nullptr && value[0] == '1';
 }
 
+/// On unless the variable is 0.
+inline bool SwitchNotOff(const char* name) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
+/// Unknown writes (the pre-draw invalidation, hot pages) leave no ranges, so they may have
+/// changed a handle in a constant buffer: a delta draw after them reads its pipeline's handles
+/// again and is resolved in full if one changed. =0 keeps the views without looking.
+inline const bool g_check_invalidated_handles =
+    SwitchNotOff("EDEN_NX2_FAST_DRAW_CHECK_INVALIDATED");
+
 /// With EDEN_NX2_FAST_DRAW=2. A delta draw that rechecks handles reads every texture and image
 /// handle of the pipeline again and keeps the views and samplers of the unchanged ones; changed
 /// texture and image handles are resolved again, a changed texture buffer handle makes the draw

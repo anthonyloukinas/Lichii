@@ -505,9 +505,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
-    const bool record_raw_handles{DeltaCapable() && VideoCommon::Nx2FastDraw::g_delta_enabled &&
-                                  VideoCommon::Nx2FastDraw::RechecksHandles()};
-    boost::container::small_vector<u32, 160> raw_handles;
+    // Fast draws compare or recheck the handles later.
+    const bool record_raw_handles{VideoCommon::Nx2FastDraw::g_enabled};
+    boost::container::small_vector<u32, 160> read_raw_handles;
 
     namespace Profile = VideoCommon::Nx2Profile;
     {
@@ -558,7 +558,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
             }
             if (record_raw_handles) {
-                raw_handles.push_back(raw);
+                read_raw_handles.push_back(raw);
             }
             return TexturePair(raw, via_header_index);
         }};
@@ -661,9 +661,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
-        delta_raw_handles.assign(raw_handles.begin(), raw_handles.end());
-        configured_stages = Spec::enabled_stages;
         delta_views_valid = true;
+    }
+    if (record_raw_handles) {
+        raw_handles.assign(read_raw_handles.begin(), read_raw_handles.end());
+        configured_stages = Spec::enabled_stages;
     }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
@@ -818,12 +820,44 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return ConfigureDraw(rescaling, render_area);
 }
 
+bool GraphicsPipeline::HandlesUnchanged() {
+    namespace Profile = VideoCommon::Nx2Profile;
+    Profile::Scope scope{Profile::Zone::ReadHandles};
+    if (raw_handles.size() != num_image_elements) {
+        return false;
+    }
+    size_t view_index{};
+    // ConfigureImpl's order.
+    const auto same = [&](size_t stage, const auto& descriptors) {
+        for (const auto& desc : descriptors) {
+            for (u32 index = 0; index < desc.count; ++index, ++view_index) {
+                if (ReadRawHandle(stage, desc, index) != raw_handles[view_index]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!configured_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& info{stage_infos[stage]};
+        if (!same(stage, info.texture_buffer_descriptors) ||
+            !same(stage, info.image_buffer_descriptors) || !same(stage, info.texture_descriptors) ||
+            !same(stage, info.image_descriptors)) {
+            return false;
+        }
+    }
+    return view_index == raw_handles.size();
+}
+
 GraphicsPipeline::RecheckResult GraphicsPipeline::RecheckHandles() {
     namespace Profile = VideoCommon::Nx2Profile;
     Profile::Scope scope{Profile::Zone::ReadHandles};
     const bool via_header_index{maxwell3d->regs.sampler_binding ==
                                 Maxwell::SamplerBinding::ViaHeaderBinding};
-    if (delta_raw_handles.size() != delta_views.size()) {
+    if (raw_handles.size() != delta_views.size()) {
         delta_views_valid = false;
         return RecheckResult::BufferHandleChanged;
     }
@@ -835,7 +869,7 @@ GraphicsPipeline::RecheckResult GraphicsPipeline::RecheckHandles() {
     const auto check = [&](size_t stage, const auto& desc, bool is_buffer, bool is_texture) {
         for (u32 index = 0; index < desc.count; ++index, ++view_index) {
             const u32 raw{ReadRawHandle(stage, desc, index)};
-            if (raw != delta_raw_handles[view_index]) {
+            if (raw != raw_handles[view_index]) {
                 if (is_buffer) {
                     buffer_changed = true;
                     return false;
@@ -845,7 +879,7 @@ GraphicsPipeline::RecheckResult GraphicsPipeline::RecheckHandles() {
                     delta_views_valid = false;
                 }
                 const auto [image, sampler] = TexturePair(raw, via_header_index);
-                delta_raw_handles[view_index] = raw;
+                raw_handles[view_index] = raw;
                 delta_views[view_index].index = image;
                 delta_views[view_index].id = {};
                 if (is_texture) {
