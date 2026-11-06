@@ -56,6 +56,10 @@ EDEN_NX2_FENCE_BATCH=1
 # and the older alias copies are skipped (Ocarina's resized shadow map). =0 makes them all again.
 #EDEN_NX2_JOIN_UPLOAD_SKIP=0
 
+# Diagnostic (#210): build these compute shaders unoptimized on any driver (comma-separated
+# hexadecimal hashes, or all). Shorter driver compiles, slower shaders.
+#EDEN_NX2_NOOPT_SHADERS=74ab167d83c54073,f12162b84e9cc190
+
 # Storage buffer pointer rules: unset = upstream #150 only (default since test/oot-local-7 and
 # test/oot-local-11). =local adds our dynamic constant buffer and record pointer paths on top (the
 # oot-local-6 default; it lost Kokiri Forest's tree canopy there). =upstream is the same as unset.

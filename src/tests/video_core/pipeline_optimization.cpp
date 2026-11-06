@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
@@ -24,4 +25,18 @@ TEST_CASE("Only known AMD proprietary shaders disable pipeline optimization",
                            0xb2f024003969e2dcULL}) {
         CHECK_FALSE(Vulkan::BuildsUnoptimized(VK_DRIVER_ID_AMD_PROPRIETARY, hash));
     }
+}
+
+TEST_CASE("EDEN_NX2_NOOPT_SHADERS parses whole hexadecimal hashes",
+          "[video_core][vulkan][pipeline_optimization]") {
+    CHECK(Vulkan::ParseNooptShaders("all").all);
+    CHECK(Vulkan::ParseNooptShaders("").hashes.empty());
+    // Uppercase works; empty, non-hexadecimal and over-long tokens are ignored.
+    const auto parsed =
+        Vulkan::ParseNooptShaders("74ab167d83c54073,F12162B84E9CC190,,zz,12345678901234567");
+    CHECK_FALSE(parsed.all);
+    REQUIRE(parsed.hashes.size() == 2);
+    CHECK(parsed.hashes[0] == 0x74ab167d83c54073ULL);
+    CHECK(parsed.hashes[1] == 0xf12162b84e9cc190ULL);
+    CHECK(Vulkan::ParseNooptShaders("c54073").hashes == std::vector<u64>{0xc54073});
 }
