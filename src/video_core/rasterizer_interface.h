@@ -147,6 +147,13 @@ public:
         return false;
     }
 
+    /// Whether the query cache tracks a report in the range (pending or not yet unregistered).
+    /// Thread safe: true unless the backend can tell (callers then take the full path).
+    [[nodiscard]] virtual bool HasCachedQueries([[maybe_unused]] DAddr addr,
+                                                [[maybe_unused]] u64 size) {
+        return true;
+    }
+
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,
                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

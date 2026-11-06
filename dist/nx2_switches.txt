@@ -36,3 +36,8 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# Macro DMA reads of occlusion reports wait for the reports' host results (#204/#215). Default:
+# only reads of a range holding a tracked report wait; =all every read (each drains the split);
+# =0 none (A/B test of the wait; reads can return older counts).
+#EDEN_NX2_QUERY_REPORT_WAIT=0

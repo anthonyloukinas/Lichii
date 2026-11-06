@@ -1618,11 +1618,36 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         flush_if_dirty();
     }
     // Write out the reports held in the query cache, or the read returns stale occlusion counts.
-    split.Run(
-        [this, source, read_bytes] {
-            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
-        },
-        VideoCommon::DrainSite::MacroDmaFlush);
+    // EDEN_NX2_QUERY_REPORT_WAIT: by default only when the range holds a report the query cache
+    // tracks (after the wait above the back has registered every report sent over it), so the
+    // other reads keep the ranged wait instead of draining; =all at every read as #204/#215,
+    // =0 never.
+    namespace QueryDma = VideoCommon::QueryDma;
+    const QueryDma::ReportWaitMode report_wait = QueryDma::ReportWait();
+    const bool wait_reports =
+        report_wait == QueryDma::ReportWaitMode::All ||
+        (report_wait == QueryDma::ReportWaitMode::Cached &&
+         QueryDma::MayHoldReports(memory_manager, *rasterizer, source, read_bytes));
+    if (wait_reports) {
+        split.Run(
+            [this, macro, method, source, read_bytes] {
+                QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
+                if (QueryDma::TraceEnabled() &&
+                    QueryDma::HasPendingQueries(memory_manager, *rasterizer, source, read_bytes)) {
+                    QueryDma::TraceAfterWait(memory_manager, macro, method, source, read_bytes);
+                }
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+    }
+    if (report_wait == QueryDma::ReportWaitMode::Cached) {
+        static u64 reads{};
+        static u64 waited{};
+        waited += wait_reports ? 1 : 0;
+        if (++reads % 50000 == 0) {
+            LOG_INFO(HW_GPU, "Query report wait: {} of {} macro DMA reads held a cached report",
+                     waited, reads);
+        }
+    }
     u32 changed{};
     u32 verify_changed{};
     u32 verify_first{};

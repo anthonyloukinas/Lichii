@@ -102,6 +102,16 @@ public:
         return mask;
     }
 
+    /// Whether a query is cached in the region (any thread: the map is read under its lock).
+    [[nodiscard]] bool HasCachedQueries(VAddr addr, std::size_t size) {
+        bool found = false;
+        IterateCache<false>(addr, size, [&found](QueryLocation) {
+            found = true;
+            return true;
+        });
+        return found;
+    }
+
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
         bool result = false;
