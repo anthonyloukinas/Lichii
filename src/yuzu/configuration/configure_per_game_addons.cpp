@@ -380,8 +380,21 @@ void ConfigurePerGameAddons::LoadConfiguration() {
 
         first_item->setCheckState(should_enable ? Qt::Checked : Qt::Unchecked);
 
-        list_items.push_back(QList<QStandardItem*>{
-            first_item, new QStandardItem{QString::fromStdString(patch.version)}});
+        auto* const version_item = new QStandardItem{QString::fromStdString(patch.version)};
+        if (is_mod) {
+            // A built-in that its environment switch turns off keeps its saved tick; the row says
+            // that it does not apply in this session.
+            const auto note =
+                FileSys::BuiltinPatchEnvironmentNote(title_id, name.toStdString());
+            if (!note.empty()) {
+                const QString tip = QString::fromStdString(note);
+                first_item->setToolTip(tip);
+                version_item->setToolTip(tip);
+                version_item->setText(tr("%1 (off in this session)").arg(version_item->text()));
+            }
+        }
+
+        list_items.push_back(QList<QStandardItem*>{first_item, version_item});
         item_model->appendRow(list_items.back());
     }
 

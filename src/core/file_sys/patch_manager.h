@@ -143,4 +143,11 @@ private:
 void KeepSupersededBuiltinEntries(u64 title_id, std::vector<std::string>& disabled,
                                   const std::vector<std::string>& previous);
 
+/// Why a built-in patch does not apply in this session although Add-Ons may list it ticked: its
+/// environment switch is off (EDEN_NX2_OOT_REAL_TIME=0 for Real-time speed). Empty when the
+/// switch allows it. Shown on its Add-Ons row only; the saved choice is not changed.
+/// environment_allows replaces the switch's reading (tests).
+[[nodiscard]] std::string BuiltinPatchEnvironmentNote(
+    u64 title_id, std::string_view name, std::optional<bool> environment_allows = std::nullopt);
+
 } // namespace FileSys

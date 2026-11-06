@@ -596,3 +596,29 @@ TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only re
         REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::None);
     }
 }
+
+TEST_CASE("Add-Ons says when the environment switch turns Real-time speed off",
+          "[patch_manager][addons]") {
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    Settings::values.disabled_addons[OcarinaTitleId] = {};
+
+    // EDEN_NX2_OOT_REAL_TIME=0: the row stays ticked as saved, and it says neither speed patch
+    // applies.
+    const auto note = FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, RealTime, false);
+    REQUIRE(note.find("EDEN_NX2_OOT_REAL_TIME=0") != std::string::npos);
+    REQUIRE(note.find(DynamicFps) != std::string::npos);
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, DynamicFps, false).empty());
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, MaxResolution, false).empty());
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OtherTitleId, RealTime, false).empty());
+    // Switch on (also how the tests run): no note.
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, RealTime, true).empty());
+    REQUIRE(FileSys::BuiltinPatchEnvironmentNote(OcarinaTitleId, RealTime).empty());
+
+    // Opening and applying the list with the note shown saves nothing new.
+    AddonsDialog dialog{manager};
+    REQUIRE(dialog.Ticked(RealTime));
+    REQUIRE_FALSE(dialog.Ticked(DynamicFps));
+    dialog.Apply();
+    REQUIRE(Settings::values.disabled_addons[OcarinaTitleId].empty());
+}
