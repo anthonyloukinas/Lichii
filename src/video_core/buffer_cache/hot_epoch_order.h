@@ -30,9 +30,10 @@ template <typename Tracker>
 
 /// Marks the hot pages written if the guest passed an epoch since `applied`, calling
 /// on_run(address, size) for each run of them. Returns the pages marked. With no hot pages
-/// `applied` stays: a page that becomes hot later is marked at the next call.
+/// `applied` stays: a page that becomes hot later is marked at the next call. Inlined: every
+/// SynchronizeBuffer starts with it, and the two early returns must stay a load and a compare.
 template <typename Tracker, typename OnRun>
-u64 Apply(Tracker& tracker, u64& applied, OnRun&& on_run) {
+HOT_EPOCH_ORDER_INLINE u64 Apply(Tracker& tracker, u64& applied, OnRun&& on_run) {
     if (!tracker.HasHotPages()) {
         return 0;
     }
