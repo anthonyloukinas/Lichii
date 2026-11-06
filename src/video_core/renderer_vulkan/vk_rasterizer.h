@@ -338,6 +338,7 @@ private:
         HandleBind,
         HandleData,
         DeltaBuffers,
+        HandlesChanged,
         Count,
     };
     /// Why a fully resolved draw can't be reused by the next one.
@@ -369,6 +370,11 @@ private:
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
+        /// Handle rechecks: delta draws by result; with verify, draws checked and mismatches.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::RecheckResult::Count)> rechecks{};
+        u64 recheck_verified{};
+        u64 recheck_predicted_full{};
+        u64 recheck_mismatches{};
         /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
         /// StateChanged draws by the reason of the last break, and by its 3D method.
@@ -382,6 +388,7 @@ private:
         GraphicsPipeline* pipeline{}; ///< null: resolve the draw in full
         bool delta{};                 ///< light changes since: ConfigureDelta
         bool vertex_buffers{};        ///< a delta draw binds the vertex buffers again
+        bool recheck_handles{};       ///< a delta draw reads the handles again
     };
     /// The pipeline the draw can reuse with what the previous draw bound, if any.
     ReusableTake TakeReusableDraw(bool is_indexed, bool is_indirect);

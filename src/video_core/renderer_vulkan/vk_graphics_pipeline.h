@@ -19,6 +19,7 @@
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -191,7 +192,12 @@ public:
     /// image views and samplers after light changes. Handles computed at draw time are resolved
     /// on every draw.
     [[nodiscard]] bool TakesDeltaDraws() const noexcept {
-        return delta_blocker == DeltaBlocker::None && delta_views_valid;
+        return DeltaCapable() && delta_views_valid;
+    }
+
+    /// EDEN_NX2_FAST_DRAW_COMPUTED: delta draws of this pipeline must recheck its handles.
+    [[nodiscard]] bool HasComputedHandles() const noexcept {
+        return has_computed_handles;
     }
 
     /// Why TakesDeltaDraws is false (diagnostics).
@@ -204,21 +210,34 @@ public:
         Count,
     };
     [[nodiscard]] DeltaBlocker DeltaDrawBlocker() const noexcept {
-        return delta_blocker != DeltaBlocker::None ? delta_blocker
-               : delta_views_valid                 ? DeltaBlocker::None
-                                                   : DeltaBlocker::NotConfigured;
+        return !DeltaCapable()    ? delta_blocker
+               : delta_views_valid ? DeltaBlocker::None
+                                   : DeltaBlocker::NotConfigured;
     }
 
     /// Constant buffer slots per stage the pipeline reads texture and image handles from.
+    /// With EDEN_NX2_FAST_DRAW_COMPUTED, the slots of handles computed from storage buffers are
+    /// left out (delta draws recheck those).
     [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
-        return handle_constant_buffers;
+        return VideoCommon::Nx2FastDraw::g_computed_delta ? static_handle_constant_buffers
+                                                          : handle_constant_buffers;
     }
 
-    enum class DeltaResult { Configured, Failed, NeedsFull };
+    enum class DeltaResult { Configured, Failed, NeedsFull, HandlesChanged };
     /// Binds the constant and storage buffers again (storage buffer addresses are read from
     /// constant buffers) and records the draw's descriptors with the image views, samplers and
-    /// texture buffers the last full Configure resolved.
-    DeltaResult ConfigureDelta();
+    /// texture buffers the last full Configure resolved. recheck_handles: RecheckHandles first.
+    DeltaResult ConfigureDelta(bool recheck_handles);
+
+    enum class RecheckResult : u8 { Kept, Resolved, BufferHandleChanged, Count };
+    /// Reads the handles again and resolves the views and samplers of the changed ones into the
+    /// lists delta draws use. BufferHandleChanged: a texture or image buffer handle changed (the
+    /// draw must be resolved in full; the lists are left invalid).
+    RecheckResult RecheckHandles();
+    /// The result of the last delta draw's RecheckHandles.
+    [[nodiscard]] RecheckResult LastRecheck() const noexcept {
+        return last_recheck;
+    }
 
     /// EDEN_NX2_FAST_DRAW_VERIFY: the next Configure compares what it resolves with the views
     /// and samplers a delta draw would have kept; DeltaMismatch reports the result.
@@ -242,6 +261,17 @@ public:
 private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
+
+    [[nodiscard]] bool DeltaCapable() const noexcept {
+        return delta_blocker == DeltaBlocker::None ||
+               (delta_blocker == DeltaBlocker::ComputedHandles &&
+                VideoCommon::Nx2FastDraw::g_computed_delta);
+    }
+
+    /// The raw handle of element index of desc (stage's constant buffer words, or its handle
+    /// program).
+    template <typename Descriptor>
+    u32 ReadRawHandle(size_t stage, const Descriptor& desc, u32 index);
 
     /// Binds stage's native_indirect storage buffers at first_index on (task and mesh programs)
     void BindNativeIndirect(size_t stage, size_t first_index);
@@ -297,8 +327,13 @@ private:
     bool delta_mismatch{};
     std::array<bool, NUM_STAGES> configured_stages{};
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
+    std::array<u32, NUM_STAGES> static_handle_constant_buffers{};
+    bool has_computed_handles{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// The raw handle of each element of delta_views (handle rechecks).
+    std::vector<u32> delta_raw_handles;
+    RecheckResult last_recheck{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

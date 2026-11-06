@@ -67,6 +67,23 @@ inline const bool g_verify = [] {
     return value != nullptr && value[0] == '1';
 }();
 
+inline bool SwitchOn(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && value[0] == '1';
+}
+
+/// With EDEN_NX2_FAST_DRAW=2. A delta draw that rechecks handles reads every texture and image
+/// handle of the pipeline again and keeps the views and samplers of the unchanged ones; changed
+/// texture and image handles are resolved again, a changed texture buffer handle makes the draw
+/// full. EDEN_NX2_FAST_DRAW_COMPUTED=1: pipelines with handles computed from storage buffers take
+/// delta draws, which always recheck.
+inline const bool g_computed_delta = SwitchOn("EDEN_NX2_FAST_DRAW_COMPUTED");
+
+/// Whether any delta draw can recheck handles (full draws then keep the raw handles).
+inline bool RechecksHandles() {
+    return g_computed_delta;
+}
+
 /// EDEN_NX2_BUFFER_SKIP=1: the buffer cache keeps vertex buffer lookups while their registers and
 /// the page table stay the same, skips the upload scan of vertex buffers no CPU write reached, and
 /// touches each buffer's LRU entry once a frame.

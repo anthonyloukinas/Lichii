@@ -359,6 +359,7 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
         ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
         return full(FullDraw::DeltaPipeline);
     }
+    const bool recheck = FastDraw::g_computed_delta && draw.pipeline->HasComputedHandles();
     const auto& handles = draw.pipeline->HandleConstantBuffers();
     for (size_t stage = 0; stage < handles.size(); ++stage) {
         if ((delta.binds[stage] & handles[stage]) != 0) {
@@ -378,7 +379,7 @@ RasterizerVulkan::ReusableTake RasterizerVulkan::TakeReusableDraw(bool is_indexe
             }
         }
     }
-    return {draw.pipeline, true, delta.vertex_buffers};
+    return {draw.pipeline, true, delta.vertex_buffers, recheck};
 }
 
 void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
@@ -478,14 +479,27 @@ void RasterizerVulkan::ReportFastDraws() {
              "draw, {:.0f} different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} "
              "render pass or pipeline changed, {:.0f} index buffer changed buffers, {:.0f} "
              "pipeline takes no delta draws, {:.0f} handle buffer bound, {:.0f} handle data "
-             "written, {:.0f} uniform buffers changed buffers",
+             "written, {:.0f} uniform buffers changed buffers, {:.0f} buffer handle changed",
              static_cast<double>(stats.reused) / seconds,
              static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
              per_second(FullDraw::IndexBuffers), per_second(FullDraw::DeltaPipeline),
              per_second(FullDraw::HandleBind), per_second(FullDraw::HandleData),
-             per_second(FullDraw::DeltaBuffers));
+             per_second(FullDraw::DeltaBuffers), per_second(FullDraw::HandlesChanged));
+    if (VideoCommon::Nx2FastDraw::RechecksHandles()) {
+        const auto rechecks = [&](GraphicsPipeline::RecheckResult result) {
+            return static_cast<double>(stats.rechecks[static_cast<size_t>(result)]) / seconds;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Fast draw handle rechecks per second: {:.0f} kept, {:.0f} resolved again, {:.0f} "
+                 "buffer handle changed | verify totals: {} checked, {} predicted full, {} "
+                 "mismatches",
+                 rechecks(GraphicsPipeline::RecheckResult::Kept),
+                 rechecks(GraphicsPipeline::RecheckResult::Resolved),
+                 rechecks(GraphicsPipeline::RecheckResult::BufferHandleChanged),
+                 stats.recheck_verified, stats.recheck_predicted_full, stats.recheck_mismatches);
+    }
     static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
         ineligible_names{"indirect",       "mesh",          "not built",     "writes images",
                          "transform feedback", "inline index", "quads",       "repacked vertices",
@@ -799,8 +813,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         path = DrawPath::Full;
     }
     if (path == DrawPath::Delta) {
-        switch (pipeline->ConfigureDelta()) {
+        switch (pipeline->ConfigureDelta(take.recheck_handles)) {
         case GraphicsPipeline::DeltaResult::Configured:
+            if (take.recheck_handles) {
+                ++fast_draw_stats.rechecks[static_cast<size_t>(pipeline->LastRecheck())];
+            }
+            break;
+        case GraphicsPipeline::DeltaResult::HandlesChanged:
+            ++fast_draw_stats.rechecks[static_cast<size_t>(pipeline->LastRecheck())];
+            ++fast_draw_stats.full[static_cast<size_t>(FullDraw::HandlesChanged)];
+            path = DrawPath::Full;
             break;
         case GraphicsPipeline::DeltaResult::Failed:
             report_failure("configure failed");
@@ -842,7 +864,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const u64 kept_bindings =
             verify_bindings ? buffer_cache.KeptGraphicsBindingsHash(keeps_vertex, keeps_storage, true)
                             : 0;
-        if (verify_views) {
+        // A delta draw that rechecks handles would have kept the views RecheckHandles leaves.
+        const bool verify_recheck = verify_views && verify_take.delta && verify_take.recheck_handles;
+        bool verify_delta_views = verify_views;
+        if (verify_recheck) {
+            ++fast_draw_stats.recheck_verified;
+            if (pipeline->RecheckHandles() ==
+                GraphicsPipeline::RecheckResult::BufferHandleChanged) {
+                ++fast_draw_stats.recheck_predicted_full;
+                verify_delta_views = false;
+            }
+        }
+        if (verify_delta_views) {
             pipeline->VerifyNextDelta();
         }
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
@@ -850,8 +883,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
         }
-        if (verify_views && pipeline->DeltaMismatch()) {
-            ++fast_draw_stats.view_mismatches;
+        if (verify_delta_views && pipeline->DeltaMismatch()) {
+            ++(verify_recheck ? fast_draw_stats.recheck_mismatches : fast_draw_stats.view_mismatches);
         }
         if (verify_bindings &&
             kept_bindings != buffer_cache.KeptGraphicsBindingsHash(keeps_vertex, keeps_storage, true)) {
