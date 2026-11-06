@@ -224,6 +224,18 @@ private:
     std::chrono::steady_clock::time_point used_pipelines_saved{};
     void SaveUsedPipelines();
 
+    /// Appends a live graphics capture to the cache on the serialization thread (a replacement
+    /// only if it builds as read back).
+    void QueueGraphicsSerialization(
+        const GraphicsPipelineCacheKey& key,
+        VideoCommon::DiskPipelineRecords<GraphicsPipelineCacheKey>::Write write,
+        decltype(GraphicsEnvironments::envs)&& envs);
+    /// The same for a compute capture.
+    void QueueComputeSerialization(
+        const ComputePipelineCacheKey& key,
+        VideoCommon::DiskPipelineRecords<ComputePipelineCacheKey>::Write write,
+        VideoCommon::ComputeEnvironment&& env);
+
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};

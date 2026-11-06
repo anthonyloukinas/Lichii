@@ -1041,12 +1041,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
         disk_compute.NoteStored(key);
 
-        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
+        workers.QueueWork([this, key, env_ = std::move(env), build = disk_compute.StartBuild(key),
+                           &state, &callback]() mutable {
             ShaderPools pools;
             auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
-            if (!entry.pipeline) {
-                disk_compute.NoteFailed(key);
-            }
+            build.Finish(entry.pipeline != nullptr);
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
                 compute_cache.emplace(key, std::move(entry));
@@ -1111,7 +1110,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 capture_bytes += env.MemorySize();
             }
             if (background_pipelines.Add(
-                    key, capture_bytes, [this, key, envs = std::move(envs)]() mutable {
+                    key, capture_bytes,
+                    [this, key, envs = std::move(envs),
+                     build = disk_graphics.StartBuild(key)]() mutable {
                         ShaderPools pools;
                         boost::container::static_vector<Shader::Environment*,
                                                         Maxwell::MaxShaderProgram>
@@ -1121,9 +1122,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         }
                         auto pipeline =
                             CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
-                        if (!pipeline) {
-                            disk_graphics.NoteFailed(key);
-                        }
+                        // A failure writes the live capture if the GPU thread built the key
+                        // meanwhile (Write::Deferred).
+                        build.Finish(pipeline != nullptr);
                         if (pipeline && pipeline->Failed()) {
                             return std::unique_ptr<GraphicsPipeline>{};
                         }
@@ -1135,7 +1136,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         ++queued_graphics;
 
-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
+        workers.QueueWork([this, key, envs_ = std::move(envs),
+                           build = disk_graphics.StartBuild(key), &state,
+                           &callback]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
@@ -1143,9 +1146,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
-            if (!pipeline) {
-                disk_graphics.NoteFailed(key);
-            }
+            build.Finish(pipeline != nullptr);
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1820,15 +1821,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    const auto write = disk_graphics.ClaimWrite(graphics_key);
     using Write = decltype(disk_graphics)::Write;
-    if (write == Write::No) {
-        // In the disk cache already, only not built at boot.
-        QueueVulkanPipelineCacheFlush();
-        return pipeline;
+    decltype(disk_graphics)::Writer writer = [this, key = graphics_key,
+                                              envs = std::move(environments.envs)](
+                                                 Write write) mutable {
+        QueueGraphicsSerialization(key, write, std::move(envs));
+    };
+    // Deferred: the stored capture is still building in the background; writer runs if it fails.
+    const auto write = disk_graphics.ClaimWrite(graphics_key, writer);
+    if (write == Write::New || write == Write::Replacement) {
+        writer(Write{write});
     }
-    serialization_thread.QueueWork([this, key = graphics_key, write,
-                                    envs = std::move(environments.envs)] {
+    QueueVulkanPipelineCacheFlush();
+    return pipeline;
+}
+
+void PipelineCache::QueueGraphicsSerialization(
+    const GraphicsPipelineCacheKey& pipeline_key,
+    VideoCommon::DiskPipelineRecords<GraphicsPipelineCacheKey>::Write write,
+    decltype(GraphicsEnvironments::envs)&& graphics_envs) {
+    using Write = decltype(disk_graphics)::Write;
+    serialization_thread.QueueWork([this, key = pipeline_key, write,
+                                    envs = std::move(graphics_envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
         for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -1861,8 +1875,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
             disk_graphics.ReturnWrite(key, write);
         }
     });
-    QueueVulkanPipelineCacheFlush();
-    return pipeline;
 }
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
@@ -1897,12 +1909,25 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     if (!entry.pipeline || pipeline_cache_filename.empty()) {
         return entry;
     }
-    const auto write = disk_compute.ClaimWrite(key);
     using Write = decltype(disk_compute)::Write;
-    if (write == Write::No) {
-        QueueVulkanPipelineCacheFlush();
-        return entry;
+    decltype(disk_compute)::Writer writer = [this, key, env_ = std::move(env)](
+                                                Write write) mutable {
+        QueueComputeSerialization(key, write, std::move(env_));
+    };
+    // Deferred: the stored capture is still building; writer runs if it fails.
+    const auto write = disk_compute.ClaimWrite(key, writer);
+    if (write == Write::New || write == Write::Replacement) {
+        writer(Write{write});
     }
+    QueueVulkanPipelineCacheFlush();
+    return entry;
+}
+
+void PipelineCache::QueueComputeSerialization(
+    const ComputePipelineCacheKey& key,
+    VideoCommon::DiskPipelineRecords<ComputePipelineCacheKey>::Write write,
+    ComputeEnvironment&& env) {
+    using Write = decltype(disk_compute)::Write;
     serialization_thread.QueueWork([this, key, write, env_ = std::move(env)] {
         const std::array<const GenericEnvironment*, 1> envs{&env_};
         if (write == Write::New) {
@@ -1925,8 +1950,6 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
             disk_compute.ReturnWrite(key, write);
         }
     });
-    QueueVulkanPipelineCacheFlush();
-    return entry;
 }
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <memory>
 #include <span>
@@ -18,6 +20,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/shader_environment.h"
 
 namespace {
@@ -767,5 +770,81 @@ TEST_CASE("A write that stores nothing gives its claim back", "[pipeline_cache_f
     REQUIRE(AppendChecked(path, 1, true, unstorable) == VideoCommon::CheckedWrite::NotSerializable);
     records.ReturnWrite(1, Write::Replacement);
     CHECK(records.ClaimWrite(1) == Write::Replacement);
+    CHECK(records.ClaimWrite(1) == Write::No);
+}
+
+TEST_CASE("A background build that fails after the live build still gets the live capture written",
+          "[pipeline_cache_files][repair]") {
+    using Records = VideoCommon::DiskPipelineRecords<u64>;
+    using Write = Records::Write;
+    for (const bool stored_builds : {false, true}) {
+        TempDir temp;
+        const auto path = temp.path / "late.bin";
+        WriteGraphics(path, 1, 1, stored_builds);
+        Records records;
+        REQUIRE(records.NoteStored(1));
+        // The stored capture is prebuilt in the background, as the Vulkan cache does for keys a
+        // recent session did not use; this build is held until the GPU thread has gone ahead.
+        Vulkan::PipelinePrebuild<u64, int> prebuild{2, 100, false};
+        std::promise<void> entered, release;
+        auto gate = release.get_future().share();
+        REQUIRE(prebuild.Add(1, 1,
+                             [&, build = records.StartBuild(1)]() mutable -> std::unique_ptr<int> {
+                                 entered.set_value();
+                                 gate.wait();
+                                 build.Finish(stored_builds);
+                                 return stored_builds ? std::make_unique<int>(1) : nullptr;
+                             }));
+        prebuild.Start(1);
+        entered.get_future().wait();
+
+        // GPU thread: nothing ready, so it builds live and claims the write without waiting.
+        REQUIRE(prebuild.Take(1) == nullptr);
+        std::atomic<int> writes{};
+        Records::Writer writer = [&](Write write) {
+            if (write == Write::Replacement &&
+                AppendChecked(path, 1, false, Capture{false, 2, true, GraphicsStages}) ==
+                    VideoCommon::CheckedWrite::Written) {
+                ++writes;
+            }
+        };
+        CHECK(records.ClaimWrite(1, writer) == Write::Deferred);
+        CHECK(writes == 0);
+        release.set_value();
+        prebuild.Stop();
+
+        CHECK(writes == (stored_builds ? 0 : 1));
+        auto index = MakeIndex();
+        const auto loaded = Load(path, &index);
+        REQUIRE(loaded.size() == 1);
+        CHECK(loaded.front().translates);
+        CHECK(loaded.front().value == (stored_builds ? 1u : 2u));
+        CHECK(records.ClaimWrite(1) == Write::No);
+    }
+}
+
+TEST_CASE("A stored capture the GPU thread takes before its build starts keeps no live capture",
+          "[pipeline_cache_files][repair]") {
+    using Records = VideoCommon::DiskPipelineRecords<u64>;
+    using Write = Records::Write;
+    Records records;
+    REQUIRE(records.NoteStored(1));
+    Vulkan::PipelinePrebuild<u64, int> prebuild{2, 100, false};
+    std::atomic<bool> ran{};
+    REQUIRE(prebuild.Add(1, 1, [&, build = records.StartBuild(1)]() mutable {
+        ran = true;
+        build.Finish(false);
+        return std::unique_ptr<int>{};
+    }));
+    REQUIRE(prebuild.Take(1) == nullptr);
+    bool written = false;
+    Records::Writer writer = [&](Write) { written = true; };
+    CHECK(records.ClaimWrite(1, writer) == Write::Deferred);
+    prebuild.Start(1);
+    prebuild.Stop();
+    // The build never ran (the key was claimed first): the capture is untested, nothing is
+    // written now, and a later boot that builds it decides.
+    CHECK_FALSE(ran);
+    CHECK_FALSE(written);
     CHECK(records.ClaimWrite(1) == Write::No);
 }
