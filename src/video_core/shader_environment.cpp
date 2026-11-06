@@ -267,7 +267,23 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    return !has_unbound_instructions;
+    return NotSerializableReason() == nullptr;
+}
+
+const char* GenericEnvironment::NotSerializableReason() const noexcept {
+    // EDEN_NX2_STORE_GUARDED_PIPELINES=0 keeps programs with a trap guard prefix out of the disk
+    // and translation caches, as before upstream #192.
+    static const bool store_guarded = [] {
+        const char* value = std::getenv("EDEN_NX2_STORE_GUARDED_PIPELINES");
+        return !value || value[0] != '0';
+    }();
+    if (has_unbound_instructions) {
+        return "reads instructions outside its captured code";
+    }
+    if (!store_guarded && lowered_native && !lowered_native->trap_prefix.empty()) {
+        return "has a trap guard prefix";
+    }
+    return nullptr;
 }
 
 bool GenericEnvironment::HasNativeInstructions() const {

@@ -92,6 +92,9 @@ public:
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
+    /// Why the environment cannot be written to the disk cache, or nullptr.
+    [[nodiscard]] const char* NotSerializableReason() const noexcept;
+
     [[nodiscard]] bool CanCacheTranslation() const override {
         return CanBeSerialized();
     }

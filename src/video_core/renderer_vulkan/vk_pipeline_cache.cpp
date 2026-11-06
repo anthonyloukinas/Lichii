@@ -1769,10 +1769,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     }
     if (disk_pipelines.contains(graphics_key.Hash())) {
         // In the disk cache already, only not built at boot.
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline not stored: graphics {:016x} has a record in the disk cache already",
+                 graphics_key.Hash());
         QueueVulkanPipelineCacheFlush();
         return pipeline;
     }
     disk_pipelines.insert(graphics_key.Hash());
+    for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+        if (graphics_key.unique_hashes[index] == 0) {
+            continue;
+        }
+        if (const char* reason = environments.envs[index].NotSerializableReason()) {
+            LOG_INFO(Render_Vulkan, "Pipeline not stored: graphics {:016x} s{}:{:016x} {}",
+                     graphics_key.Hash(), index, graphics_key.unique_hashes[index], reason);
+            QueueVulkanPipelineCacheFlush();
+            return pipeline;
+        }
+    }
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
@@ -1817,6 +1831,12 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         }
     }
     if (!entry.pipeline || pipeline_cache_filename.empty()) {
+        return entry;
+    }
+    if (const char* reason = env.NotSerializableReason()) {
+        LOG_INFO(Render_Vulkan, "Pipeline not stored: compute {:016x} s6:{:016x} {}", key.Hash(),
+                 key.unique_hash, reason);
+        QueueVulkanPipelineCacheFlush();
         return entry;
     }
     serialization_thread.QueueWork([this, key, env_ = std::move(env)] {
