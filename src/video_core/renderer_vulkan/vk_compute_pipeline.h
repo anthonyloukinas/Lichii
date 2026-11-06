@@ -86,8 +86,9 @@ public:
     static void TickUpscalerTrace();
 
 private:
-    /// Builds the pipeline once, on whichever thread gets here first.
-    void RunBuild();
+    /// Builds the pipeline once, on whichever thread gets here first (the build worker, or the
+    /// scheduler thread of the first dispatch that needs it).
+    void RunBuild(bool on_worker);
 
     const Device& device;
     vk::PipelineCache& pipeline_cache;
@@ -113,6 +114,7 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
+    bool build_on_worker{false};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <vector>
@@ -287,8 +288,18 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineHandle = 0,
             .basePipelineIndex = 0,
         };
+        const auto create_start = std::chrono::steady_clock::now();
         try {
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            // The driver's compile (or its cache lookup), to time freezes after live builds.
+            LOG_INFO(Render_Vulkan, "Compute pipeline {:016x}: driver create {:.1f} ms on the {}{}",
+                     shader_hash,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               create_start)
+                         .count(),
+                     build_on_worker ? "build worker" : "thread that needs it",
+                     (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0 ? ", unoptimized"
+                                                                                 : "");
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
@@ -323,18 +334,19 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }};
     build_task = std::move(func);
     if (thread_worker) {
-        thread_worker->QueueWork([this] { RunBuild(); });
+        thread_worker->QueueWork([this] { RunBuild(true); });
     } else {
-        RunBuild();
+        RunBuild(false);
     }
 }
 
-void ComputePipeline::RunBuild() {
+void ComputePipeline::RunBuild(bool on_worker) {
     // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
     // waiting for the worker queue, which can hold hundreds of builds, to reach it.
     if (build_claimed.exchange(true)) {
         return;
     }
+    build_on_worker = on_worker;
     build_task();
     build_task = nullptr;
 }
@@ -602,7 +614,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
-            RunBuild();
+            RunBuild(false);
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });
