@@ -38,6 +38,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/gpu_modified_set.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/hot_epoch_order.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -249,8 +250,7 @@ public:
 
     /// EDEN_NX2_HOT_PAGES: whether hot pages must be marked written before buffers are used
     [[nodiscard]] bool HotEpochPending() const noexcept {
-        return memory_tracker.HasHotPages() &&
-               Nx2HotPages::g_epoch.load(std::memory_order_acquire) != hot_applied_epoch;
+        return HotEpochOrder::Pending(memory_tracker, hot_applied_epoch);
     }
     /// EDEN_NX2_HOT_PAGES: marks hot pages written if the guest passed a submission or an
     /// acquire since they last were (the guest may have written them for what follows)
@@ -796,6 +796,39 @@ private:
 
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
+
+    /// BindHostVertexBuffers' steps for HotEpochOrder (hot_epoch_order.h).
+    struct VertexBindSteps {
+        BufferCache& cache;
+
+        void RefreshRepackedVertexBuffers() {
+            cache.RefreshRepackedVertexBuffers();
+        }
+        struct Slot {
+            Buffer& buffer;
+            const Binding& binding;
+        };
+        bool Synchronize(const Slot& slot) {
+            return cache.SynchronizeBuffer(slot.buffer, slot.binding.device_addr,
+                                           slot.binding.size);
+        }
+        bool IsSynchronized(u32 index) const {
+            return cache.memory_tracker.IsSynchronized(index);
+        }
+        void WatchSynchronized(u32 index, const Slot& slot) {
+            cache.memory_tracker.WatchSynchronized(index, slot.binding.device_addr,
+                                                   slot.binding.size);
+        }
+        void NoteSync() {
+            ++cache.skip_stats.syncs;
+        }
+        void NoteSkip() {
+            ++cache.skip_stats.syncs_skipped;
+        }
+        void NoteMismatch() {
+            ++cache.skip_stats.verify_mismatches;
+        }
+    };
 
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);

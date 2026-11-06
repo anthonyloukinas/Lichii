@@ -1827,7 +1827,8 @@ void BufferCache<P>::RefreshRepackedVertexBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostVertexBuffers() {
-    RefreshRepackedVertexBuffers();
+    VertexBindSteps steps{*this};
+    HotEpochOrder::PrepareVertexBindings(steps);
 
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
@@ -1855,21 +1856,10 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            if (!Nx2FastDraw::g_buffer_skip) {
-                SynchronizeBuffer(buffer, binding.device_addr, binding.size);
-            } else {
-                ++skip_stats.syncs;
-                if (memory_tracker.IsSynchronized(index)) {
-                    ++skip_stats.syncs_skipped;
-                    if (Nx2FastDraw::g_verify &&
-                        !SynchronizeBuffer(buffer, binding.device_addr, binding.size)) {
-                        ++skip_stats.verify_mismatches;
-                    }
-                } else {
-                    SynchronizeBuffer(buffer, binding.device_addr, binding.size);
-                    memory_tracker.WatchSynchronized(index, binding.device_addr, binding.size);
-                }
-            }
+            HotEpochOrder::SynchronizeVertexBuffer(steps, index,
+                                                   typename VertexBindSteps::Slot{buffer, binding},
+                                                   Nx2FastDraw::g_buffer_skip,
+                                                   Nx2FastDraw::g_verify);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -3246,22 +3236,15 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 void BufferCache<P>::ApplyHotEpoch() {
-    if (!memory_tracker.HasHotPages()) {
-        return;
-    }
-    const u64 epoch = Nx2HotPages::g_epoch.load(std::memory_order_acquire);
-    if (epoch == hot_applied_epoch) {
-        return;
-    }
-    hot_applied_epoch = epoch;
     // A CPU write's side effects (WriteMemory) for pages nothing traps writes on.
-    const u64 marked = memory_tracker.MarkHotPagesWritten([&](DAddr addr, u64 size) {
-        Nx2NoteListHostWrite(addr, size);
-        if (!native_indirect_cache.empty()) {
-            InvalidateNativeIndirectCache(addr, size);
-        }
-        MarkVertexBuffersStale(addr, size);
-    });
+    const u64 marked =
+        HotEpochOrder::Apply(memory_tracker, hot_applied_epoch, [&](DAddr addr, u64 size) {
+            Nx2NoteListHostWrite(addr, size);
+            if (!native_indirect_cache.empty()) {
+                InvalidateNativeIndirectCache(addr, size);
+            }
+            MarkVertexBuffersStale(addr, size);
+        });
     if (marked == 0) {
         return;
     }
