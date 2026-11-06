@@ -1045,7 +1045,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                            &state, &callback]() mutable {
             ShaderPools pools;
             auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
-            build.Finish(entry.pipeline != nullptr);
+            build.Finish(VideoCommon::PipelineBuilt(entry.pipeline.get()));
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
                 compute_cache.emplace(key, std::move(entry));
@@ -1124,8 +1124,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                             CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
                         // A failure writes the live capture if the GPU thread built the key
                         // meanwhile (Write::Deferred).
-                        build.Finish(pipeline != nullptr);
-                        if (pipeline && pipeline->Failed()) {
+                        const bool built = VideoCommon::PipelineBuilt(pipeline.get());
+                        build.Finish(built);
+                        if (!built) {
                             return std::unique_ptr<GraphicsPipeline>{};
                         }
                         return pipeline;
@@ -1146,7 +1147,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
-            build.Finish(pipeline != nullptr);
+            build.Finish(VideoCommon::PipelineBuilt(pipeline.get()));
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1866,8 +1867,9 @@ void PipelineCache::QueueGraphicsSerialization(
                 for (auto& env : loaded) {
                     loaded_ptrs.push_back(&env);
                 }
-                return CreateGraphicsPipeline(pools, key, MakeSpan(loaded_ptrs), nullptr,
-                                              false) != nullptr;
+                const auto candidate =
+                    CreateGraphicsPipeline(pools, key, MakeSpan(loaded_ptrs), nullptr, false);
+                return VideoCommon::PipelineBuilt(candidate.get());
             });
         LogReplacement("graphics", key.Hash(), result);
         if (result == VideoCommon::CheckedWrite::NotSerializable ||
@@ -1941,8 +1943,9 @@ void PipelineCache::QueueComputeSerialization(
             key, envs, pipeline_cache_filename, CACHE_VERSION,
             [this, &key](std::span<FileEnvironment> loaded) {
                 ShaderPools pools;
-                return CreateComputePipeline(pools, key, loaded.front(), nullptr, false)
-                           .pipeline != nullptr;
+                const auto candidate =
+                    CreateComputePipeline(pools, key, loaded.front(), nullptr, false);
+                return VideoCommon::PipelineBuilt(candidate.pipeline.get());
             });
         LogReplacement("compute", key.Hash(), result);
         if (result == VideoCommon::CheckedWrite::NotSerializable ||

@@ -848,3 +848,84 @@ TEST_CASE("A stored capture the GPU thread takes before its build starts keeps n
     CHECK_FALSE(written);
     CHECK(records.ClaimWrite(1) == Write::No);
 }
+
+namespace {
+
+/// Wrappers as a synchronous build leaves them when the driver build failed or succeeded.
+struct FakeGraphicsPipeline {
+    bool failed{};
+    bool IsBuilt() const {
+        return true;
+    }
+    bool Failed() const {
+        return failed;
+    }
+};
+
+struct FakeComputePipeline {
+    bool bound{};
+    bool IsBound() const {
+        return bound;
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("A pipeline counts as built only when the driver built it",
+          "[pipeline_cache_files][repair]") {
+    const FakeGraphicsPipeline graphics_failed{true}, graphics_built{false};
+    const FakeComputePipeline compute_unbound{false}, compute_bound{true};
+    CHECK_FALSE(VideoCommon::PipelineBuilt<FakeGraphicsPipeline>(nullptr));
+    CHECK_FALSE(VideoCommon::PipelineBuilt(&graphics_failed));
+    CHECK(VideoCommon::PipelineBuilt(&graphics_built));
+    CHECK_FALSE(VideoCommon::PipelineBuilt(&compute_unbound));
+    CHECK(VideoCommon::PipelineBuilt(&compute_bound));
+
+    // A checked replacement whose driver build fails is not written.
+    TempDir temp;
+    const auto path = temp.path / "driver.bin";
+    WriteCompute(path, 1, 1, false);
+    const auto size = std::filesystem::file_size(path);
+    const Capture capture{true, 2, true, {}};
+    CHECK(VideoCommon::AppendCheckedPipeline(u64{1}, capture.envs, path, Version,
+                                             [](std::span<VideoCommon::FileEnvironment> envs) {
+                                                 const auto candidate =
+                                                     std::make_unique<FakeComputePipeline>(false);
+                                                 return TranslatesAll(envs) &&
+                                                        VideoCommon::PipelineBuilt(candidate.get());
+                                             }) == VideoCommon::CheckedWrite::Rejected);
+    CHECK(std::filesystem::file_size(path) == size);
+}
+
+TEST_CASE("A background build the driver rejects still gets the live capture written",
+          "[pipeline_cache_files][repair]") {
+    using Records = VideoCommon::DiskPipelineRecords<u64>;
+    using Write = Records::Write;
+    Records records;
+    REQUIRE(records.NoteStored(1));
+    Vulkan::PipelinePrebuild<u64, FakeGraphicsPipeline> prebuild{2, 100, false};
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    // As the Vulkan prebuild: the wrapper exists, its build failed.
+    REQUIRE(prebuild.Add(1, 1, [&, build = records.StartBuild(1)]() mutable {
+        entered.set_value();
+        gate.wait();
+        auto pipeline = std::make_unique<FakeGraphicsPipeline>(true);
+        const bool built = VideoCommon::PipelineBuilt(pipeline.get());
+        build.Finish(built);
+        return built ? std::move(pipeline) : nullptr;
+    }));
+    prebuild.Start(1);
+    entered.get_future().wait();
+    REQUIRE(prebuild.Take(1) == nullptr);
+    std::atomic<int> writes{};
+    Records::Writer writer = [&](Write write) {
+        if (write == Write::Replacement) {
+            ++writes;
+        }
+    };
+    REQUIRE(records.ClaimWrite(1, writer) == Write::Deferred);
+    release.set_value();
+    prebuild.Stop();
+    CHECK(writes == 1);
+}

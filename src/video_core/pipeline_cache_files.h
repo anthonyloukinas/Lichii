@@ -97,6 +97,21 @@ inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
     return true;
 }
 
+/// Whether a synchronous build (build_in_parallel false) gave a pipeline the driver accepted. A
+/// failed build still leaves its wrapper: graphics catches the failure in its build and reports
+/// Failed(); compute catches the driver's rejection and holds no handle (IsBound() false).
+template <typename Pipeline>
+[[nodiscard]] bool PipelineBuilt(const Pipeline* pipeline) {
+    if (pipeline == nullptr) {
+        return false;
+    }
+    if constexpr (requires { pipeline->Failed(); }) {
+        return pipeline->IsBuilt() && !pipeline->Failed();
+    } else {
+        return pipeline->IsBound();
+    }
+}
+
 /// Which pipelines the transferable cache holds, so that a live build is appended only when the
 /// cache has no record for it, or when the stored capture failed to build (it lacks an answer
 /// the translation now asks for). Such a replacement follows the old record and is the one
