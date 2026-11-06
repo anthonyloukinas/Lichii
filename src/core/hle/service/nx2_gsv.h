@@ -1822,10 +1822,19 @@ private:
             }
             m_frame_trace.last_present = entered;
         }
+        // EDEN_NX2_OOT_REAL_TIME=0 never writes the delta, so the game keeps the patched-in 1.0
+        // (its old fixed step) with the patch still applied: for A/B timing and for routes
+        // scripted in frames. Unset or 1 writes the measured frame time.
+        static const bool oot_real_time = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_REAL_TIME");
+            return value == nullptr || value[0] != '0';
+        }();
         if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
-                system.ApplicationMemory().Write32(
-                    address, std::bit_cast<u32>(m_oot_frame_delta.Update(entered)));
+                const float delta = m_oot_frame_delta.Update(entered);
+                if (oot_real_time) {
+                    system.ApplicationMemory().Write32(address, std::bit_cast<u32>(delta));
+                }
             }
         }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
