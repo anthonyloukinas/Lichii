@@ -1617,6 +1617,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
         flush_if_dirty();
     }
+    // Reports and semaphore writes held in the query cache are written out (and waited on
+    // through the fence manager) on the thread that owns it: without this, macro DMA reads of
+    // occlusion reports return stale counts and the guest culls visible objects. The non-split
+    // path in macro.cpp has the matching flush.
+    split.Run(
+        [memory = &memory_manager, source, read_bytes] {
+            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+        },
+        VideoCommon::DrainSite::MacroDmaFlush);
     u32 changed{};
     u32 verify_changed{};
     u32 verify_first{};
