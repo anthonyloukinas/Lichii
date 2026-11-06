@@ -801,6 +801,11 @@ private:
     struct VertexBindSteps {
         BufferCache& cache;
 
+        void ApplyPendingHotEpoch() {
+            if (cache.HotEpochPending()) [[unlikely]] {
+                cache.ApplyHotEpoch();
+            }
+        }
         void RefreshRepackedVertexBuffers() {
             cache.RefreshRepackedVertexBuffers();
         }

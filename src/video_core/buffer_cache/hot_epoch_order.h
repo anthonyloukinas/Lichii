@@ -44,10 +44,14 @@ u64 Apply(Tracker& tracker, u64& applied, OnRun&& on_run) {
     return tracker.MarkHotPagesWritten(on_run);
 }
 
-/// Before BufferCache::BindHostVertexBuffers looks at any slot.
-/// Steps: RefreshRepackedVertexBuffers().
+/// Before BufferCache::BindHostVertexBuffers looks at any slot. The epoch sets the stale bits of
+/// repacked slots and clears the synchronized ranges (EDEN_NX2_BUFFER_SKIP), so it goes first:
+/// applied only by a slot's upload (SynchronizeBuffer), it came after the refresh had read the
+/// stale bits, and never at all when the skip left out the upload.
+/// Steps: ApplyPendingHotEpoch(), RefreshRepackedVertexBuffers().
 template <typename Steps>
 HOT_EPOCH_ORDER_INLINE void PrepareVertexBindings(Steps& steps) {
+    steps.ApplyPendingHotEpoch();
     steps.RefreshRepackedVertexBuffers();
 }
 
