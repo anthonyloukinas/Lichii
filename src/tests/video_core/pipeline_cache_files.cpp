@@ -1110,3 +1110,175 @@ TEST_CASE("A write that cannot complete counts for nothing and keeps the earlier
     CHECK(Load(path, &reloaded).size() == 4);
 }
 #endif
+
+namespace {
+
+using VkGraphicsKey = Vulkan::GraphicsPipelineCacheKey;
+using VkRecords = VideoCommon::DiskPipelineRecords<VkGraphicsKey>;
+constexpr std::initializer_list<Shader::Stage> MeshStages{
+    Shader::Stage::Task, Shader::Stage::Mesh, Shader::Stage::Fragment};
+constexpr std::initializer_list<Shader::Stage> VertexStages{Shader::Stage::VertexB,
+                                                            Shader::Stage::Fragment};
+
+VkGraphicsKey PipelineKey(u64 attribute_types, u64 fragment = 0x292b3848bd8c1dbf,
+                          bool dynamic_vertex_input = true) {
+    VkGraphicsKey key{};
+    key.unique_hashes[1] = 0x46cc6aaba42f700f;
+    key.unique_hashes[3] = 0x7caf726f95774b01;
+    key.unique_hashes[5] = fragment;
+    key.state.extended_dynamic_state_3_blend.Assign(1);
+    key.state.dynamic_vertex_input.Assign(dynamic_vertex_input ? 1 : 0);
+    key.state.attribute_types = attribute_types;
+    return key;
+}
+
+void WritePipeline(const std::filesystem::path& path, const VkGraphicsKey& key, bool complete,
+                   std::initializer_list<Shader::Stage> stages) {
+    std::vector<std::unique_ptr<SerializedEnvironment>> owned;
+    std::vector<const VideoCommon::GenericEnvironment*> envs;
+    for (const auto stage : stages) {
+        owned.push_back(std::make_unique<SerializedEnvironment>(stage, 0x1357, complete));
+        envs.push_back(owned.back().get());
+    }
+    REQUIRE(VideoCommon::SerializePipeline(key, envs, path, Version));
+}
+
+struct LoadedPipeline {
+    VkGraphicsKey key;
+    bool translates;
+};
+
+/// One boot of the Vulkan cache's loader: the record index LoadDiskResources builds, task/mesh
+/// keys normalised as load_graphics does before NoteStored, a capture that does not translate
+/// noted as failed.
+std::vector<LoadedPipeline> LoadPipelineKeys(const std::filesystem::path& path,
+                                             VideoCommon::PipelineRecordIndex& index,
+                                             VkRecords& records, bool mask) {
+    std::vector<LoadedPipeline> loaded;
+    VideoCommon::LoadPipelines(
+        {}, path, Version,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> envs) {
+            VkGraphicsKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            if (std::ranges::any_of(envs, [](const VideoCommon::FileEnvironment& env) {
+                    return env.ShaderStage() == Shader::Stage::Task ||
+                           env.ShaderStage() == Shader::Stage::Mesh;
+                })) {
+                Vulkan::ClearMeshVertexInput(key, mask);
+            }
+            if (!records.NoteStored(key)) {
+                return;
+            }
+            const bool translates = TranslatesAll(envs);
+            if (!translates) {
+                records.NoteFailed(key);
+            }
+            loaded.push_back({key, translates});
+        },
+        &index);
+    return loaded;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("A repaired task/mesh capture is not shadowed by older records whose keys differ only "
+          "in vertex attribute types",
+          "[pipeline_cache_files][repair][mesh_key]") {
+    TempDir temp;
+    const auto path = temp.path / "mesh-repair.bin";
+    // Two captures from before the types were cleared, both lacking an answer the translation
+    // now asks for, the older one first.
+    WritePipeline(path, PipelineKey(0x15000105), false, MeshStages);
+    WritePipeline(path, PipelineKey(0x15310100), false, MeshStages);
+    using Write = VkRecords::Write;
+    auto live = PipelineKey(0x15310100);
+    Vulkan::ClearMeshVertexInput(live, true);
+
+    // Boot 1: one of them is loaded, fails, and the live build repairs it.
+    {
+        auto index = Vulkan::MakePipelineRecordIndex(true);
+        VkRecords records;
+        const auto loaded = LoadPipelineKeys(path, index, records, true);
+        REQUIRE(loaded.size() == 1);
+        REQUIRE_FALSE(loaded[0].translates);
+        REQUIRE(loaded[0].key == live);
+        REQUIRE(records.ClaimWrite(live) == Write::Replacement);
+        WritePipeline(path, live, true, MeshStages);
+    }
+    const auto repaired_size = std::filesystem::file_size(path);
+
+    // Boots 2 and 3: the repair is the newest record of the normalised key; it is loaded, builds,
+    // and nothing is written again.
+    for (int boot = 2; boot <= 3; ++boot) {
+        auto index = Vulkan::MakePipelineRecordIndex(true);
+        VkRecords records;
+        const auto loaded = LoadPipelineKeys(path, index, records, true);
+        REQUIRE(loaded.size() == 1);
+        REQUIRE(loaded[0].translates);
+        REQUIRE(loaded[0].key == live);
+        REQUIRE(index.superseded == 2);
+        REQUIRE(records.ClaimWrite(live) == Write::No);
+        REQUIRE(std::filesystem::file_size(path) == repaired_size);
+    }
+}
+
+TEST_CASE("Only task/mesh keys with dynamic vertex input merge over their vertex attribute types",
+          "[pipeline_cache_files][repair][mesh_key]") {
+    TempDir temp;
+    const auto path = temp.path / "mesh-controls.bin";
+    const auto load = [&](bool mask, bool colliding = false) {
+        auto index = Vulkan::MakePipelineRecordIndex(mask);
+        if (colliding) {
+            // Every key hashes the same: only the (normalised) key bytes tell records apart.
+            index.identify = [](std::span<const char> bytes,
+                                bool) -> VideoCommon::PipelineRecordIndex::Identity {
+                VkGraphicsKey key;
+                std::memcpy(&key, bytes.data(), sizeof(key));
+                return {0x5eed, key.Size()};
+            };
+        }
+        VkRecords records;
+        auto loaded = LoadPipelineKeys(path, index, records, mask);
+        return std::pair{loaded, index.superseded};
+    };
+
+    SECTION("vertex pipelines keep their types") {
+        WritePipeline(path, PipelineKey(0x15000105), true, VertexStages);
+        WritePipeline(path, PipelineKey(0x15310100), true, VertexStages);
+        const auto [loaded, superseded] = load(true);
+        REQUIRE(loaded.size() == 2);
+        REQUIRE(superseded == 0);
+        REQUIRE(loaded[0].key.state.attribute_types == 0x15000105);
+        REQUIRE(loaded[1].key.state.attribute_types == 0x15310100);
+    }
+    SECTION("without dynamic vertex input the field holds divisors and is kept") {
+        WritePipeline(path, PipelineKey(0x1, 0x292b3848bd8c1dbf, false), true, MeshStages);
+        WritePipeline(path, PipelineKey(0x3, 0x292b3848bd8c1dbf, false), true, MeshStages);
+        const auto [loaded, superseded] = load(true);
+        REQUIRE(loaded.size() == 2);
+        REQUIRE(superseded == 0);
+    }
+    SECTION("EDEN_NX2_MESH_KEY_ATTRIBUTES=1 keeps the old keys") {
+        WritePipeline(path, PipelineKey(0x15000105), true, MeshStages);
+        WritePipeline(path, PipelineKey(0x15310100), true, MeshStages);
+        const auto [loaded, superseded] = load(false);
+        REQUIRE(loaded.size() == 2);
+        REQUIRE(superseded == 0);
+    }
+    SECTION("equal hashes do not merge task/mesh keys whose normalised bytes differ") {
+        WritePipeline(path, PipelineKey(0x15000105, 0x1111), true, MeshStages);
+        WritePipeline(path, PipelineKey(0x15310100, 0x2222), true, MeshStages);
+        const auto [loaded, superseded] = load(true, true);
+        REQUIRE(loaded.size() == 2);
+        REQUIRE(superseded == 0);
+    }
+    SECTION("equal normalised bytes merge, newest first, under equal hashes too") {
+        WritePipeline(path, PipelineKey(0x15000105), false, MeshStages);
+        WritePipeline(path, PipelineKey(0x15310100), true, MeshStages);
+        const auto [loaded, superseded] = load(true, true);
+        REQUIRE(loaded.size() == 1);
+        REQUIRE(loaded[0].translates);
+        REQUIRE(superseded == 1);
+    }
+}

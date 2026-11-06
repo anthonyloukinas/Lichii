@@ -1460,6 +1460,7 @@ std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, st
             }
             std::optional<Shader::Stage> first_stage;
             bool complete = true;
+            bool mesh = false;
             for (u32 env = 0; env < num_envs; ++env) {
                 const auto stage = FileEnvironment::Skip(file, end);
                 if (!stage) {
@@ -1469,6 +1470,7 @@ std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, st
                 if (!first_stage) {
                     first_stage = stage;
                 }
+                mesh |= *stage == Shader::Stage::Task || *stage == Shader::Stage::Mesh;
             }
             if (!complete) {
                 break;
@@ -1478,7 +1480,7 @@ std::vector<IndexedRecord> IndexPipelineRecords(std::stop_token stop_loading, st
             file.read(key.data(), static_cast<std::streamsize>(key.size()));
             scanned.push_back({
                 .end = file.tellg(),
-                .key = index.Key(std::span<const char>{key}, compute),
+                .key = index.CanonicalKey(std::span<const char>{key}, compute, mesh),
                 .compute = compute,
             });
         }

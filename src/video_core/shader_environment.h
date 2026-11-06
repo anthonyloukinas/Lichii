@@ -358,6 +358,10 @@ struct PipelineRecordIndex {
     size_t graphics_key_size{};
     /// compute is true for the key of a compute record.
     std::function<Identity(std::span<const char> key, bool compute)> identify;
+    /// Optional: rewrites a graphics key to the form the loader uses before it is identified, so
+    /// the newest record is chosen among the records the loader treats as one key. mesh is true
+    /// when the record holds a task or mesh program (from its stored stages).
+    std::function<void(std::span<char> key, bool mesh)> canonical_graphics_key;
 
     /// Filled by LoadPipelines: the records stored per key, and how many older records it
     /// skipped for a newer one.
@@ -370,9 +374,20 @@ struct PipelineRecordIndex {
         return {identity.hash, std::string(key.data(), std::min(identity.size, key.size()))};
     }
 
-    [[nodiscard]] u32 Records(std::span<const char> key, bool compute) const {
+    /// The key as identified (canonical_graphics_key applied to a graphics key).
+    [[nodiscard]] RecordKey CanonicalKey(std::span<const char> key, bool compute,
+                                         bool mesh) const {
+        if (compute || !canonical_graphics_key) {
+            return Key(key, compute);
+        }
+        std::string bytes(key.data(), key.size());
+        canonical_graphics_key(std::span<char>{bytes.data(), bytes.size()}, mesh);
+        return Key(std::span<const char>{bytes.data(), bytes.size()}, compute);
+    }
+
+    [[nodiscard]] u32 Records(std::span<const char> key, bool compute, bool mesh = false) const {
         const auto& records = compute ? compute_records : graphics_records;
-        const auto it = records.find(Key(key, compute));
+        const auto it = records.find(CanonicalKey(key, compute, mesh));
         return it == records.end() ? 1 : it->second;
     }
 };

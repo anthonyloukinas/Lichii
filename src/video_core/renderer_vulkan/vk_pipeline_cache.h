@@ -120,6 +120,11 @@ struct ComputePipelineCacheEntry {
 
 /// Clears the vertex attribute types from a task/mesh pipeline's key (it has no vertex input).
 void ClearMeshVertexInput(GraphicsPipelineCacheKey& key) noexcept;
+/// mask: EDEN_NX2_MESH_KEY_ATTRIBUTES is not 1 (what the overload above reads).
+void ClearMeshVertexInput(GraphicsPipelineCacheKey& key, bool mask) noexcept;
+
+/// The record index LoadDiskResources loads the disk cache with (newest record per key).
+[[nodiscard]] VideoCommon::PipelineRecordIndex MakePipelineRecordIndex(bool mask_mesh_attributes);
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:

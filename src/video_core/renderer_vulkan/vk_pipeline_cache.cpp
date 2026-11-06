@@ -832,10 +832,44 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
-void ClearMeshVertexInput(GraphicsPipelineCacheKey& key) noexcept {
-    if (key.state.dynamic_vertex_input && MaskMeshAttributeTypes()) {
+void ClearMeshVertexInput(GraphicsPipelineCacheKey& key, bool mask) noexcept {
+    if (key.state.dynamic_vertex_input && mask) {
         key.state.attribute_types = 0;
     }
+}
+
+void ClearMeshVertexInput(GraphicsPipelineCacheKey& key) noexcept {
+    ClearMeshVertexInput(key, MaskMeshAttributeTypes());
+}
+
+VideoCommon::PipelineRecordIndex MakePipelineRecordIndex(bool mask_mesh_attributes) {
+    return {
+        .compute_key_size = sizeof(ComputePipelineCacheKey),
+        .graphics_key_size = sizeof(GraphicsPipelineCacheKey),
+        .identify = [](std::span<const char> bytes,
+                       bool compute) -> VideoCommon::PipelineRecordIndex::Identity {
+            if (compute) {
+                ComputePipelineCacheKey key;
+                std::memcpy(&key, bytes.data(), sizeof(key));
+                return {key.Hash(), sizeof(key)};
+            }
+            GraphicsPipelineCacheKey key;
+            std::memcpy(&key, bytes.data(), sizeof(key));
+            return {key.Hash(), key.Size()};
+        },
+        // load_graphics clears the types of a task/mesh key before NoteStored: the newest record
+        // is chosen among the records that become one key there, so an older capture whose
+        // types differ cannot shadow a later repair.
+        .canonical_graphics_key = [mask_mesh_attributes](std::span<char> bytes, bool mesh) {
+            if (!mesh) {
+                return;
+            }
+            GraphicsPipelineCacheKey key;
+            std::memcpy(&key, bytes.data(), sizeof(key));
+            ClearMeshVertexInput(key, mask_mesh_attributes);
+            std::memcpy(bytes.data(), &key, sizeof(key));
+        },
+    };
 }
 
 void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) {
@@ -1050,21 +1084,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
     }
-    VideoCommon::PipelineRecordIndex record_index{
-        .compute_key_size = sizeof(ComputePipelineCacheKey),
-        .graphics_key_size = sizeof(GraphicsPipelineCacheKey),
-        .identify = [](std::span<const char> bytes,
-                       bool compute) -> VideoCommon::PipelineRecordIndex::Identity {
-            if (compute) {
-                ComputePipelineCacheKey key;
-                std::memcpy(&key, bytes.data(), sizeof(key));
-                return {key.Hash(), sizeof(key)};
-            }
-            GraphicsPipelineCacheKey key;
-            std::memcpy(&key, bytes.data(), sizeof(key));
-            return {key.Hash(), key.Size()};
-        },
-    };
+    auto record_index = MakePipelineRecordIndex(MaskMeshAttributeTypes());
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
