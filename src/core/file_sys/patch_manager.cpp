@@ -47,34 +47,73 @@ constexpr std::array<const char*, 14> EXEFS_FILE_NAMES{
     "subsdk3", "subsdk4",   "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
 };
 
-struct BuiltinPatchWord {
+struct BuiltinPatchRecord {
     size_t module_offset;
-    u32 original;
-    u32 replacement;
+    std::span<const u8> bytes;
+    std::span<const u8> original;
+    bool executable_padding = false;
 };
 
-/// All of a patch's words apply together, or none of them do.
+/// All of a patch's records apply together, or none of them do.
 struct BuiltinPatch {
     std::string_view name;
     u64 title_id;
     std::string_view module;
     std::string_view build_id;
-    std::span<const BuiltinPatchWord> words;
+    std::span<const BuiltinPatchRecord> records;
+    size_t state_offset = 0;
+    size_t state_size = 0;
 };
 
-constexpr std::array OCARINA_MAX_RESOLUTION{
-    BuiltinPatchWord{0x805BD0, 0x360041E8, 0x1400020F}, // tbz w8, #0, 0x80640c -> b 0x80640c
+constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
+constexpr std::array<u8, 4> MAX_RESOLUTION_BRANCH{0x0F, 0x02, 0x00, 0x14};
+constexpr std::array MAX_RESOLUTION_RECORDS{
+    BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
 };
 
-constexpr std::array OCARINA_REAL_TIME{
-    BuiltinPatchWord{Service::Nx2OotTime::DeltaOffset, 0x00000000, 0x3F800000}, // 1.0f
-    BuiltinPatchWord{Service::Nx2OotTime::LoadDeltaOffset, 0x00000000,
-                     Service::Nx2OotTime::LoadDeltaInstruction}, // ldr s8, 0x3c461e0
-    BuiltinPatchWord{Service::Nx2OotTime::ReturnOffset, 0x00000000,
-                     Service::Nx2OotTime::ReturnInstruction}, // b 0x6e6cc8
-    // fdiv s8, s1, s0 -> b 0x3c461e4
-    BuiltinPatchWord{Service::Nx2OotTime::HookOffset, 0x1E201828,
-                     Service::Nx2OotTime::HookInstruction},
+constexpr std::array<u8, 4> DYNAMIC_FPS_ORIGINAL{0x28, 0x18, 0x20, 0x1E};
+constexpr std::array<u8, 4> DYNAMIC_FPS_CALL{0x4F, 0x7D, 0xD5, 0x94};
+constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
+    0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91, 0x2B, 0xE0, 0x3B,
+    0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9, 0xCC, 0x02, 0x00, 0xB4, 0x6B, 0x01,
+    0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5, 0x8E, 0x02, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F,
+    0x01, 0x0E, 0xEB, 0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9, 0x4C, 0x00, 0x00, 0xB5,
+    0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D, 0x8E, 0x8B, 0x4C, 0x05, 0x00,
+    0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E, 0x42, 0x18, 0x23, 0x1E, 0x42, 0x08,
+    0x21, 0x1E, 0xC3, 0x00, 0x00, 0x1C, 0x03, 0x09, 0x23, 0x1E, 0x40, 0x20, 0x23, 0x1E, 0x4D,
+    0x00, 0x00, 0x54, 0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0x83, 0x3F,
+};
+constexpr std::array DYNAMIC_FPS_RECORDS{
+    BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
+    BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
+};
+
+constexpr std::array<u8, 4> LittleEndianWord(u32 word) {
+    return {static_cast<u8>(word), static_cast<u8>(word >> 8), static_cast<u8>(word >> 16),
+            static_cast<u8>(word >> 24)};
+}
+
+// Ocarina of Time's frame delta comes from the measured frame time (nx2_oot_time.h): the hook
+// replaces the same fdiv as Dynamic FPS, so at most one of the two applies (the first in
+// BUILTIN_PATCHES; the other then sees changed bytes and is skipped).
+constexpr std::array<u8, 12> REAL_TIME_STUB = [] {
+    std::array<u8, 12> bytes{};
+    const std::array<u32, 3> words{0x3F800000, // 1.0f, the delta the present path rewrites
+                                   Service::Nx2OotTime::LoadDeltaInstruction, // ldr s8, 0x3c461e0
+                                   Service::Nx2OotTime::ReturnInstruction};   // b 0x6e6cc8
+    for (size_t i = 0; i < words.size(); ++i) {
+        const auto word = LittleEndianWord(words[i]);
+        std::copy(word.begin(), word.end(), bytes.begin() + i * 4);
+    }
+    return bytes;
+}();
+constexpr std::array<u8, 12> REAL_TIME_STUB_ORIGINAL{};
+// fdiv s8, s1, s0 -> b 0x3c461e4
+constexpr std::array<u8, 4> REAL_TIME_HOOK =
+    LittleEndianWord(Service::Nx2OotTime::HookInstruction);
+constexpr std::array REAL_TIME_RECORDS{
+    BuiltinPatchRecord{Service::Nx2OotTime::DeltaOffset, REAL_TIME_STUB, REAL_TIME_STUB_ORIGINAL},
+    BuiltinPatchRecord{Service::Nx2OotTime::HookOffset, REAL_TIME_HOOK, DYNAMIC_FPS_ORIGINAL},
 };
 
 constexpr std::array BUILTIN_PATCHES{
@@ -85,16 +124,26 @@ constexpr std::array BUILTIN_PATCHES{
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .words = OCARINA_MAX_RESOLUTION,
+        .records = MAX_RESOLUTION_RECORDS,
     },
     // Ocarina of Time's frame delta comes from the measured frame time, so it doesn't run in slow
-    // motion below 60 fps: see nx2_oot_time.h.
+    // motion below 60 fps: see nx2_oot_time.h. Listed before Dynamic FPS, which hooks the same
+    // instruction: with both enabled this one applies and Dynamic FPS is skipped.
     BuiltinPatch{
         .name = "Real-time speed (built-in)",
         .title_id = Service::Nx2OotTime::ProgramId,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .words = OCARINA_REAL_TIME,
+        .records = REAL_TIME_RECORDS,
+    },
+    BuiltinPatch{
+        .name = "Dynamic FPS by Dark (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = DYNAMIC_FPS_RECORDS,
+        .state_offset = 0x4E9FE00,
+        .state_size = 16,
     },
 };
 
@@ -527,42 +576,83 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                      patch.build_id);
             continue;
         }
-        const auto word_at = [](const std::vector<u8>& data, size_t offset) -> std::optional<u32> {
-            if (data.size() < offset + sizeof(u32)) {
-                return std::nullopt;
-            }
-            u32 word;
-            std::memcpy(&word, data.data() + offset, sizeof(word));
-            return word;
+        const auto fits = [](const std::vector<u8>& data, size_t offset, size_t size) {
+            return data.size() >= sizeof(Loader::NSOHeader) &&
+                   offset <= data.size() - sizeof(Loader::NSOHeader) &&
+                   size <= data.size() - sizeof(Loader::NSOHeader) - offset;
         };
-        const bool applies = std::ranges::all_of(patch.words, [&](const BuiltinPatchWord& word) {
-            const size_t offset = sizeof(Loader::NSOHeader) + word.module_offset;
-            const auto original = word_at(nso, offset);
-            if (original != word.original) {
-                LOG_WARNING(Loader,
-                            "    - Skipping \"{}\": {}+{:#x} holds {:#010x}, expected {:#010x}",
-                            patch.name, name, word.module_offset, original.value_or(0),
-                            word.original);
-                return false;
+        if (patch.state_size != 0) {
+            const auto& data = header.segments[2];
+            const u64 bss_start = u64{data.location} + data.size;
+            const u64 bss_end = bss_start + data.bss_size;
+            if (patch.state_offset < bss_start || patch.state_offset > bss_end ||
+                patch.state_size > bss_end - patch.state_offset ||
+                !fits(nso, patch.state_offset, patch.state_size) ||
+                !fits(out, patch.state_offset, patch.state_size)) {
+                LOG_WARNING(Loader, "    - Skipping \"{}\": timer state is outside BSS",
+                            patch.name);
+                continue;
             }
-            if (const auto modded = word_at(out, offset); modded != word.original) {
-                LOG_INFO(Loader,
-                         "    - Skipping \"{}\": a user mod already patched {}+{:#x} to "
-                         "{:#010x}, the mod's patch is used",
-                         patch.name, name, word.module_offset, modded.value_or(0));
-                return false;
+            const size_t offset = sizeof(Loader::NSOHeader) + patch.state_offset;
+            if (!std::all_of(nso.begin() + offset, nso.begin() + offset + patch.state_size,
+                             [](u8 byte) { return byte == 0; }) ||
+                !std::equal(nso.begin() + offset, nso.begin() + offset + patch.state_size,
+                            out.begin() + offset)) {
+                LOG_WARNING(Loader, "    - Skipping \"{}\": timer state is not zero-filled",
+                            patch.name);
+                continue;
             }
-            return true;
-        });
-        if (!applies) {
+        }
+        bool apply = true;
+        for (const auto& record : patch.records) {
+            if (!fits(nso, record.module_offset, record.bytes.size()) ||
+                !fits(out, record.module_offset, record.bytes.size()) ||
+                !fits(nso, record.module_offset, record.original.size())) {
+                LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} is past the module's end",
+                            patch.name, name, record.module_offset);
+                apply = false;
+                break;
+            }
+            const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
+            if (record.executable_padding) {
+                const auto& text = header.segments[0];
+                const u64 text_end = u64{text.location} + text.size;
+                const u64 executable_end = (text_end + 0xFFF) & ~u64{0xFFF};
+                if (record.module_offset < text_end ||
+                    record.module_offset + record.bytes.size() > executable_end ||
+                    record.module_offset + record.bytes.size() > header.segments[1].location ||
+                    !std::all_of(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
+                                 [](u8 byte) { return byte == 0; })) {
+                    LOG_WARNING(Loader,
+                                "    - Skipping \"{}\": code cave is not executable padding",
+                                patch.name);
+                    apply = false;
+                    break;
+                }
+            }
+            if (!std::equal(record.original.begin(), record.original.end(), nso.begin() + offset)) {
+                LOG_WARNING(Loader, "    - Skipping \"{}\": unexpected original bytes at {}+{:#x}",
+                            patch.name, name, record.module_offset);
+                apply = false;
+                break;
+            }
+            if (!std::equal(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
+                            out.begin() + offset)) {
+                LOG_INFO(Loader, "    - Skipping \"{}\": a user mod already patched {}+{:#x}",
+                         patch.name, name, record.module_offset);
+                apply = false;
+                break;
+            }
+        }
+        if (!apply) {
             continue;
         }
-        for (const auto& word : patch.words) {
-            std::memcpy(out.data() + sizeof(Loader::NSOHeader) + word.module_offset,
-                        &word.replacement, sizeof(word.replacement));
-            LOG_INFO(Loader, "    - Applying built-in patch \"{}\" at {}+{:#x}", patch.name, name,
-                     word.module_offset);
+        for (const auto& record : patch.records) {
+            std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
+                        record.bytes.data(), record.bytes.size());
         }
+        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
+                 patch.records.size(), name);
     }
 
     if (out.size() < sizeof(Loader::NSOHeader)) {

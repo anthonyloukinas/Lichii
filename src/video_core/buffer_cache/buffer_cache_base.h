@@ -38,6 +38,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/gpu_modified_set.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -47,6 +48,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -190,6 +192,7 @@ public:
 
 template <class P>
 class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInfo> {
+    friend struct BufferCacheTestAccess;
     // Page size for caching purposes.
     // This is unrelated to the CPU page size and it can be changed as it seems optimal.
 #ifdef YUZU_LEGACY
@@ -282,7 +285,7 @@ public:
     void DownloadMemory(DAddr device_addr, u64 size);
 
     /// DownloadMemory for each range, waiting for the GPU once.
-    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
+    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
 
     /// The area a guest CPU read of [device_addr, device_addr + size) flushes and the core then
     /// skips later reads in.
@@ -911,6 +914,9 @@ private:
         if (queued < size && !ArmReadTraps(device_addr, size)) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
         }
+        if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
+            Nx2DownloadTrace::Queued(device_addr, size, queued);
+        }
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
@@ -947,6 +953,13 @@ private:
     Common::RangeSet<DAddr> unarmed_read_trap_ranges;
     /// Its bitmap answers MustFlushRegion without the mutex (GpuModifiedRangeSet::MayIntersect).
     GpuModifiedRangeSet gpu_modified_ranges;
+    /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
+    /// writes in all of them, so the reads that usually follow it find nothing left to flush.
+    /// Upstream's trap-and-flush path for native titles (#184); inert in this line, where
+    /// GetFlushArea keeps marking read ranges Preflushable, so download_cpu_read_ranges stays
+    /// false.
+    Common::RangeSet<DAddr> cpu_read_ranges;
+    bool download_cpu_read_ranges{};
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers
