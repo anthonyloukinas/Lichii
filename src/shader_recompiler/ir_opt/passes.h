@@ -36,8 +36,8 @@ void LayerPass(IR::Program& program, const HostTranslateInfo& host_info);
 void VendorWorkaroundPass(IR::Program& program);
 void VerificationPass(const IR::Program& program);
 bool HasBrokenPattern(const IR::Program& program);
-/// EDEN_NX2_DYN_CBUF_POINTERS (read once; on unless =0, or off with EDEN_NX2_POINTER_RULES=upstream
-/// unless set): native global accesses whose base pointer is read from a constant buffer at a
+/// EDEN_NX2_DYN_CBUF_POINTERS (read once; =0 off, other values on; unset: off, or on with
+/// EDEN_NX2_POINTER_RULES=local): native global accesses whose base pointer is read from a constant buffer at a
 /// dynamic offset bind every pointer of that buffer, instead of upstream #150's slot walk.
 bool NativeDynamicCbufPointers();
 /// EDEN_NX2_INDIRECT_POINTERS (same default; =guest also counts as on): native loads through a

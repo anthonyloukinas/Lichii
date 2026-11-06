@@ -2546,17 +2546,19 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
 
 namespace {
 /// EDEN_NX2_POINTER_RULES picks the default of EDEN_NX2_DYN_CBUF_POINTERS and
-/// EDEN_NX2_INDIRECT_POINTERS: unset keeps both on (Anthony's paths, as before the merge of
-/// upstream #150); =upstream leaves them off, so only #150's dynamic-slot and table-entry rules
-/// apply. Either switch, when set, overrides the default (=0 off, anything else on).
+/// EDEN_NX2_INDIRECT_POINTERS. Unset (or =upstream, or any other value) leaves both off, so only
+/// upstream #150's dynamic-slot and table-entry rules apply: the default since test/oot-local-7,
+/// because on test/oot-local-6 our paths stacked on #150 lost Kokiri Forest's tree canopy.
+/// =local turns both on (Anthony's paths on top of #150, the test/oot-local-6 default). Either
+/// switch, when set, overrides the default (=0 off, anything else on).
 bool PointerSwitch(const char* name) {
-    static const bool upstream_rules = [] {
+    static const bool local_rules = [] {
         const char* const rules = std::getenv("EDEN_NX2_POINTER_RULES");
-        return rules != nullptr && std::string_view{rules} == "upstream";
+        return rules != nullptr && std::string_view{rules} == "local";
     }();
     const char* const value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
-        return !upstream_rules;
+        return local_rules;
     }
     return value[0] != '0';
 }
