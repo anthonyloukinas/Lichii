@@ -584,44 +584,39 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     };
 
     // The texture binding serial changes only with the descriptor tables, not with the handles
-    // or the pipeline, so the cached answer also needs the same views. EDEN_NX2_FEEDBACK_VIEWS=0:
-    // serials only, as before.
+    // or the pipeline, so the cached answer also needs the same views, and the same view lifetime
+    // epoch (view ids are recycled slots). EDEN_NX2_FEEDBACK_VIEWS=0: serials only, as before.
     static const bool key_views = Nx2FastDraw::SwitchNotOff("EDEN_NX2_FEEDBACK_VIEWS");
-    const bool keep_views = key_views || Nx2FastDraw::g_verify;
-    const bool serials_hit = render_targets_serial == last_feedback_loop_serial &&
-                             texture_bindings_serial == last_feedback_texture_serial;
-    const bool views_hit =
-        serials_hit && keep_views &&
-        std::ranges::equal(views, last_feedback_views,
-                           [](const ImageViewInOut& view, ImageViewId id) { return view.id == id; });
+    boost::container::small_vector<ImageViewId, 32> view_ids;
+    for (const auto& view : views) {
+        view_ids.push_back(view.id);
+    }
+    const bool serials_hit = feedback_cache.Hit(render_targets_serial, texture_bindings_serial,
+                                                view_lifetime_epoch, view_ids, false);
+    const bool views_hit = serials_hit && feedback_cache.Hit(render_targets_serial,
+                                                             texture_bindings_serial,
+                                                             view_lifetime_epoch, view_ids, true);
     if (Nx2FastDraw::g_verify && serials_hit) [[unlikely]] {
         // EDEN_NX2_FAST_DRAW_VERIFY: each cached answer against one worked out again.
         const bool fresh = FeedbackLoopRequiresBarrier(views);
         ++feedback_stats.checked;
-        if (fresh != last_feedback_loop_result) {
+        if (fresh != feedback_cache.Answer()) {
             ++(fresh ? feedback_stats.serial_missed : feedback_stats.serial_extra);
             feedback_stats.views_wrong += views_hit ? 1 : 0;
         }
     }
     if (key_views ? views_hit : serials_hit) {
-        if (last_feedback_loop_result) {
+        if (feedback_cache.Answer()) {
             barrier();
         }
         return;
     }
-    if (render_targets_serial != last_feedback_loop_serial) {
+    if (render_targets_serial != feedback_cache.RenderTargetsSerial()) {
         feedback_depth_dirty = true;
     }
     const bool requires_barrier = FeedbackLoopRequiresBarrier(views);
-    last_feedback_loop_serial = render_targets_serial;
-    last_feedback_texture_serial = texture_bindings_serial;
-    last_feedback_loop_result = requires_barrier;
-    if (keep_views) {
-        last_feedback_views.clear();
-        for (const auto& view : views) {
-            last_feedback_views.push_back(view.id);
-        }
-    }
+    feedback_cache.Store(render_targets_serial, texture_bindings_serial, view_lifetime_epoch,
+                         view_ids, requires_barrier);
     if (requires_barrier) {
         barrier();
     }
@@ -2294,6 +2289,8 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     }
     RemoveImageViewReferences(image_view_ids);
     RemoveFramebuffers(image_view_ids);
+    // The slots become reusable: answers cached for these ids no longer hold.
+    ++view_lifetime_epoch;
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
@@ -3630,6 +3627,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         ASSERT_MSG(num_removed_overlaps == 1, "Invalid number of removed overlapps: {}",
                    num_removed_overlaps);
     }
+    // The slots become reusable: answers cached for these ids no longer hold.
+    ++view_lifetime_epoch;
     for (const ImageViewId image_view_id : image_view_ids) {
         if (!immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));

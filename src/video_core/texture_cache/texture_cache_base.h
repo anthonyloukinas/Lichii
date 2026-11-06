@@ -40,6 +40,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
+#include "video_core/texture_cache/feedback_loop_cache.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
@@ -249,6 +250,10 @@ public:
         u64 serial_extra{};
         u64 views_wrong{};
     };
+    /// The view lifetime epoch (diagnostics).
+    [[nodiscard]] u64 ViewLifetimeEpoch() const noexcept {
+        return view_lifetime_epoch;
+    }
     FeedbackStats TakeFeedbackStats() {
         return std::exchange(feedback_stats, FeedbackStats{});
     }
@@ -560,11 +565,9 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
-    u64 last_feedback_loop_serial = 0;
-    u64 last_feedback_texture_serial = 0;
-    bool last_feedback_loop_result = false;
-    /// The views of the cached feedback loop answer.
-    boost::container::small_vector<ImageViewId, 32> last_feedback_views;
+    FeedbackLoopCache feedback_cache;
+    /// Advanced whenever image views are retired (their slot ids can be reused).
+    u64 view_lifetime_epoch = 0;
     FeedbackStats feedback_stats;
     bool FeedbackLoopRequiresBarrier(std::span<const ImageViewInOut> views);
     bool feedback_depth_dirty = true;
