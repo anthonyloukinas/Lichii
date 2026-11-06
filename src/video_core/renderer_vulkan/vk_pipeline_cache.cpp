@@ -807,6 +807,18 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
 
+// Task/mesh pipelines have no vertex input, but with dynamic vertex input their keys held the
+// vertex attribute types earlier draws left in the registers: one pipeline per leftover
+// combination (OoT, three boots: 178 mesh records, 70 without the field). Their keys hold 0
+// there now, cached records included. EDEN_NX2_MESH_KEY_ATTRIBUTES=1 keeps the types.
+bool MaskMeshAttributeTypes() {
+    static const bool mask = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_KEY_ATTRIBUTES");
+        return !value || value[0] != '1';
+    }();
+    return mask;
+}
+
 // The "Build all cached pipelines at boot" setting (per game), a precompile run, or
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before. Read on each
 // LoadDiskResources call: the per-game setting can differ between titles in one process.
@@ -819,6 +831,12 @@ bool PreloadAllPipelines() {
            Settings::values.force_preload_all_pipelines;
 }
 } // Anonymous namespace
+
+void ClearMeshVertexInput(GraphicsPipelineCacheKey& key) noexcept {
+    if (key.state.dynamic_vertex_input && MaskMeshAttributeTypes()) {
+        key.state.attribute_types = 0;
+    }
+}
 
 void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) {
     namespace TC = VideoCommon::TranslationCache;
@@ -911,7 +929,17 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         current_pipeline = nullptr;
         return nullptr;
     }
+    if (graphics_key.state.dynamic_vertex_input) {
+        // Refresh only rewrites the types when the vertex input is dirty.
+        graphics_key.state.attribute_types = vertex_attribute_types;
+    }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (graphics_key.state.dynamic_vertex_input) {
+        vertex_attribute_types = graphics_key.state.attribute_types;
+        if (last_shaders_mesh) {
+            ClearMeshVertexInput(graphics_key);
+        }
+    }
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -1085,6 +1113,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (key.state.dynamic_vertex_input != 0) !=
                 dynamic_features.has_dynamic_vertex_input) {
             return;
+        }
+
+        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
+                return env.ShaderStage() == Shader::Stage::Task ||
+                       env.ShaderStage() == Shader::Stage::Mesh;
+            })) {
+            ClearMeshVertexInput(key);
         }
 
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
@@ -1856,6 +1891,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto write = disk_graphics.ClaimWrite(graphics_key, writer);
     if (write == Write::New || write == Write::Replacement) {
         writer(Write{write});
+    } else if (write == Write::No) {
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline not stored: graphics {:016x} has a record in the disk cache already",
+                 graphics_key.Hash());
     }
     QueueVulkanPipelineCacheFlush();
     return pipeline;
@@ -1868,6 +1907,17 @@ void PipelineCache::QueueGraphicsSerialization(
     using Write = decltype(disk_graphics)::Write;
     serialization_thread.QueueWork([this, key = pipeline_key, write,
                                     envs = std::move(graphics_envs)] {
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            if (const char* reason = envs[index].NotSerializableReason()) {
+                LOG_INFO(Render_Vulkan, "Pipeline not stored: graphics {:016x} s{}:{:016x} {}",
+                         key.Hash(), index, key.unique_hashes[index], reason);
+                disk_graphics.ReturnWrite(key, write);
+                return;
+            }
+        }
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
         for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -1944,6 +1994,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     const auto write = disk_compute.ClaimWrite(key, writer);
     if (write == Write::New || write == Write::Replacement) {
         writer(Write{write});
+    } else if (write == Write::No) {
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline not stored: compute {:016x} has a record in the disk cache already",
+                 key.Hash());
     }
     QueueVulkanPipelineCacheFlush();
     return entry;
@@ -1955,6 +2009,12 @@ void PipelineCache::QueueComputeSerialization(
     ComputeEnvironment&& env) {
     using Write = decltype(disk_compute)::Write;
     serialization_thread.QueueWork([this, key, write, env_ = std::move(env)] {
+        if (const char* reason = env_.NotSerializableReason()) {
+            LOG_INFO(Render_Vulkan, "Pipeline not stored: compute {:016x} s6:{:016x} {}",
+                     key.Hash(), key.unique_hash, reason);
+            disk_compute.ReturnWrite(key, write);
+            return;
+        }
         const std::array<const GenericEnvironment*, 1> envs{&env_};
         if (write == Write::New) {
             if (!SerializePipeline(key, envs, pipeline_cache_filename, CACHE_VERSION)) {

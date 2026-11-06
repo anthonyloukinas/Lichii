@@ -122,6 +122,7 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+    bool last_shaders_mesh = false; ///< The stages are task/mesh and pixel programs
 
 private:
     friend struct ShaderCacheTestAccess;
