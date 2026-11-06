@@ -2362,18 +2362,41 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
     // queued behind the pending report writes instead. On the split's back the fence's
     // submission may be deferred, and the fencing thread would wait for this thread to submit it.
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
-    bool written{};
-    fence_manager.SyncOperation([&] {
-        std::scoped_lock lock{wait_mutex};
-        written = true;
-        wait_cv.notify_all();
+    // The wait is bounded: if the operation never runs (a fence that is never made or never
+    // submitted), the read goes ahead with the values in memory after 2 s instead of hanging the
+    // GPU thread. The state is shared with the operation, which may run after this returns.
+    struct WaitState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto state = std::make_shared<WaitState>();
+    fence_manager.SyncOperation([state] {
+        std::scoped_lock lock{state->mutex};
+        state->written = true;
+        state->cv.notify_all();
     });
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    constexpr auto slice = std::chrono::milliseconds{5};
+    constexpr auto limit = std::chrono::seconds{2};
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    std::unique_lock lock{state->mutex};
+    while (!state->cv.wait_for(lock, slice, [&state] { return state->written; })) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            static std::atomic<u64> timeouts{};
+            LOG_WARNING(HW_GPU,
+                        "Query result wait gave up after 2 s at {:#x}+{:#x}: the operation queued "
+                        "behind the reports did not run ({} times so far)",
+                        addr, size, timeouts.fetch_add(1, std::memory_order_relaxed) + 1);
+            return;
+        }
+        // Work deferred since (by this thread's own fence or a later one) is submitted, so the
+        // fence the operation rides on can complete.
+        lock.unlock();
+        scheduler.FlushDeferred();
+        lock.lock();
+    }
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
