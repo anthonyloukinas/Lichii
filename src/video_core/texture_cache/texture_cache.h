@@ -2859,9 +2859,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // of Time resizes a shadow map every frame in parts of Kokiri Forest, at the same address:
     // each size is a new depth target and a new texture, both copied from older sizes, and their
     // uploads took up to 17% of the GPU back thread there.
+    // EDEN_NX2_JOIN_UPLOAD_SKIP=0 makes every upload and alias copy as before (for A/B runs).
+    static const bool join_upload_skip = [] {
+        const char* value = std::getenv("EDEN_NX2_JOIN_UPLOAD_SKIP");
+        return value == nullptr || value[0] != '0';
+    }();
     size_t first_copy = 0;
     bool copied_whole = false;
-    for (size_t index = join_copies_to_do.size(); index-- > 0;) {
+    for (size_t index = join_upload_skip ? join_copies_to_do.size() : 0; index-- > 0;) {
         const AliasedImage* const aliased = alias_copy(join_copies_to_do[index]);
         if (aliased != nullptr && writes_whole_image(*aliased)) {
             first_copy = index;

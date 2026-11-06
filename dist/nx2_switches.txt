@@ -52,6 +52,10 @@ EDEN_NX2_FENCE_BATCH=1
 # =0 none (A/B test of the wait; reads can return older counts).
 #EDEN_NX2_QUERY_REPORT_WAIT=0
 
+# Texture joins (#288): when one alias copy writes a whole new image, its upload from guest memory
+# and the older alias copies are skipped (Ocarina's resized shadow map). =0 makes them all again.
+#EDEN_NX2_JOIN_UPLOAD_SKIP=0
+
 # Storage buffer pointer rules: unset = upstream #150 only (default since test/oot-local-7 and
 # test/oot-local-11). =local adds our dynamic constant buffer and record pointer paths on top (the
 # oot-local-6 default; it lost Kokiri Forest's tree canopy there). =upstream is the same as unset.
