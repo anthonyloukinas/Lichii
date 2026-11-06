@@ -955,9 +955,9 @@ private:
     GpuModifiedRangeSet gpu_modified_ranges;
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
-    /// Upstream's trap-and-flush path for native titles (#184); inert in this line, where
-    /// GetFlushArea keeps marking read ranges Preflushable, so download_cpu_read_ranges stays
-    /// false.
+    /// Upstream's trap-and-flush path for native titles (#184), only with
+    /// EDEN_NX2_NATIVE_TRAP_FLUSH=1 (GetFlushArea); by default read ranges are marked Preflushable
+    /// and download_cpu_read_ranges stays false.
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;

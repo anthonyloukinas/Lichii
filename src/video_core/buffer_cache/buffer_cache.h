@@ -353,7 +353,23 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     area->preemtive = !read_gpu_modified && !rest_gpu_modified;
     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
     // in the range to a download at each fence.
-    if (read_gpu_modified) {
+    // EDEN_NX2_NATIVE_TRAP_FLUSH=1 (Switch 2 titles, default off): upstream's trap-and-flush
+    // instead. No mark; the range is remembered, and the next read that must flush downloads the
+    // GPU writes in every remembered range at once (DownloadMemory).
+    static const bool native_trap_flush = [] {
+        const char* value = std::getenv("EDEN_NX2_NATIVE_TRAP_FLUSH");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool trap_flush =
+        native_trap_flush && Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    if (read_gpu_modified && trap_flush) {
+        if constexpr (USE_MEMORY_MAPS) {
+            cpu_read_ranges.Add(read_begin, read_end - read_begin);
+            download_cpu_read_ranges = true;
+        }
+        // The core consumed this trap: the next GPU write must arm it again.
+        read_trapped_ranges.Subtract(read_begin, read_end - read_begin);
+    } else if (read_gpu_modified) {
         memory_tracker.MarkRegionAsPreflushable(read_begin, read_end - read_begin);
     } else {
         // The core keeps this area and has no mark. The next GPU write here must arm the range
