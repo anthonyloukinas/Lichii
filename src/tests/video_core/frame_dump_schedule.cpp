@@ -153,11 +153,11 @@ TEST_CASE("Frame dump schedule captures EDEN_NX2_FRAME_DUMP_COUNT consecutive fr
 
 TEST_CASE("Frame dump schedule bursts for the debug server", "[frame_dump_schedule]") {
     FrameDumpSchedule schedule;
-    REQUIRE(schedule.Arm(false, 11, 2));
+    REQUIRE(schedule.Arm(false, false, 11, 2));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.CaptureId() == 11);
     REQUIRE(schedule.FrameSubdirectory() == "frame-1");
-    REQUIRE_FALSE(schedule.Arm(false, 12, 2));
+    REQUIRE_FALSE(schedule.Arm(false, false, 12, 2));
     REQUIRE(schedule.Tick(0.0) == Step::Next);
     REQUIRE(schedule.FrameSubdirectory() == "frame-2");
     REQUIRE(schedule.LastOfBurst());
@@ -166,7 +166,7 @@ TEST_CASE("Frame dump schedule bursts for the debug server", "[frame_dump_schedu
     REQUIRE(schedule.Tick(0.0) == Step::None);
 
     // A later single-frame request is not a burst, whatever the last one was.
-    REQUIRE(schedule.Arm(false, 12));
+    REQUIRE(schedule.Arm(false, false, 12));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.FrameSubdirectory().empty());
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
@@ -207,7 +207,7 @@ TEST_CASE("Frame dump schedule re-arms on the trigger file", "[frame_dump_schedu
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
 
     // A debug server capture in between does not count as a burst and keeps the file armed.
-    REQUIRE(schedule.Arm(false, 3, 1));
+    REQUIRE(schedule.Arm(false, false, 3, 1));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.FrameSubdirectory().empty());
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
