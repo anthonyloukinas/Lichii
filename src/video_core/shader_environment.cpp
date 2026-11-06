@@ -1283,38 +1283,73 @@ std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u3
     return it->second;
 }
 
-bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
-                       const std::filesystem::path& filename, u32 cache_version) try {
+namespace {
+/// Appends one record (and the header to a new file), entirely or not at all: the write counts
+/// only once the stream has been flushed and closed without error. On a failure the file is cut
+/// back to its length before the append, so its earlier records stay loadable; a new file is
+/// removed. Only if cutting back fails is the file removed, as before (the loader would discard
+/// it for the damaged tail anyway).
+template <typename WriteRecord>
+bool AppendRecord(const std::filesystem::path& filename, u32 cache_version,
+                  WriteRecord&& write_record) {
     std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
-    file.exceptions(std::ifstream::failbit);
     if (!file.is_open()) {
         LOG_ERROR(Common_Filesystem, "Failed to open pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
         return false;
     }
-    if (file.tellp() == 0) {
-        // Write header
-        file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
-            .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+    const std::streamoff start = file.tellp();
+    if (start < 0) {
+        return false;
     }
+    try {
+        file.exceptions(std::ios::failbit | std::ios::badbit);
+        if (start == 0) {
+            file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+        }
+        write_record(file);
+        file.flush();
+        file.close();
+        return true;
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "Writing to pipeline cache file {} failed: {}",
+                  Common::FS::PathToUTF8String(filename), e.what());
+    }
+    // Drop what is still buffered before cutting back.
+    file.exceptions(std::ios::goodbit);
+    file.close();
+    std::error_code error;
+    if (start == 0) {
+        std::filesystem::remove(filename, error);
+    } else {
+        std::filesystem::resize_file(filename, static_cast<std::uintmax_t>(start), error);
+    }
+    if (error) {
+        LOG_ERROR(Common_Filesystem, "Failed to restore pipeline cache file {}: {}",
+                  Common::FS::PathToUTF8String(filename), error.message());
+        if (!Common::FS::RemoveFile(filename)) {
+            LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+                      Common::FS::PathToUTF8String(filename));
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
+bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+                       const std::filesystem::path& filename, u32 cache_version) {
     if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
         return false;
     }
-    const u32 num_envs{static_cast<u32>(envs.size())};
-    file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
-    for (const GenericEnvironment* const env : envs) {
-        env->Serialize(file);
-    }
-    file.write(key.data(), key.size_bytes());
-    return true;
-
-} catch (const std::ios_base::failure& e) {
-    LOG_ERROR(Common_Filesystem, "{}", e.what());
-    if (!Common::FS::RemoveFile(filename)) {
-        LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
-                  Common::FS::PathToUTF8String(filename));
-    }
-    return false;
+    return AppendRecord(filename, cache_version, [&](std::ofstream& file) {
+        const u32 num_envs{static_cast<u32>(envs.size())};
+        file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
+        for (const GenericEnvironment* const env : envs) {
+            env->Serialize(file);
+        }
+        file.write(key.data(), key.size_bytes());
+    });
 }
 
 CheckedWrite AppendCheckedPipeline(std::span<const char> key,
@@ -1329,7 +1364,10 @@ CheckedWrite AppendCheckedPipeline(std::span<const char> key,
     scratch += ".candidate";
     std::error_code error;
     std::filesystem::remove(scratch, error);
-    SerializePipeline(key, envs, scratch, cache_version);
+    if (!SerializePipeline(key, envs, scratch, cache_version)) {
+        std::filesystem::remove(scratch, error);
+        return CheckedWrite::Failed;
+    }
 
     std::string record;
     std::vector<FileEnvironment> loaded;
@@ -1372,26 +1410,10 @@ CheckedWrite AppendCheckedPipeline(std::span<const char> key,
     if (!check(std::span<FileEnvironment>{loaded})) {
         return CheckedWrite::Rejected;
     }
-    try {
-        std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
-        if (!file.is_open()) {
-            return CheckedWrite::Failed;
-        }
-        file.exceptions(std::ifstream::failbit);
-        if (file.tellp() == 0) {
-            file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
-                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
-        }
+    const bool written = AppendRecord(filename, cache_version, [&](std::ofstream& file) {
         file.write(record.data(), static_cast<std::streamsize>(record.size()));
-    } catch (const std::ios_base::failure& e) {
-        LOG_ERROR(Common_Filesystem, "{}", e.what());
-        if (!Common::FS::RemoveFile(filename)) {
-            LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
-                      Common::FS::PathToUTF8String(filename));
-        }
-        return CheckedWrite::Failed;
-    }
-    return CheckedWrite::Written;
+    });
+    return written ? CheckedWrite::Written : CheckedWrite::Failed;
 }
 
 namespace {

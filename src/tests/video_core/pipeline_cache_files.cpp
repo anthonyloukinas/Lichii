@@ -17,6 +17,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#ifndef _WIN32
+#include <csignal>
+#include <sys/resource.h>
+#endif
+
 #include "shader_recompiler/exception.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -929,3 +934,81 @@ TEST_CASE("A background build the driver rejects still gets the live capture wri
     prebuild.Stop();
     CHECK(writes == 1);
 }
+
+#ifndef _WIN32
+namespace {
+
+/// While it lives, writes past `limit` bytes of any file fail (EFBIG), as on a full disk.
+class FileSizeLimit {
+public:
+    explicit FileSizeLimit(rlim_t limit) {
+        REQUIRE(getrlimit(RLIMIT_FSIZE, &saved) == 0);
+        previous_handler = std::signal(SIGXFSZ, SIG_IGN);
+        rlimit lowered = saved;
+        lowered.rlim_cur = limit;
+        REQUIRE(setrlimit(RLIMIT_FSIZE, &lowered) == 0);
+    }
+    ~FileSizeLimit() {
+        setrlimit(RLIMIT_FSIZE, &saved);
+        std::signal(SIGXFSZ, previous_handler);
+    }
+
+private:
+    rlimit saved{};
+    void (*previous_handler)(int){};
+};
+
+} // Anonymous namespace
+
+TEST_CASE("A write that cannot complete counts for nothing and keeps the earlier records",
+          "[pipeline_cache_files][repair]") {
+    TempDir temp;
+    const auto path = temp.path / "full.bin";
+    WriteCompute(path, 1, 1);
+    WriteCompute(path, 2, 1);
+    const auto size = std::filesystem::file_size(path);
+    const std::string before = ReadAll(path);
+    const Capture capture{true, 3, true, {}};
+
+    // Room for a few bytes of the new record only: the write must fail, give its claim back
+    // (false) and leave the two records as they were.
+    bool serialized{};
+    {
+        const FileSizeLimit limit{size + 8};
+        serialized = VideoCommon::SerializePipeline(u64{3}, capture.envs, path, Version);
+    }
+    CHECK_FALSE(serialized);
+    CHECK(ReadAll(path) == before);
+
+    // The checked append: its scratch copy fits, the append to the cache does not.
+    VideoCommon::CheckedWrite checked{};
+    {
+        const FileSizeLimit limit{size + 8};
+        checked = AppendChecked(path, 3, true, capture);
+    }
+    CHECK(checked == VideoCommon::CheckedWrite::Failed);
+    CHECK(ReadAll(path) == before);
+
+    // A scratch copy that cannot be written fails the check and leaves the cache alone.
+    {
+        const FileSizeLimit limit{4};
+        checked = AppendChecked(path, 3, true, capture);
+    }
+    CHECK(checked == VideoCommon::CheckedWrite::Failed);
+    CHECK(ReadAll(path) == before);
+    CHECK_FALSE(std::filesystem::exists(path.string() + ".candidate"));
+
+    // A rejected candidate leaves the cache byte for byte.
+    CHECK(AppendChecked(path, 3, true, Capture{true, 3, false, {}}) ==
+          VideoCommon::CheckedWrite::Rejected);
+    CHECK(ReadAll(path) == before);
+
+    auto index = MakeIndex();
+    CHECK(Load(path, &index).size() == 2);
+    // With room again, both writers complete.
+    CHECK(AppendChecked(path, 3, true, capture) == VideoCommon::CheckedWrite::Written);
+    CHECK(VideoCommon::SerializePipeline(u64{4}, capture.envs, path, Version));
+    auto reloaded = MakeIndex();
+    CHECK(Load(path, &reloaded).size() == 4);
+}
+#endif

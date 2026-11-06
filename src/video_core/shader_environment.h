@@ -291,8 +291,9 @@ private:
     u32 viewport_transform_state = 1;
 };
 
-/// Appends a record. False when nothing was written: an environment cannot be stored, or the
-/// file failed (it is then removed).
+/// Appends a record. True only once it is complete on disk (flushed and closed without error).
+/// False when nothing was written: an environment cannot be stored, or the write failed (the file
+/// is then cut back to its earlier records).
 bool SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version);
 
@@ -308,7 +309,7 @@ enum class CheckedWrite {
     Written,         ///< The record was appended.
     NotSerializable, ///< An environment cannot be stored; nothing was written.
     Rejected,        ///< check refused the capture as read back; nothing was appended.
-    Failed,          ///< Writing or reading back failed (as SerializePipeline, the cache may be removed).
+    Failed,          ///< Writing or reading back failed; the cache keeps its earlier records.
 };
 
 /// Appends a record like SerializePipeline, but only after reading it back from a scratch file
