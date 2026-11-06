@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 
@@ -105,7 +106,9 @@ struct FastDrawFixture {
         return draws[draws.size() - 1] == draws[draws.size() - 2];
     }
 
-    const bool previous = FastDraw::g_enabled;
+    // Set before maxwell3d is built: it picks its fast method path from the fast draw mode at
+    // construction (mode 1 keeps the slow path), as the emulator reads the mode at startup.
+    const bool previous = std::exchange(FastDraw::g_enabled, true);
     ScopedSystemTestContext context;
     Core::System system;
     Core::DeviceMemory physical;

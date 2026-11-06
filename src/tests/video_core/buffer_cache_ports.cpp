@@ -314,6 +314,9 @@ TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies"
     f.Descriptor(base + 0x123, 0x1456);
     REQUIRE(f.Bind(true).size == 0x1479);
     f.runtime.alignment = 4096;
+    // The alignment is a device constant, so this line's SSBO translation cache does not key on
+    // it: map the same range again (a new map serial) to drop the old translations.
+    f.memory->Map(base, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
     REQUIRE(f.Bind(true).device_addr == 0x20000);
     REQUIRE(f.Bind(true).size == 0x1579);
     REQUIRE(f.Bind(true, true).size == 0x10000);
