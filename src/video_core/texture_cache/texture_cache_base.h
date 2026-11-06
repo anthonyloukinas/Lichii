@@ -253,6 +253,21 @@ public:
         u64 serial_false_positive{};
         u64 views_wrong{};
     };
+    /// EDEN_NX2_FAST_DRAW_VERIFY diagnostics: a graphics texture slot as the cache sees it now,
+    /// the TIC bytes in guest memory and cached, and the identity behind a view id.
+    struct ViewProbe {
+        std::array<u64, 4> guest_tic{};
+        std::array<u64, 4> cached_tic{};
+        bool tic_cached{};
+        u32 bound_id{}; ///< the view the table holds for the slot
+        bool live{};    ///< the view id names a live slot
+        u32 image{};
+        u32 format{};
+        u32 flags{};
+        u32 base_level{};
+        u32 base_layer{};
+    };
+    [[nodiscard]] ViewProbe ProbeGraphicsView(u32 index, ImageViewId id) const;
     /// The view lifetime epoch (diagnostics).
     [[nodiscard]] u64 ViewLifetimeEpoch() const noexcept {
         return view_lifetime_epoch;

@@ -82,6 +82,84 @@ using VideoCommon::ImageViewType;
 
 namespace {
 
+/// EDEN_NX2_FAST_DRAW_VERIFY: what a reused or delta draw kept, with the texture cache's view of
+/// each slot, taken before the full resolve (which can retire view slots), so that a view or
+/// sampler mismatch can be classified: changed guest descriptor, lifetime change, or the same
+/// resource behind another view.
+struct KeptViews {
+    std::vector<VideoCommon::ImageViewInOut> views;
+    std::vector<VideoCommon::SamplerId> samplers;
+    std::vector<TextureCache::ViewProbe> probes;
+    u64 epoch{};
+    u64 tick{};
+};
+
+void SnapshotKeptViews(KeptViews& kept, const GraphicsPipeline& pipeline,
+                       const TextureCache& texture_cache, u64 tick) {
+    const auto views = pipeline.DeltaViews();
+    const auto samplers = pipeline.DeltaSamplers();
+    kept.views.assign(views.begin(), views.end());
+    kept.samplers.assign(samplers.begin(), samplers.end());
+    kept.probes.clear();
+    for (const auto& view : views) {
+        kept.probes.push_back(texture_cache.ProbeGraphicsView(view.index, view.id));
+    }
+    kept.epoch = texture_cache.ViewLifetimeEpoch();
+    kept.tick = tick;
+}
+
+void LogViewMismatch(const KeptViews& kept, const GraphicsPipeline& pipeline,
+                     const TextureCache& texture_cache, u64 tick, bool delta, bool invalidated,
+                     bool recheck, std::string_view raw_handles) {
+    const auto views = pipeline.DeltaViews();
+    const auto samplers = pipeline.DeltaSamplers();
+    LOG_WARNING(Render_Vulkan,
+                "Fast draw verify view mismatch: {} invalidated={} recheck={} raw handles {}; "
+                "views {} -> {}, samplers {} -> {}; view lifetime epoch {} -> {}; tick {} -> {}",
+                delta ? "delta" : "reused", invalidated, recheck,
+                raw_handles, kept.views.size(), views.size(), kept.samplers.size(),
+                samplers.size(), kept.epoch, texture_cache.ViewLifetimeEpoch(), kept.tick, tick);
+    const auto log_probe = [](std::string_view when, const TextureCache::ViewProbe& probe) {
+        LOG_WARNING(Render_Vulkan,
+                    "  {}: live={} image={} format={} flags={:#x} level={} layer={} bound={}; "
+                    "TIC guest {:016x} {:016x} {:016x} {:016x}, cached({}) {:016x} {:016x} "
+                    "{:016x} {:016x}",
+                    when, probe.live, probe.image, probe.format, probe.flags, probe.base_level,
+                    probe.base_layer, probe.bound_id, probe.guest_tic[0], probe.guest_tic[1],
+                    probe.guest_tic[2], probe.guest_tic[3], probe.tic_cached,
+                    probe.cached_tic[0], probe.cached_tic[1], probe.cached_tic[2],
+                    probe.cached_tic[3]);
+    };
+    const size_t num_views = (std::max)(kept.views.size(), views.size());
+    for (size_t i = 0; i < num_views; ++i) {
+        const bool has_old = i < kept.views.size();
+        const bool has_new = i < views.size();
+        if (has_old && has_new && kept.views[i].index == views[i].index &&
+            kept.views[i].id == views[i].id) {
+            continue;
+        }
+        LOG_WARNING(Render_Vulkan, " view slot {}: index {} id {} -> index {} id {}", i,
+                    has_old ? kept.views[i].index : ~0U, has_old ? kept.views[i].id.index : ~0U,
+                    has_new ? views[i].index : ~0U, has_new ? views[i].id.index : ~0U);
+        if (has_old) {
+            log_probe("kept, before the resolve", kept.probes[i]);
+            log_probe("kept id, after", texture_cache.ProbeGraphicsView(kept.views[i].index,
+                                                                        kept.views[i].id));
+        }
+        if (has_new) {
+            log_probe("resolved", texture_cache.ProbeGraphicsView(views[i].index, views[i].id));
+        }
+    }
+    const size_t num_samplers = (std::max)(kept.samplers.size(), samplers.size());
+    for (size_t i = 0; i < num_samplers; ++i) {
+        const u32 old_id = i < kept.samplers.size() ? kept.samplers[i].index : ~0U;
+        const u32 new_id = i < samplers.size() ? samplers[i].index : ~0U;
+        if (old_id != new_id) {
+            LOG_WARNING(Render_Vulkan, " sampler slot {}: {} -> {}", i, old_id, new_id);
+        }
+    }
+}
+
 /// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
 /// read as the GPU reads it, without flushing GPU caches.
 VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager* const> spaces,
@@ -971,6 +1049,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             const std::span<const u32> raw = pipeline->RawHandles();
             kept_raw_handles.assign(raw.begin(), raw.end());
         }
+        // The first few view mismatches are logged with what was kept (snapshot taken here,
+        // before the recheck or the full resolve can change or retire views).
+        static u32 view_mismatch_logs = 0;
+        static KeptViews kept_views;
+        const bool snapshot_views = verify_views && view_mismatch_logs < 8;
+        if (snapshot_views) {
+            SnapshotKeptViews(kept_views, *pipeline, texture_cache, scheduler.CurrentTick());
+        }
         // A delta draw that rechecks handles would have kept the views RecheckHandles leaves.
         const bool verify_recheck = verify_views && verify_take.delta && verify_take.recheck_handles;
         bool verify_delta_views = verify_views;
@@ -992,6 +1078,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (verify_delta_views && pipeline->DeltaMismatch()) {
             ++(verify_recheck ? fast_draw_stats.recheck_mismatches : fast_draw_stats.view_mismatches);
+            if (snapshot_views) {
+                ++view_mismatch_logs;
+                const bool raw_same = std::ranges::equal(pipeline->RawHandles(), kept_raw_handles);
+                LogViewMismatch(kept_views, *pipeline, texture_cache, scheduler.CurrentTick(),
+                                verify_take.delta, verify_take.invalidated,
+                                verify_take.recheck_handles, !verify_handles ? "not compared" : raw_same ? "same" : "changed");
+            }
         }
         if (verify_bindings &&
             kept_bindings != buffer_cache.KeptGraphicsBindingsHash(keeps_vertex, keeps_storage, true)) {

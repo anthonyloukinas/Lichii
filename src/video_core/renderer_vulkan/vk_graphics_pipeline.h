@@ -260,6 +260,13 @@ public:
     [[nodiscard]] bool DeltaMismatch() const noexcept {
         return delta_mismatch;
     }
+    /// The views and samplers a delta draw keeps (after a Configure: the ones it resolved).
+    [[nodiscard]] std::span<const VideoCommon::ImageViewInOut> DeltaViews() const noexcept {
+        return delta_views;
+    }
+    [[nodiscard]] std::span<const VideoCommon::SamplerId> DeltaSamplers() const noexcept {
+        return delta_samplers;
+    }
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {

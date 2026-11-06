@@ -14,6 +14,7 @@
 #include <vector>
 #include <optional>
 #include <bit>
+#include <cstring>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -885,6 +886,31 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
     last_framebuffer_id = framebuffer_id;
     last_framebuffer_serial = render_targets_serial;
     return &slot_framebuffers[framebuffer_id];
+}
+
+template <class P>
+typename TextureCache<P>::ViewProbe TextureCache<P>::ProbeGraphicsView(u32 index,
+                                                                       ImageViewId id) const {
+    ViewProbe probe;
+    const auto& table = channel_state->graphics_image_table;
+    index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
+                                               gpu_memory->UsesNativeTiling());
+    const auto peeked = table.Peek(*gpu_memory, index);
+    static_assert(sizeof(peeked.guest) == sizeof(probe.guest_tic));
+    std::memcpy(probe.guest_tic.data(), &peeked.guest, sizeof(probe.guest_tic));
+    std::memcpy(probe.cached_tic.data(), &peeked.cached, sizeof(probe.cached_tic));
+    probe.tic_cached = peeked.cached_valid;
+    probe.bound_id = index < table.bound_ids.size() ? table.bound_ids[index].index : ~0U;
+    probe.live = slot_image_views.contains(id);
+    if (probe.live) {
+        const ImageViewBase& view = slot_image_views[id];
+        probe.image = view.image_id.index;
+        probe.format = static_cast<u32>(view.format);
+        probe.flags = static_cast<u32>(view.flags);
+        probe.base_level = static_cast<u32>(view.range.base.level);
+        probe.base_layer = static_cast<u32>(view.range.base.layer);
+    }
+    return probe;
 }
 
 template <class P>
