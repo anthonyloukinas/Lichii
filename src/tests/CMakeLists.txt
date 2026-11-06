@@ -157,6 +157,10 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
+# The translation cache wrapper test reads environment.h and shader_translation_cache.h.
+set_source_files_properties(video_core/shader_translation_cache.cpp PROPERTIES
+    COMPILE_DEFINITIONS "LICHII_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/..\"")
+
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 

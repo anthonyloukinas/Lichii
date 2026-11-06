@@ -5,6 +5,11 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <tuple>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/shader_translation_cache.h"
 
@@ -55,6 +60,10 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
+    bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override {
+        ++table_queries;
+        return table_pointers.contains({index, offset, indirect});
+    }
     void Dump(u64, u64) override {}
 
     void SetHeaderWord(size_t word, u32 value) {
@@ -65,6 +74,8 @@ public:
     u32 viewport = 1;
     u32 texture_bound = 2;
     u32 reads = 0;
+    std::set<std::tuple<u32, u32, u32>> table_pointers;
+    u32 table_queries = 0;
 };
 
 // What a translation does with its environment, for the record/replay tests: the second read
@@ -115,6 +126,49 @@ Shader::Info SampleInfo() {
 
 std::filesystem::path TempPath(const char* name) {
     return std::filesystem::temp_directory_path() / name;
+}
+
+// Group 1 of each `declaration` match in the class that starts at `head` (comments removed).
+// `head` missing gives an empty set.
+std::set<std::string> DeclaredFunctions(const std::string& text, const std::string& head,
+                                        const std::regex& declaration) {
+    const size_t begin = text.find(head);
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const size_t end = text.find("\n};", begin);
+    const std::string body = std::regex_replace(
+        text.substr(begin, end == std::string::npos ? std::string::npos : end - begin),
+        std::regex{"//[^\n]*"}, "");
+    std::set<std::string> names;
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), declaration);
+         it != std::sregex_iterator{}; ++it) {
+        names.insert((*it)[1].str());
+    }
+    return names;
+}
+
+// Virtuals of Shader::Environment (environment.h) that RecordingEnvironment (wrapper_header)
+// does not override. A defaulted virtual it leaves out answers the translator without asking
+// the live environment and is never recorded or replayed.
+std::set<std::string> UnforwardedQueries(const std::string& environment_header,
+                                         const std::string& wrapper_header) {
+    std::set<std::string> missing = DeclaredFunctions(
+        environment_header, "class Environment {", std::regex{R"(virtual\s+[^;{]*?(\w+)\s*\()"});
+    missing.erase("Environment"); // the destructor
+    for (const std::string& name :
+         DeclaredFunctions(wrapper_header, "class RecordingEnvironment final",
+                           std::regex{R"((\w+)\s*\([^;{)]*\)\s*(?:const\s*)?override)"})) {
+        missing.erase(name);
+    }
+    return missing;
+}
+
+std::string ReadSourceFile(const std::filesystem::path& path) {
+    std::ifstream file{path};
+    std::ostringstream text;
+    text << file.rdbuf();
+    return text.str();
 }
 } // Anonymous namespace
 
@@ -231,6 +285,57 @@ TEST_CASE("Translation cache runtime info digest covers emitted state",
     REQUIRE_FALSE(DigestRuntimeInfo(info) == base);
 }
 
+TEST_CASE("Translation cache records which pointer table slots hold pointers",
+          "[video_core][translation_cache]") {
+    // Each slot of a pointer table is asked about; the base class answers true for all of them,
+    // so the recording wrapper must forward the question and record the answer and arguments.
+    FakeEnvironment env;
+    env.table_pointers.insert({2, 0x18, 0x60});
+    RecordingEnvironment recording{env};
+    REQUIRE(recording.IsCbufIndirectStorageBufferPointer(2, 0x18, 0x60));
+    REQUIRE_FALSE(recording.IsCbufIndirectStorageBufferPointer(2, 0x20, 0x60));
+    REQUIRE(env.table_queries == 2);
+    const std::vector<Query> queries = recording.TakeQueries();
+    REQUIRE(queries.size() == 2);
+    REQUIRE(queries[0].kind == QueryKind::CbufIndirectStorageBufferPointer);
+    REQUIRE(queries[0].c == 0x60);
+    REQUIRE(ReplayQueries(queries, env));
+
+    // The second slot now holds a pointer: the recorded translation no longer applies.
+    env.table_pointers.insert({2, 0x20, 0x60});
+    REQUIRE_FALSE(ReplayQueries(queries, env));
+    env.table_pointers.erase({2, 0x20, 0x60});
+
+    // The same slot at another holder offset is a different question.
+    env.table_pointers.erase({2, 0x18, 0x60});
+    env.table_pointers.insert({2, 0x18, 0x68});
+    REQUIRE_FALSE(ReplayQueries(queries, env));
+    env.table_pointers = {{2, 0x18, 0x60}};
+
+    // The third argument survives the file.
+    const auto path = TempPath("lichii_translation_cache_table_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{0x31, 0x32};
+    const Digest stage_key = MakeStageKey(env, 0x77, 5, config);
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Fragment;
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Insert(stage_key, queries, meta));
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.FindEntry(stage_key, env);
+        REQUIRE(entry);
+        REQUIRE(entry->queries == queries);
+        env.table_pointers = {{2, 0x18, 0x68}};
+        REQUIRE_FALSE(store.FindEntry(stage_key, env));
+    }
+    std::filesystem::remove(path);
+}
+
 TEST_CASE("Translation cache persists entries and variants", "[video_core][translation_cache]") {
     const auto path = TempPath("lichii_translation_cache_test.bin");
     std::filesystem::remove(path);
@@ -303,4 +408,35 @@ TEST_CASE("Translation cache persists entries and variants", "[video_core][trans
         REQUIRE_FALSE(store.FindVariant(variant_key));
     }
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Translation cache wrapper forwards every environment query",
+          "[video_core][translation_cache]") {
+    // Reads the two headers this test was built from (LICHII_SOURCE_DIR, set by CMake).
+    const std::filesystem::path source_dir{LICHII_SOURCE_DIR};
+    const std::string environment_header =
+        ReadSourceFile(source_dir / "shader_recompiler" / "environment.h");
+    const std::string wrapper_header =
+        ReadSourceFile(source_dir / "video_core" / "shader_translation_cache.h");
+    if (environment_header.empty() || wrapper_header.empty()) {
+        SKIP("Sources not found at " << source_dir.string());
+    }
+
+    // The scan sees the queries: without IsCbufIndirectStorageBufferPointer's override the
+    // wrapper is reported (it was missing until FormatVersion 5).
+    const std::string override_line = "IsCbufIndirectStorageBufferPointer(u32 index";
+    const size_t line = wrapper_header.find(override_line);
+    REQUIRE(line != std::string::npos);
+    std::string without_override = wrapper_header;
+    without_override.replace(line, override_line.size(), "Removed(u32 index");
+    REQUIRE(UnforwardedQueries(environment_header, without_override) ==
+            std::set<std::string>{"IsCbufIndirectStorageBufferPointer"});
+
+    // A query virtual added to Shader::Environment must be forwarded and recorded by
+    // RecordingEnvironment (and replayed by ReplayQueries, with a FormatVersion bump).
+    const std::set<std::string> missing = UnforwardedQueries(environment_header, wrapper_header);
+    for (const std::string& name : missing) {
+        UNSCOPED_INFO("RecordingEnvironment does not override Shader::Environment::" << name);
+    }
+    REQUIRE(missing.empty());
 }
