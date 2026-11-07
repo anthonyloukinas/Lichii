@@ -8,6 +8,8 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <cstdlib>
+#include <string_view>
 
 #include <boost/container/static_vector.hpp>
 
@@ -979,7 +981,17 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     using DefPtr = Id StorageDefinitions::*;
     // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
     // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
-    constexpr spv::FunctionControlMask function_control = spv::FunctionControlMask::DontInline;
+    // Experiment only: EDEN_NX2_GLOBAL_HELPER_INLINE=mesh (task and mesh stages) or =all leaves
+    // them inlinable (MaskNone), as before 6ca892bc2a.
+    static const int inline_scope = [] {
+        const char* const value = std::getenv("EDEN_NX2_GLOBAL_HELPER_INLINE");
+        const std::string_view text{value ? value : ""};
+        return text == "all" ? 2 : text == "mesh" ? 1 : 0;
+    }();
+    const bool inlinable = inline_scope == 2 ||
+                           (inline_scope == 1 && (stage == Stage::Task || stage == Stage::Mesh));
+    const spv::FunctionControlMask function_control =
+        inlinable ? spv::FunctionControlMask::MaskNone : spv::FunctionControlMask::DontInline;
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                bool writes, auto&& callback) {
