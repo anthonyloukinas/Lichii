@@ -977,6 +977,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         return;
     }
     using DefPtr = Id StorageDefinitions::*;
+    // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
+    // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
+    constexpr spv::FunctionControlMask function_control = spv::FunctionControlMask::DontInline;
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                bool writes, auto&& callback) {
@@ -1085,7 +1088,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
+        const Id func_id{OpFunction(type, function_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
             AddLabel();
@@ -1129,7 +1132,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }};
     const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(void_id, U64, type)};
-        const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
+        const Id func_id{OpFunction(void_id, function_control, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
@@ -1198,7 +1201,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             continue;
         }
         const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-        const Id function{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
+        const Id function{OpFunction(U32[1], function_control, function_type)};
         if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
             atomic_add_global_func_u32 = function;
         } else {
@@ -1222,8 +1225,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             });
         })) {
         const Id function_type{TypeFunction(U32[1], U64, U32[1], U32[1])};
-        atomic_cas_global_func_u32 =
-            OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type);
+        atomic_cas_global_func_u32 = OpFunction(U32[1], function_control, function_type);
         const Id address{OpFunctionParameter(U64)};
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};
