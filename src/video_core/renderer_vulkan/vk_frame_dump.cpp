@@ -262,7 +262,7 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
         return;
     }
     if (const char* const readback = std::getenv("EDEN_NX2_MESH_POS_READBACK");
-        readback && *readback != '\0' && device.IsBufferDeviceAddressSupported()) {
+        readback && *readback != '\0' && device.IsDebugDeviceAddressEnabled()) {
         positions = memory_allocator.CreateBuffer(
             VkBufferCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

@@ -749,12 +749,19 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+    // Debug only (EDEN_NX2_MESH_POS_READBACK): the feature stays on for the frame dump's buffer,
+    // the rest of the renderer still sees no device addresses.
+    debug_device_address = !extensions.descriptor_buffer && extensions.buffer_device_address &&
+                           features.buffer_device_address.bufferDeviceAddress &&
+                           std::getenv("EDEN_NX2_MESH_POS_READBACK") != nullptr;
+    if (debug_device_address) {
+        extensions.buffer_device_address = false;
+    } else
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave Eglantine's own buffers as they are without descriptor buffers.
-    const bool dlss_wants_device_address =
-        streamline_extensions && features.buffer_device_address.bufferDeviceAddress;
-    if (!extensions.descriptor_buffer && dlss_wants_device_address) {
+    if (!extensions.descriptor_buffer && streamline_extensions &&
+        features.buffer_device_address.bufferDeviceAddress) {
         extensions.buffer_device_address = false;
     } else
 #endif
@@ -785,7 +792,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
-    if (extensions.buffer_device_address) {
+    if (extensions.buffer_device_address || debug_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
     // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
