@@ -346,6 +346,8 @@ struct DeviceDispatch : InstanceDispatch {
 #endif
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR
+        vkGetPipelineExecutableInternalRepresentationsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
     PFN_vkMapMemory vkMapMemory{};
@@ -1063,6 +1065,14 @@ public:
     }
 };
 
+/// One internal representation of a pipeline executable (VK_KHR_pipeline_executable_properties).
+struct PipelineExecutableInternalRepresentation {
+    std::string name;
+    std::string description;
+    bool is_text{};
+    std::vector<char> data;
+};
+
 class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
     using Handle<VkDevice, NoOwner, DeviceDispatch>::Handle;
 
@@ -1137,6 +1147,12 @@ public:
 
     std::vector<VkPipelineExecutableStatisticKHR> GetPipelineExecutableStatisticsKHR(
         VkPipeline pipeline, u32 executable_index) const;
+
+    /// VK_KHR_pipeline_executable_properties internal representations of one executable, for
+    /// pipelines created with CAPTURE_INTERNAL_REPRESENTATIONS (EDEN_NX2_PIPELINE_STATS=2).
+    std::vector<PipelineExecutableInternalRepresentation>
+    GetPipelineExecutableInternalRepresentationsKHR(VkPipeline pipeline,
+                                                    u32 executable_index) const;
 
     void UpdateDescriptorSets(Span<VkWriteDescriptorSet> writes,
                               Span<VkCopyDescriptorSet> copies) const noexcept;
