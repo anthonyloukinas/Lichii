@@ -112,6 +112,8 @@ struct StorageInfo {
     bool tables_seen{};
     size_t table_budget{};
     size_t table_used{};
+    /// Table candidates the budget could not take, see the eviction in CollectStorageBuffers
+    size_t table_dropped{};
     small_vector<StorageBufferAddr, 8> table_candidates;
 };
 
@@ -1732,6 +1734,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                              ? 1U
                              : 0U)};
                     if (info.table_used + added > info.table_budget) {
+                        ++info.table_dropped;
                         continue;
                     }
                     info.table_used += added;
@@ -2416,20 +2419,30 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     };
     collect();
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
+    // OoT's additional direct lists can crowd their indirect object pools out of the 32
+    // bindings the descriptor budget guarantees. EDEN_NX2_SSBO64=1 raises the budget for native
+    // programs when the device supports the recompiler's full slot count (#423).
+    const char* const ssbo64 = std::getenv("EDEN_NX2_SSBO64");
+    const size_t binding_limit = env.IsNativeProgram() && ssbo64 && ssbo64[0] == '1' &&
+                                         ssbo64[1] == '\0' &&
+                                         (host_info.max_descriptor_set_storage_buffers == 0 ||
+                                          host_info.max_descriptor_set_storage_buffers >= Info::MAX_SSBOS)
+                                     ? Info::MAX_SSBOS
+                                     : 32;
+    if (info.tables_seen && info.set.size() < binding_limit) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
         with_tables.iterator_words = std::move(info.iterator_words);
         with_tables.atomic_pointers = std::move(info.atomic_pointers);
         with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
+        with_tables.table_budget = binding_limit - info.set.size();
         info = std::move(with_tables);
         collect();
     }
     if (!info.dynamic_set.empty()) {
         // A pointer slot over the limit stays unbound: accesses through it are dropped, as they
         // were before these slots were bound at all.
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(binding_limit,
                                             host_info.max_descriptor_set_storage_buffers)};
         for (const StorageBufferAddr& slot : info.dynamic_set) {
             if (!info.set.contains(slot) && info.set.size() >= limit) {
@@ -2458,7 +2471,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         // as the storage buffer limit and MAX_NATIVE_INDIRECT_BINDINGS allow. The dispatch binds
         // the distinct targets of the first records that have one.
         auto& stats{info.stats};
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(binding_limit,
                                             host_info.max_descriptor_set_storage_buffers)};
         const size_t room{limit > info.set.size() ? limit - info.set.size() : 0};
         const size_t slots{std::min(info.indirect_slots.size(), Info::MAX_NATIVE_INDIRECT_SLOTS)};
@@ -2482,6 +2495,17 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                         "the storage buffer limit {} and are not bound",
                         stats.indirect_slots_dropped, Info::MAX_NATIVE_INDIRECT_SLOTS, limit);
         }
+    }
+    // Never evict a storage binding silently: evicted pools produce empty consumer output
+    // (OoT Hyrule Field lost its grass this way).
+    if (info.table_dropped > 0) {
+        LOG_WARNING(Shader,
+                    "Storage binding budget exceeded: program has {} storage bindings bound "
+                    "at the limit of {} (native {}, stage {}, start {:x}); {} binding "
+                    "requests were evicted and their consumers see empty data",
+                    info.set.size(), binding_limit, env.IsNativeProgram(),
+                    static_cast<int>(env.ShaderStage()), env.StartAddress(),
+                    info.table_dropped);
     }
     program.info.native_global_bounds |= info.native_runtime_bounds;
     program.info.native_global_stats = info.stats;

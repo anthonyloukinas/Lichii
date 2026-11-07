@@ -899,8 +899,8 @@ bool BufferCache<P>::EnableGraphicsStorageBuffer(size_t stage, size_t ssbo_index
             }
         }
     }
-    channel_state->enabled_storage_buffers[stage] |= 1U << ssbo_index;
-    channel_state->written_storage_buffers[stage] |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
+    channel_state->written_storage_buffers[stage] |= u64{is_written} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_graphics_storage_buffers;
@@ -969,8 +969,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             }
         }
     }
-    channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
-    channel_state->written_compute_storage_buffers |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
+    channel_state->written_compute_storage_buffers |= u64{is_written} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_compute_storage_buffers;
@@ -994,8 +994,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     }
     const bool native_pointer = kepler_compute->IsNativeMode();
     channel_state->native_compute_storage_buffers =
-        (channel_state->native_compute_storage_buffers & ~(1U << ssbo_index)) |
-        ((native_pointer ? 1U : 0U) << ssbo_index);
+        (channel_state->native_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
+        (u64{native_pointer} << ssbo_index);
     const Binding binding =
         table_pointer && holder == 0
             ? NULL_BINDING
@@ -1042,8 +1042,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     }
     channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
     channel_state->bounded_compute_storage_buffers =
-        (channel_state->bounded_compute_storage_buffers & ~(1U << ssbo_index)) |
-        ((bounded ? 1U : 0U) << ssbo_index);
+        (channel_state->bounded_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
+        (u64{bounded} << ssbo_index);
 }
 
 template <class P>
@@ -1062,9 +1062,9 @@ void BufferCache<P>::BindComputeIndirectStorageBuffers(
                       ssbo_index);
             return;
         }
-        channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
-        channel_state->written_compute_storage_buffers &= ~(1U << ssbo_index);
-        channel_state->native_compute_storage_buffers |= 1U << ssbo_index;
+        channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
+        channel_state->written_compute_storage_buffers &= ~(u64{1} << ssbo_index);
+        channel_state->native_compute_storage_buffers |= u64{1} << ssbo_index;
         channel_state->compute_storage_buffers[ssbo_index] = NULL_BINDING;
     }
     const auto& launch_desc = kepler_compute->launch_description;
@@ -2768,7 +2768,7 @@ bool BufferCache<P>::OverlapsGraphicsBindings(DAddr device_addr, u64 size,
         return false;
     }
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        const auto any_enabled = [&](u32 mask, const auto& bindings) {
+        const auto any_enabled = [&](auto mask, const auto& bindings) {
             for (; mask != 0; mask &= mask - 1) {
                 if (overlaps(bindings[std::countr_zero(mask)])) {
                     return true;
