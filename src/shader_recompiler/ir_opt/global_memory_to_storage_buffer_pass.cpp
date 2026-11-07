@@ -117,6 +117,9 @@ struct StorageInfo {
     bool tables_seen{};
     size_t table_budget{};
     size_t table_used{};
+    /// The storage buffers the pass without table entries bound; bound again, they take nothing
+    /// from table_budget, which they were left out of.
+    StorageBufferSet counted;
     small_vector<StorageBufferAddr, 8> table_candidates;
 };
 
@@ -1813,11 +1816,13 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                     info.table_candidates.end()) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
+                    const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
+                        return info.set.find(buffer) == info.set.end() &&
+                               !info.counted.contains(buffer);
+                    };
                     const size_t added{
-                        (info.set.find(candidate) == info.set.end() ? 1U : 0U) +
-                        (candidate.indirect != ~0U && info.set.find(holder) == info.set.end()
-                             ? 1U
-                             : 0U)};
+                        (takes_binding(candidate) ? 1U : 0U) +
+                        (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
                     if (info.table_used + added > info.table_budget) {
                         continue;
                     }
@@ -2544,13 +2549,18 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
-        with_tables.iterator_words = std::move(info.iterator_words);
-        with_tables.atomic_pointers = std::move(info.atomic_pointers);
+        with_tables.iterator_words = info.iterator_words;
+        with_tables.atomic_pointers = info.atomic_pointers;
         with_tables.bind_competing_loaded = info.bind_competing_loaded;
         with_tables.tables_enabled = true;
         with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
-        info = std::move(with_tables);
+        with_tables.counted = info.set;
+        std::swap(info, with_tables);
         collect();
+        if (info.set.size() > Info::MAX_SSBOS) {
+            // Never more storage buffers than a stage binds: without the table entries, then.
+            info = std::move(with_tables);
+        }
     }
     if (!info.dynamic_set.empty()) {
         // A pointer slot over the limit stays unbound: accesses through it are dropped, as they
