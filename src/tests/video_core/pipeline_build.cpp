@@ -2,8 +2,11 @@
 
 #include <atomic>
 #include <future>
+#include <limits>
+#include <mutex>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -405,4 +408,67 @@ TEST_CASE("Pipeline residency counts parse from the environment", "[video_core][
     REQUIRE(ParseEnvCount("12000", 8000) == 12000);
     REQUIRE(ParseEnvCount("12k", 8000) == 8000);
     REQUIRE(ParseEnvCount("-1", 8000) == 8000);
+}
+
+TEST_CASE("Unbounded prebuild builds the newest records first and makes room by dropping the oldest",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{std::numeric_limits<size_t>::max(), 100, false, true};
+    std::mutex order_mutex;
+    std::vector<int> order;
+    auto build = [&](int key) {
+        return [&, key] {
+            std::scoped_lock lock{order_mutex};
+            order.push_back(key);
+            return std::make_unique<int>(key);
+        };
+    };
+    for (int key = 1; key <= 4; ++key) {
+        REQUIRE(cache.Add(key, 30, build(key)));
+    }
+    // 4 x 30 > 100: record 1 made room for record 4. A capture over the whole limit is refused.
+    REQUIRE_FALSE(cache.Add(5, 101, build(5)));
+    REQUIRE_FALSE(cache.Take(1));
+    cache.Start(1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (cache.Held() < 3 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    {
+        std::scoped_lock lock{order_mutex};
+        REQUIRE(order == std::vector<int>{4, 3, 2});
+    }
+    REQUIRE(cache.Held() == 3);
+    auto taken = cache.Take(3);
+    REQUIRE(taken);
+    REQUIRE(*taken == 3);
+    REQUIRE(cache.Held() == 2);
+    cache.Stop();
+    REQUIRE(cache.Held() == 0);
+}
+
+TEST_CASE("Prebuild gate skips builds once the live pipeline cap is reached",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{std::numeric_limits<size_t>::max(), 1000, false, true};
+    std::atomic<int> builds{};
+    for (int key = 0; key < 10; ++key) {
+        REQUIRE(cache.Add(key, 1, [&, key] {
+            ++builds;
+            return std::make_unique<int>(key);
+        }));
+    }
+    constexpr size_t cap = 4;
+    std::promise<void> done;
+    std::atomic<int> asked{};
+    cache.Start(1, [&] {
+        const bool admit = cache.Held() < cap;
+        if (++asked == 10) {
+            done.set_value();
+        }
+        return admit;
+    });
+    done.get_future().wait();
+    cache.Stop();
+    REQUIRE(builds == static_cast<int>(cap));
+    // Skipped keys are not held: a draw builds them itself.
+    REQUIRE_FALSE(cache.Take(0));
 }

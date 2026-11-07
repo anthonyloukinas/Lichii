@@ -99,3 +99,17 @@ EDEN_NX2_FENCE_BATCH=1
 # memory bytes, barriers, 64/16/8-bit ops, atomics, image and subgroup ops, buffer loads/stores.
 # Computed by walking the SPIR-V words.
 #EDEN_NX2_SHADER_STATS=1
+
+# Shader-compile stutter: cached graphics pipelines the boot did not build (no used list: all past
+# the first 3,000; with one: those no recent session drew) are all built after boot on 1-2
+# low-priority threads, newest first, until 8,000 graphics pipelines are live (~0.45 MB of driver
+# memory each). =<n> sets the thread count; =0 builds only the first 64 (16 MiB), as before.
+#EDEN_NX2_BG_PIPELINES=0
+# "Evict unused pipelines" destroys pipelines unused for 9,000 frames only while more than this
+# many graphics pipelines are live, the least recently used first (default 8,000, also the
+# background build's cap). =0 evicts every one unused that long, as before.
+#EDEN_NX2_PIPELINE_EVICT_ABOVE=0
+# =1 / =0 override the per-game "Evict unused pipelines" / "Build all cached pipelines at boot"
+# settings (measurements of the default settings on a profile that changed them).
+#EDEN_NX2_PIPELINE_EVICT=1
+#EDEN_NX2_PRELOAD_ALL_PIPELINES=0

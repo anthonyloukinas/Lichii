@@ -9,9 +9,10 @@
 
 namespace Vulkan {
 
-/// Live graphics pipelines below which none is evicted. At ~0.45 MB of driver memory each, 8,000
-/// is ~3.6 GB. EDEN_NX2_PIPELINE_EVICT_ABOVE=<n> overrides it; 0 evicts every pipeline unused for
-/// the eviction window, as before.
+/// Live graphics pipelines below which none is evicted, and up to which the background prebuild
+/// fills (prebuilds no draw took yet count as live). At ~0.45 MB of driver memory each, 8,000 is
+/// ~3.6 GB. EDEN_NX2_PIPELINE_EVICT_ABOVE=<n> overrides it; 0 evicts every pipeline unused for the
+/// eviction window, as before (the prebuild then still stops at 8,000).
 inline constexpr size_t DefaultPipelineEvictAbove = 8000;
 
 /// Parses a non-negative decimal count from an environment value; `fallback` when it is unset or

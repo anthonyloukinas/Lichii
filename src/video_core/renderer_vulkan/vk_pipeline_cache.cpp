@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -536,6 +537,32 @@ bool DriverCachesPipelines(const Device& device) {
         return false;
     }
 }
+size_t EvictAbove() {
+    static const size_t threshold = [] {
+        const size_t value = ParseEnvCount(std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE"),
+                                           DefaultPipelineEvictAbove);
+        LOG_INFO(Render_Vulkan, "Pipeline eviction applies above {} live graphics pipelines", value);
+        return value;
+    }();
+    return threshold;
+}
+
+// EDEN_NX2_BG_PIPELINES=<threads>: every cached graphics pipeline the boot skipped is built after
+// it on that many low-priority workers (default: a quarter of the pipeline workers, 1-2), newest
+// records first, while the live graphics pipelines stay below the eviction threshold (8,000 by
+// default). Their captures stay in memory until built, up to 1 GiB (older records make room).
+// =0 keeps the old bound: the first 64 skipped records within 16 MiB of captures.
+constexpr size_t BackgroundPipelinesDefault = std::numeric_limits<size_t>::max();
+
+size_t BackgroundPipelinesEnv() {
+    static const size_t value =
+        ParseEnvCount(std::getenv("EDEN_NX2_BG_PIPELINES"), BackgroundPipelinesDefault);
+    return value;
+}
+
+bool BoundedBackgroundPipelines() {
+    return BackgroundPipelinesEnv() == 0;
+}
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -557,7 +584,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       emission_budget{num_pipeline_workers},
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
-      background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+      background_pipelines{BoundedBackgroundPipelines() ? 64 : std::numeric_limits<size_t>::max(),
+                           BoundedBackgroundPipelines() ? 16ULL << 20 : 1ULL << 30,
+                           device.HasBrokenParallelShaderCompiling(),
+                           !BoundedBackgroundPipelines()} {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1377,7 +1407,21 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (stop_loading.stop_requested()) {
         background_pipelines.Stop();
     } else {
-        background_pipelines.Start(std::clamp<size_t>(num_pipeline_workers / 4, 1, 2));
+        const size_t env_threads = BackgroundPipelinesEnv();
+        const size_t threads = env_threads == 0 || env_threads == BackgroundPipelinesDefault
+                                   ? std::clamp<size_t>(num_pipeline_workers / 4, 1, 2)
+                                   : std::min(env_threads, num_pipeline_workers);
+        resident_graphics.store(graphics_cache.size(), std::memory_order_relaxed);
+        if (BoundedBackgroundPipelines()) {
+            background_pipelines.Start(threads);
+        } else {
+            const size_t cap = EvictAbove() != 0 ? EvictAbove() : DefaultPipelineEvictAbove;
+            background_pipelines.Start(threads, [this, cap] {
+                return resident_graphics.load(std::memory_order_relaxed) +
+                           background_pipelines.Held() <
+                       cap;
+            });
+        }
     }
 }
 
@@ -1411,16 +1455,6 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
 }
 
 namespace {
-size_t EvictAbove() {
-    static const size_t threshold = [] {
-        const size_t value = ParseEnvCount(std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE"),
-                                           DefaultPipelineEvictAbove);
-        LOG_INFO(Render_Vulkan, "Pipeline eviction applies above {} live graphics pipelines", value);
-        return value;
-    }();
-    return threshold;
-}
-
 // EDEN_NX2_PIPELINE_DIFF=1: for a new graphics pipeline whose shaders an earlier one uses too,
 // log which parts of the fixed state differ from that one (finds state that splits the same
 // draws into many pipelines, each translated on the GPU thread).
@@ -1503,6 +1537,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    resident_graphics.store(graphics_cache.size(), std::memory_order_relaxed);
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
@@ -1535,10 +1570,12 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
-    // Below EvictAbove() live pipelines nothing is evicted; above it, the least recently used of
-    // those unused for the window go until EvictAbove() remain.
+    // Below EvictAbove() live pipelines (background prebuilds no draw took yet included) nothing
+    // is evicted; above it, the least recently used of those unused for the window go until
+    // EvictAbove() remain.
     const size_t threshold = EvictAbove();
-    if (graphics_cache.size() <= threshold) {
+    const size_t live = graphics_cache.size() + background_pipelines.Held();
+    if (live <= threshold) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -1564,7 +1601,7 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         stale.push_back(it);
     }
-    const size_t evicted = PipelinesToEvict(graphics_cache.size(), stale.size(), threshold);
+    const size_t evicted = PipelinesToEvict(live, stale.size(), threshold);
     if (evicted < stale.size()) {
         std::ranges::nth_element(stale, stale.begin() + evicted, {}, [](const auto& it) {
             return it->second->LastUse();

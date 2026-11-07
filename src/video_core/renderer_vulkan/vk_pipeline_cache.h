@@ -280,6 +280,8 @@ private:
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
+    /// graphics_cache.size() as of the last frame, for the background prebuild's live cap.
+    std::atomic<size_t> resident_graphics{};
     PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
 };
 
