@@ -67,6 +67,32 @@ static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
            MakeCbufKey(index, offset);
 }
 
+// EDEN_NX2_CBUF_PTR_DENY=<cbuf>:<offset>,... (diagnostic, unset = off): both pointer
+// classifications answer 0 for these slots. The real answers are still recorded.
+static bool CbufPointerDenied(u32 index, u32 offset) {
+    static const std::vector<u64> denied = [] {
+        std::vector<u64> keys;
+        const char* text = std::getenv("EDEN_NX2_CBUF_PTR_DENY");
+        while (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            const unsigned long cbuf = std::strtoul(text, &end, 0);
+            if (end == text || *end != ':') {
+                break;
+            }
+            text = end + 1;
+            const unsigned long slot = std::strtoul(text, &end, 0);
+            if (end == text) {
+                break;
+            }
+            keys.push_back(MakeCbufKey(static_cast<u32>(cbuf), static_cast<u32>(slot)));
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_CBUF_PTR_DENY: c{}+{:#x}", cbuf, slot);
+            text = *end == ',' ? end + 1 : end;
+        }
+        return keys;
+    }();
+    return !denied.empty() && std::ranges::find(denied, MakeCbufKey(index, offset)) != denied.end();
+}
+
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
     switch (entry.texture_type) {
     case Tegra::Texture::TextureType::Texture1D:
@@ -198,23 +224,24 @@ bool GenericEnvironment::IsNativeProgram() const {
 bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const u64 key = MakeCbufKey(index, offset);
     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
-        return it->second != 0;
+        return it->second != 0 && !CbufPointerDenied(index, offset);
     }
     const u64 address = u64{ReadCbufValue(index, offset)} |
                         (u64{ReadCbufValue(index, offset + 4)} << 32);
     const bool mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
                         gpu_memory->IsFullyMappedRange(address, 1);
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
-    return mapped;
+    return mapped && !CbufPointerDenied(index, offset);
 }
 
 bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
     const u64 key = MakeIndirectCbufKey(index, offset, indirect);
     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
-        return it->second != 0;
+        return it->second != 0 && !CbufPointerDenied(index, offset);
     }
     bool mapped = false;
-    if (IsCbufStorageBufferPointer(index, offset)) {
+    static_cast<void>(IsCbufStorageBufferPointer(index, offset));
+    if (storage_pointer_types[MakeCbufKey(index, offset)] != 0) {
         const u64 holder =
             u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
         if (gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
@@ -224,7 +251,7 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
         }
     }
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
-    return mapped;
+    return mapped && !CbufPointerDenied(index, offset);
 }
 
 std::optional<u64> GenericEnvironment::Analyze() {
@@ -1222,7 +1249,7 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     if (it == storage_pointer_types.end()) {
         throw Shader::LogicError("Uncached storage pointer classification");
     }
-    return it->second != 0;
+    return it->second != 0 && !CbufPointerDenied(index, offset);
 }
 
 bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
@@ -1230,7 +1257,7 @@ bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, 
     if (it == storage_pointer_types.end()) {
         throw Shader::LogicError("Uncached storage pointer table classification");
     }
-    return it->second != 0;
+    return it->second != 0 && !CbufPointerDenied(index, offset);
 }
 
 u64 FileEnvironment::ReadInstruction(u32 address) {
