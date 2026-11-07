@@ -473,6 +473,39 @@ void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info)
              IndirectPointersMode());
 }
 
+/// Debug only (EDEN_NX2_MESH_REG_LOG=1): the mesh registers and translated limits of each task and
+/// mesh program, once per pipeline stage hash.
+void LogMeshRegisters(u64 hash, const Shader::IR::Program& program, const Shader::Environment* env) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MESH_REG_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!enabled) [[likely]] {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> logged;
+    {
+        std::scoped_lock lock{mutex};
+        if (!logged.insert(hash).second) {
+            return;
+        }
+    }
+    const std::array<u32, 3> regs = env ? env->MeshRegisters() : std::array<u32, 3>{};
+    const Shader::MeshInfo& mesh = program.mesh;
+    LOG_INFO(Render_Vulkan,
+             "NX2 mesh regs: hash={:016x} stage={} shader_a={:#010x} shader_b={:#010x} "
+             "init={:#010x} workgroup={}x{}x{} payload_words={} max_vertices={} max_primitives={} "
+             "topology={} vertex_lines={} primitive_lines={} local_memory={} shared_memory={} "
+             "invocations={}",
+             hash, program.stage == Shader::Stage::Task ? "task" : "mesh", regs[0], regs[1],
+             regs[2], program.workgroup_size[0], program.workgroup_size[1],
+             program.workgroup_size[2], mesh.payload_words, mesh.max_vertices,
+             mesh.max_primitives, mesh.topology, mesh.vertex_lines.size(),
+             mesh.primitive_lines.size(), program.local_memory_size, program.shared_memory_size,
+             program.invocations);
+}
+
 void LogReplacement(std::string_view kind, u64 hash, VideoCommon::CheckedWrite result) {
     switch (result) {
     case VideoCommon::CheckedWrite::Written:
@@ -1662,6 +1695,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             if (runtime_info.mesh_positions_address != 0) {
                 runtime_info.mesh_positions_tag = static_cast<u32>(key.unique_hashes[index] >> 32);
             }
+        }
+        if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) {
+            LogMeshRegisters(key.unique_hashes[index], program, stage_envs[index]);
         }
         // Upstream's SPIR-V emission on a pipeline worker (DeferredStages) only without the
         // translation cache: the cache's modules are keyed on the bindings each stage leaves for
