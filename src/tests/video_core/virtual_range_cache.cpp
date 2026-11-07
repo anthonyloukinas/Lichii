@@ -19,10 +19,15 @@ constexpr GPUVAddr HOLE = 0x10000;
 /// GPU memory that is contiguous, except for a device address jump HOLE into a split range.
 struct FakeMemory {
     bool split{};
+    u64 serial{};
     mutable int walks{};
 
     size_t GetID() const {
         return 1;
+    }
+
+    u64 MapSerial() const {
+        return serial;
     }
 
     std::vector<std::pair<GPUVAddr, size_t>> GetSubmappedRange(GPUVAddr gpu_addr,
@@ -81,4 +86,31 @@ TEST_CASE("VirtualRangeCache forgets a kept range when its tail is unmapped",
     memory.split = true;
     REQUIRE(cache.Query(memory, BASE, HOLE * 2)->size() == 2);
     REQUIRE(memory.walks == 2);
+}
+
+TEST_CASE("VirtualRangeCache walks again after a remap without an unmap",
+          "[video_core][virtual_range_cache]") {
+    // Four pages across HOLE, contiguous until a page behind HOLE is mapped to other device
+    // memory: the page table changes (and the serial), no Unmap reaches the cache.
+    constexpr GPUVAddr start = BASE + HOLE - 0x2000;
+    FakeMemory memory;
+    VirtualRangeCache cache;
+    REQUIRE(cache.Query(memory, start, 0x4000)->size() == 1);
+    REQUIRE(cache.Query(memory, start, 0x3000)->size() == 1);
+    REQUIRE(cache.Query(memory, start, 0x4000)->size() == 1);
+    REQUIRE(memory.walks == 1);
+
+    memory.split = true;
+    ++memory.serial;
+    REQUIRE(cache.Query(memory, start, 0x3000)->size() == 2);
+    REQUIRE(memory.walks == 2);
+    ++memory.serial;
+    REQUIRE(cache.Query(memory, start, 0x3000)->size() == 2);
+    REQUIRE(memory.walks == 3);
+    ++memory.serial;
+    REQUIRE(cache.Query(memory, start, 0x4000)->size() == 2);
+    REQUIRE(memory.walks == 4);
+    // Unchanged serial: the walk is kept.
+    REQUIRE(cache.Query(memory, start, 0x4000)->size() == 2);
+    REQUIRE(memory.walks == 4);
 }

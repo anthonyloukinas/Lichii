@@ -41,9 +41,13 @@ public:
             entries.clear();
         }
         const size_t as_id = memory.GetID();
+        // A remap of mapped pages to other device pages is not unmapped first (no Unmap call),
+        // only the serial changes. Read before the walk: a map during it makes the entry stale.
+        const u64 map_serial = memory.MapSerial();
         const u64 key = MakeKey(as_id, gpu_addr);
         const auto it = entries.find(key);
-        if (it != entries.end() && it->second.as_id == as_id && it->second.gpu_addr == gpu_addr) {
+        if (it != entries.end() && it->second.as_id == as_id && it->second.gpu_addr == gpu_addr &&
+            it->second.map_serial == map_serial) {
             const Entry& cached = it->second;
             // Titles bind one address with several sizes (Ocarina of Time ~2,000 times a second,
             // half of them over 1 MiB). Keep the page table walk of the longest: its prefixes are
@@ -56,6 +60,7 @@ public:
         entry.as_id = as_id;
         entry.gpu_addr = gpu_addr;
         entry.size = size;
+        entry.map_serial = map_serial;
         const auto ranges = memory.GetSubmappedRange(gpu_addr, size);
         GPUVAddr expected = gpu_addr;
         bool contiguous = true;
@@ -120,6 +125,7 @@ private:
         VirtualSegments segments;
         size_t as_id{};
         GPUVAddr gpu_addr{};
+        u64 map_serial{};
         u32 size{};
     };
 
