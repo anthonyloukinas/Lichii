@@ -324,8 +324,7 @@ void ShaderCache::RememberRejection(VAddr addr) {
         return;
     }
     rejected_native.emplace(addr, std::current_exception());
-    // InvalidatePagesInRegion forgets rejections a write reaches: the filter must not skip those.
-    page_filter.Mark(addr, 1);
+    page_filter.Mark(addr, 1); // InnerInvalidation reaches InvalidatePagesInRegion for it
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
