@@ -139,6 +139,10 @@ enum class Counter : u32 {
     // BindSmallUniformReusing's compare in guest memory.
     UboInPlaceSame,    ///< Small uniform buffers unchanged, nothing copied
     UboInPlaceChanged, ///< Small uniform buffers changed, copied once
+    // PipelineCache::CurrentGraphicsPipeline's clean lookup.
+    PipelineCleanHits,        ///< Pipelines kept without Refresh
+    PipelineCleanMisses,      ///< Lookups that refreshed the key
+    PipelineCleanVerifyDiffs, ///< EDEN_NX2_PERF_VERIFY: hits Refresh would have changed
     Count,
 };
 // What the zones and drain waits measure in: the time stamp counter without the fences the wall
@@ -384,6 +388,17 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += fmt::format(" | uniform buffers compared in place {:.0f} unchanged, {:.0f} changed",
                             static_cast<double>(same) * 1e9 / window,
                             static_cast<double>(changed) * 1e9 / window);
+    }
+    if (const u64 hits = data.counters[static_cast<size_t>(Counter::PipelineCleanHits)],
+        misses = data.counters[static_cast<size_t>(Counter::PipelineCleanMisses)];
+        hits != 0 || misses != 0) {
+        line += fmt::format(" | pipeline lookups clean {:.0f}/s, refreshed {:.0f}/s",
+                            static_cast<double>(hits) * 1e9 / window,
+                            static_cast<double>(misses) * 1e9 / window);
+        if (const u64 diffs = data.counters[static_cast<size_t>(Counter::PipelineCleanVerifyDiffs)];
+            diffs != 0) {
+            line += fmt::format(" ({} verify diffs)", diffs);
+        }
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
