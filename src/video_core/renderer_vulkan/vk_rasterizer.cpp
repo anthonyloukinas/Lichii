@@ -20,6 +20,8 @@
 #include <fstream>
 #include <mutex>
 #include <string_view>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <fmt/format.h>
@@ -270,7 +272,8 @@ std::string FrameDumpDrawState(const Device& device, const Maxwell& regs,
         R"("scissor0":[{},{},{},{},{}],"cull":{},"cull_face":{},"front_face":{},"raster":{},)"
         R"("zeta":"{:#x}","zeta_format":{},"zeta_enable":{},"pipeline_key":"{:016x}",)"
         R"("key_eds":{},"key_ndc_m1":{},"key_clamp_disabled":{},"key_depth_test":{},)"
-        R"("key_depth_func":{},"key_depth_write":{},"key_bias":{},"key_early_z":{})",
+        R"("key_depth_func":{},"key_depth_write":{},"key_bias":{},"key_early_z":{},)"
+        R"("depth_bounds":[{},{},{}],"stencil":{},"color_mask0":"{:#x}")",
         regs.depth_test_enable, static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
         static_cast<u32>(regs.depth_mode), clip.depth_0_to_1.Value(), clip.pixel_min_z.Value(),
         clip.pixel_max_z.Value(), static_cast<u32>(clip.geometry_clip.Value()),
@@ -286,7 +289,8 @@ std::string FrameDumpDrawState(const Device& device, const Maxwell& regs,
         key.state.extended_dynamic_state.Value(), key.state.ndc_minus_one_to_one.Value(),
         dynamic.depth_clamp_disabled.Value(), dynamic.depth_test_enable.Value(),
         dynamic.depth_test_func.Value(), dynamic.depth_write_enable.Value(),
-        dynamic.depth_bias_enable.Value(), key.state.early_z.Value());
+        dynamic.depth_bias_enable.Value(), key.state.early_z.Value(), regs.depth_bounds_enable,
+        regs.depth_bounds[0], regs.depth_bounds[1], regs.stencil_enable, regs.color_mask[0].raw);
 }
 
 VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u32 down_shift = 0) {
@@ -1185,6 +1189,47 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateDynamicStates(pipeline);
+    }
+    // Debug only, never for nx2: EDEN_NX2_DEPTH_FUNC_OVERRIDE=<hash prefix>:<NEVER|LESS|EQUAL|
+    // LEQUAL|GREATER|NOTEQUAL|GEQUAL|ALWAYS> sets the depth compare op of draws whose pipeline has
+    // a stage hash starting with the prefix (extended dynamic state only).
+    static const auto depth_override = []() -> std::optional<std::pair<std::string, VkCompareOp>> {
+        const char* value = std::getenv("EDEN_NX2_DEPTH_FUNC_OVERRIDE");
+        if (!value) {
+            return std::nullopt;
+        }
+        const std::string_view text{value};
+        const size_t colon = text.find(':');
+        if (colon == std::string_view::npos) {
+            return std::nullopt;
+        }
+        static constexpr std::array<std::pair<std::string_view, VkCompareOp>, 8> ops{{
+            {"NEVER", VK_COMPARE_OP_NEVER}, {"LESS", VK_COMPARE_OP_LESS},
+            {"EQUAL", VK_COMPARE_OP_EQUAL}, {"LEQUAL", VK_COMPARE_OP_LESS_OR_EQUAL},
+            {"GREATER", VK_COMPARE_OP_GREATER}, {"NOTEQUAL", VK_COMPARE_OP_NOT_EQUAL},
+            {"GEQUAL", VK_COMPARE_OP_GREATER_OR_EQUAL}, {"ALWAYS", VK_COMPARE_OP_ALWAYS},
+        }};
+        for (const auto& [name, op] : ops) {
+            if (text.substr(colon + 1) == name) {
+                LOG_WARNING(Render_Vulkan, "EDEN_NX2_DEPTH_FUNC_OVERRIDE: {} on {}", name,
+                            text.substr(0, colon));
+                return std::pair{std::string{text.substr(0, colon)}, op};
+            }
+        }
+        return std::nullopt;
+    }();
+    if (depth_override && device.IsExtExtendedDynamicStateSupported()) {
+        bool match = false;
+        for (const u64 hash : pipeline->ShaderHashes()) {
+            match |= hash != 0 && fmt::format("{:016x}", hash).starts_with(depth_override->first);
+        }
+        if (match) {
+            scheduler.Record([op = depth_override->second](vk::CommandBuffer cmdbuf) {
+                cmdbuf.SetDepthCompareOpEXT(op);
+            });
+            // The next draw records the guest op again.
+            maxwell3d->dirty.flags[Dirty::DepthCompareOp] = true;
+        }
     }
 
     query_cache.NotifySegment(true);
