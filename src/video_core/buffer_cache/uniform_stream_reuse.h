@@ -107,7 +107,9 @@ template <class Runtime, class DeviceMemory>
         if (guest != nullptr) {
             namespace Profile = Nx2Profile;
             const bool same = slot.size == size && std::memcmp(slot.bytes.data(), guest, size) == 0;
-            Profile::Add(same ? Profile::Counter::UboInPlaceSame : Profile::Counter::UboInPlaceChanged, 1);
+            Profile::Add(same ? Profile::Counter::UboInPlaceSame
+                              : Profile::Counter::UboInPlaceChanged,
+                         1);
             if (same && slot.tick == runtime.CurrentTick()) {
                 runtime.RebindStreamUniform(slot.ref, size);
                 return true;
