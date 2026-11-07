@@ -472,3 +472,31 @@ TEST_CASE("Prebuild gate skips builds once the live pipeline cap is reached",
     // Skipped keys are not held: a draw builds them itself.
     REQUIRE_FALSE(cache.Take(0));
 }
+
+TEST_CASE("Warm-only prebuilds are built, dropped and never held or gated",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{std::numeric_limits<size_t>::max(), 1000, false, true};
+    std::atomic<int> builds{};
+    std::promise<void> done;
+    REQUIRE(cache.Add(1, 1, [&] {
+        ++builds;
+        done.set_value(); // added first, so built last
+        return std::make_unique<int>(1);
+    }, true));
+    REQUIRE(cache.Add(2, 1, [&] {
+        ++builds;
+        return std::make_unique<int>(2);
+    }, true));
+    std::atomic<int> asked{};
+    cache.Start(1, [&] {
+        ++asked;
+        return false;
+    });
+    done.get_future().wait();
+    cache.Stop();
+    REQUIRE(builds == 2);
+    REQUIRE(asked == 0);
+    REQUIRE(cache.Held() == 0);
+    REQUIRE_FALSE(cache.Take(1));
+    REQUIRE_FALSE(cache.Take(2));
+}

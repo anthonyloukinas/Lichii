@@ -20,7 +20,8 @@ namespace Vulkan {
 
 /// Cached pipelines the boot did not build, built on low-priority workers after it and handed to
 /// the first draw that needs one (Take). A draw that comes first claims the key and builds it
-/// itself, as without the prebuild.
+/// itself, as without the prebuild. A warm-only record is built and destroyed: no draw can take it,
+/// but its translation and driver compile are cached for the live build of the same shaders.
 template <typename Key, typename Pipeline>
 class PipelinePrebuild {
     struct Entry {
@@ -52,7 +53,7 @@ public:
         Stop();
     }
 
-    bool Add(const Key& key, size_t capture_bytes, Build build) {
+    bool Add(const Key& key, size_t capture_bytes, Build build, bool warm_only = false) {
         if (started || stopped || entries.contains(key) || capture_bytes > capture_limit) {
             return false;
         }
@@ -72,13 +73,14 @@ public:
         entry->reservation = std::move(reservation);
         entries.emplace(key, entry);
         captured_bytes += capture_bytes;
-        tasks.push_back({key, capture_bytes, [this, key, entry, build = std::move(build)]() mutable {
+        tasks.push_back({key, capture_bytes, [this, key, entry, build = std::move(build),
+                                              warm_only]() mutable {
             bool run;
             {
                 std::scoped_lock lock{mutex};
                 run = !stopped && !entry->claimed;
             }
-            const bool gated = run && gate && !gate();
+            const bool gated = run && !warm_only && gate && !gate();
             std::unique_ptr<Pipeline> pipeline;
             if (run && !gated) {
                 try {
@@ -91,10 +93,17 @@ public:
                 }
             }
             build = {};
+            const bool warmed = warm_only && pipeline;
+            if (warm_only) {
+                pipeline.reset();
+            }
             bool last;
             {
                 std::scoped_lock lock{mutex};
-                if (!stopped && !entry->claimed && pipeline) {
+                if (warmed) {
+                    entries.erase(key);
+                    ++stats.warmed;
+                } else if (!stopped && !entry->claimed && pipeline) {
                     entry->pipeline = std::move(pipeline);
                     held.fetch_add(1, std::memory_order_relaxed);
                     ++stats.built;
@@ -199,7 +208,7 @@ private:
     }
 
     void LogSummary(const char* how) {
-        size_t queued, built, drawn, taken, skipped, failed, left;
+        size_t queued, built, drawn, taken, skipped, failed, left, warmed;
         {
             std::scoped_lock lock{mutex};
             if (logged) {
@@ -212,15 +221,16 @@ private:
             taken = stats.taken;
             skipped = stats.skipped;
             failed = stats.failed;
+            warmed = stats.warmed;
             left = remaining;
         }
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
         LOG_INFO(Render_Vulkan,
                  "Background pipeline build {} after {:.1f} s: {} queued, {} built ({} taken by a "
-                 "draw, {} not drawn yet), {} claimed by a draw first, {} skipped at the live "
-                 "pipeline cap, {} failed, {} not run",
-                 how, seconds, queued, built, drawn, Held(), taken, skipped, failed, left);
+                 "draw, {} not drawn yet), {} warm-only built and dropped, {} claimed by a draw "
+                 "first, {} skipped at the live pipeline cap, {} failed, {} not run",
+                 how, seconds, queued, built, drawn, Held(), warmed, taken, skipped, failed, left);
     }
 
     EmissionBudget budget;
@@ -246,6 +256,7 @@ private:
         size_t taken{};
         size_t skipped{};
         size_t failed{};
+        size_t warmed{};
     } stats;
 };
 

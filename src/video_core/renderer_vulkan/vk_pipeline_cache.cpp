@@ -1199,6 +1199,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_translations", CACHE_VERSION));
     size_t skipped_pipelines = 0;
     size_t deferred_pipelines = 0;
+    size_t other_driver_pipelines = 0;
     size_t queued_graphics = 0;
     const bool preload_all = PreloadAllPipelines();
     if (preload_all) {
@@ -1307,6 +1308,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             for (const auto& env : envs) {
                 capture_bytes += env.MemorySize();
             }
+            // A record of another driver (or driver version) is in the key: no draw on this one
+            // looks it up. The unbounded prebuild still builds it to fill the translation and
+            // driver caches for the live build of the same shaders, but does not keep it.
+            const bool other_driver =
+                !BoundedBackgroundPipelines() &&
+                (key.state.driver_id != dynamic_features.driver_id ||
+                 key.state.driver_version != dynamic_features.driver_version);
             if (background_pipelines.Add(
                     key, capture_bytes,
                     [this, key, envs = std::move(envs),
@@ -1328,8 +1336,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                             return std::unique_ptr<GraphicsPipeline>{};
                         }
                         return pipeline;
-                    })) {
+                    },
+                    other_driver)) {
                 ++deferred_pipelines;
+                other_driver_pipelines += other_driver ? 1 : 0;
             }
             return;
         }
@@ -1370,8 +1380,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (skipped_pipelines != 0) {
         LOG_INFO(
             Render_Vulkan,
-            "{} cached graphics pipelines skipped at boot, {} admitted for background prebuild",
-            skipped_pipelines, deferred_pipelines);
+            "{} cached graphics pipelines skipped at boot, {} admitted for background prebuild "
+            "({} of another driver, warm-only)",
+            skipped_pipelines, deferred_pipelines, other_driver_pipelines);
     }
 
     std::unique_lock lock{state.mutex};
