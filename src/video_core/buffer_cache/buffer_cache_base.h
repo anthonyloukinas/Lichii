@@ -39,6 +39,7 @@
 #include "video_core/buffer_cache/gpu_modified_set.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/hot_epoch_order.h"
+#include "video_core/buffer_cache/native_bank_snapshots.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -561,6 +562,8 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// What those re-uploads last sent of each page (native_bank_snapshots.h).
+    NativeBankSnapshots native_bank_snapshots;
 
 private:
     template <typename Func>
@@ -684,6 +687,10 @@ private:
                                std::span<const BufferCopy> copies);
 
     void MappedUploadMemory(Buffer& buffer, u64 total_size_bytes, std::span<BufferCopy> copies);
+
+    /// Re-uploads the parts of a native uniform bank whose guest bytes differ from what the
+    /// last re-upload sent (native_bank_snapshots.h)
+    void UploadNativeBankChanges(Buffer& buffer, BufferId buffer_id, DAddr device_addr, u64 size);
 
     void DownloadBufferMemory(Buffer& buffer_id);
 

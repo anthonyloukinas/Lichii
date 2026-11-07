@@ -143,6 +143,14 @@ enum class Counter : u32 {
     PipelineCleanHits,        ///< Pipelines kept without Refresh
     PipelineCleanMisses,      ///< Lookups that refreshed the key
     PipelineCleanVerifyDiffs, ///< EDEN_NX2_PERF_VERIFY: hits Refresh would have changed
+    // BindHostGraphicsUniformBuffer's once-per-frame re-upload of native 64 KiB uniform banks.
+    BankReuploads,     ///< Banks that uploaded some bytes again
+    BankGated,         ///< Banks whose guest bytes all equalled the last upload: nothing sent
+    BankBytesSent,     ///< Bytes re-uploaded
+    BankBytesGated,    ///< Bytes not re-uploaded (unchanged)
+    BankChangedKnown,  ///< Of the changed pages: the tracker already had them CPU-modified
+    BankStreamed,      ///< Re-upload checks for binds that then stream from guest memory anyway
+    BankSnapshotDrops, ///< Times the snapshots passed their cap and were all dropped
     Count,
 };
 // What the zones and drain waits measure in: the time stamp counter without the fences the wall
@@ -399,6 +407,18 @@ inline void Report(const char* thread_name = "GPU thread") {
             diffs != 0) {
             line += fmt::format(" ({} verify diffs)", diffs);
         }
+    }
+    if (const u64 sent = data.counters[static_cast<size_t>(Counter::BankReuploads)],
+        gated = data.counters[static_cast<size_t>(Counter::BankGated)];
+        sent != 0 || gated != 0) {
+        line += fmt::format(
+            " | uniform banks re-uploaded {:.0f}/s ({:.0f} KiB/s), unchanged {:.0f}/s ({:.0f} KiB/s "
+            "not sent); changed pages the tracker knew {:.0f}/s; on streamed binds {:.0f}/s; "
+            "snapshot drops {}",
+            per_second(Counter::BankReuploads), per_second(Counter::BankBytesSent) / 1024.0,
+            per_second(Counter::BankGated), per_second(Counter::BankBytesGated) / 1024.0,
+            per_second(Counter::BankChangedKnown), per_second(Counter::BankStreamed),
+            data.counters[static_cast<size_t>(Counter::BankSnapshotDrops)]);
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {

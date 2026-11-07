@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -546,6 +547,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
     InvalidateNativeIndirectCache(*cpu_dest_address, amount);
+    native_bank_snapshots.Invalidate(*cpu_dest_address, amount);
     // This subtraction in this order is important for overlapping copies.
     gpu_modified_ranges.Subtract(*cpu_dest_address, amount);
     const bool has_new_downloads = tmp_intervals.size() != 0;
@@ -592,6 +594,7 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
     Buffer& dest_buffer = slot_buffers[buffer];
     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
+    native_bank_snapshots.Invalidate(*cpu_dst_address, size);
     runtime.ClearBuffer(dest_buffer, offset, size, value);
     dest_buffer.MarkUsage(offset, size);
     return true;
@@ -613,6 +616,8 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
     DAddr device_addr, u32 size, ObtainBufferSynchronize sync_info, ObtainBufferOperation post_op) {
     const BufferId buffer_id = FindBuffer(device_addr, size, false);
     Buffer& buffer = slot_buffers[buffer_id];
+    // The caller may write the buffer itself (query results).
+    native_bank_snapshots.Invalidate(device_addr, size);
 
     // synchronize op
     switch (sync_info) {
@@ -1778,6 +1783,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
     if (draw_state.inline_index_draw_indexes.empty()) {
         SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
     } else {
+        native_bank_snapshots.Invalidate(buffer.CpuAddr(), size);
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
             std::array<BufferCopy, 1> copies{{BufferCopy{.src_offset = upload_staging.offset, .dst_offset = 0, .size = size}}};
@@ -2034,20 +2040,31 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    const bool use_fast_buffer = needs_alignment_stream
+        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+            && !memory_tracker.IsRegionGpuModified(device_addr, size));
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
-    // EDEN_NX2_UNIFORM_BANK_REUPLOAD=0: skip it, as before 6053738ae2 (for A/B comparisons).
-    static const bool reupload_uniform_bank = [] {
+    // The 0x10000 size comes from the shader: a read of this bank with a non-immediate offset, or
+    // a register-indexed bank read (collect_shader_info_pass.cpp). Only the pages whose guest
+    // bytes differ from what the last re-upload sent are sent again (native_bank_snapshots.h).
+    // EDEN_NX2_UNIFORM_BANK_REUPLOAD=0: skip it, as before 6053738ae2 (for A/B comparisons);
+    // =all: send the whole bank every time, as from 6053738ae2 to l19.
+    static const int bank_reupload_mode = [] {
         const char* value = std::getenv("EDEN_NX2_UNIFORM_BANK_REUPLOAD");
-        return !(value != nullptr && value[0] == '0');
+        if (value != nullptr && value[0] == '0') {
+            return 0;
+        }
+        return value != nullptr && std::strcmp(value, "all") == 0 ? 1 : 2;
     }();
-    if (reupload_uniform_bank && has_host_buffer &&
+    if (bank_reupload_mode != 0 && has_host_buffer &&
         (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
         native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        Nx2Profile::Add(Nx2Profile::Counter::BankStreamed, use_fast_buffer ? 1 : 0);
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
@@ -2055,18 +2072,19 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
         }
         const u64 upload_size = (std::min<u64>)(mapped_size, size);
-        if (upload_size != 0) {
+        if (upload_size != 0 && bank_reupload_mode == 1) {
             std::array<BufferCopy, 1> copies{BufferCopy{
                 .src_offset = 0,
                 .dst_offset = buffer.Offset(device_addr),
                 .size = upload_size,
             }};
             UploadMemory(buffer, upload_size, upload_size, copies);
+            Nx2Profile::Add(Nx2Profile::Counter::BankReuploads, 1);
+            Nx2Profile::Add(Nx2Profile::Counter::BankBytesSent, upload_size);
+        } else if (upload_size != 0) {
+            UploadNativeBankChanges(buffer, binding.buffer_id, device_addr, upload_size);
         }
     }
-    const bool use_fast_buffer = needs_alignment_stream
-        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
-            && !memory_tracker.IsRegionGpuModified(device_addr, size));
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -2764,6 +2782,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     MarkNativeIndirectCacheWritten(device_addr, size);
+    native_bank_snapshots.Invalidate(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     QueueFenceDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
@@ -3215,6 +3234,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
+    native_bank_snapshots.Invalidate(new_buffer.CpuAddr(), size_bytes);
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
     new_buffer.MarkUsage(0, size_bytes);
     for (const BufferId overlap_id : overlap.ids) {
@@ -3431,6 +3451,9 @@ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 larg
             Tegra::Nx2Count(c.native_storage_upload_bytes, total_size_bytes);
         }
     }
+    for (const BufferCopy& copy : copies) {
+        native_bank_snapshots.Invalidate(buffer.CpuAddr() + copy.dst_offset, copy.size);
+    }
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
@@ -3489,6 +3512,79 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
 }
 
 template <class P>
+void BufferCache<P>::UploadNativeBankChanges(Buffer& buffer, BufferId buffer_id, DAddr device_addr,
+                                             u64 size) {
+    namespace Profile = Nx2Profile;
+    constexpr u32 page_size = NativeBankSnapshots::PAGE_SIZE;
+    // Dropping the snapshots only between banks keeps the slots below valid.
+    if (native_bank_snapshots.Reserve(size / page_size + 2)) {
+        Profile::Add(Profile::Counter::BankSnapshotDrops, 1);
+    }
+    struct Piece {
+        DAddr addr;
+        u32 slot;
+        u32 lo;
+        u32 size;
+    };
+    boost::container::small_vector<Piece, 17> pieces;
+    u64 changed_bytes = 0;
+    const DAddr end = device_addr + size;
+    for (DAddr addr = device_addr; addr < end;) {
+        const DAddr page = Common::AlignDown(addr, page_size);
+        const DAddr piece_end = (std::min<DAddr>)(page + page_size, end);
+        const u32 lo = static_cast<u32>(addr - page);
+        const u32 hi = static_cast<u32>(piece_end - page);
+        // The caller stopped the bank at the first unmapped page.
+        const u8* const guest = device_memory.template GetPointer<u8>(addr);
+        if (!native_bank_snapshots.Unchanged(page, buffer_id.index, lo, hi, guest)) {
+            if (Profile::Enabled() && memory_tracker.IsRegionCpuModified(addr, hi - lo)) {
+                Profile::Add(Profile::Counter::BankChangedKnown, 1);
+            }
+            const u32 slot = native_bank_snapshots.Record(page, buffer_id.index, lo, hi, guest);
+            pieces.push_back(Piece{.addr = addr, .slot = slot, .lo = lo, .size = hi - lo});
+            changed_bytes += hi - lo;
+        }
+        addr = piece_end;
+    }
+    Profile::Add(pieces.empty() ? Profile::Counter::BankGated : Profile::Counter::BankReuploads, 1);
+    Profile::Add(Profile::Counter::BankBytesSent, changed_bytes);
+    Profile::Add(Profile::Counter::BankBytesGated, size - changed_bytes);
+    if (pieces.empty()) {
+        return;
+    }
+    // Sent from the snapshots, so the host buffer gets exactly the bytes they hold.
+    if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+        auto upload_staging = runtime.UploadStagingBuffer(changed_bytes);
+        boost::container::small_vector<BufferCopy, 17> copies;
+        u64 src = 0;
+        for (const Piece& piece : pieces) {
+            std::memcpy(upload_staging.mapped_span.data() + src,
+                        native_bank_snapshots.Bytes(piece.slot) + piece.lo, piece.size);
+            const u64 dst = buffer.Offset(piece.addr);
+            if (!copies.empty() && copies.back().dst_offset + copies.back().size == dst) {
+                copies.back().size += piece.size;
+            } else {
+                copies.push_back(BufferCopy{
+                    .src_offset = upload_staging.offset + src,
+                    .dst_offset = dst,
+                    .size = piece.size,
+                });
+            }
+            src += piece.size;
+        }
+        const std::span<BufferCopy> copies_span(copies.data(), copies.size());
+        const bool can_reorder = runtime.CanReorderUpload(buffer, copies_span);
+        runtime.CopyBuffer(buffer, upload_staging.buffer, copies_span, true, can_reorder);
+    } else {
+        for (const Piece& piece : pieces) {
+            buffer.ImmediateUpload(
+                buffer.Offset(piece.addr),
+                std::span<const u8>(native_bank_snapshots.Bytes(piece.slot) + piece.lo, piece.size));
+        }
+    }
+}
+
+template <class P>
 bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
                                   std::span<const u8> inlined_buffer) {
     const bool is_dirty = IsRegionRegistered(dest_address, copy_size);
@@ -3510,6 +3606,7 @@ template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
     InvalidateNativeIndirectCache(dest_address, copy_size);
+    native_bank_snapshots.Invalidate(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);
@@ -3674,6 +3771,8 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     ++buffer_deletions;
+    native_bank_snapshots.Invalidate(slot_buffers[buffer_id].CpuAddr(),
+                                     slot_buffers[buffer_id].SizeBytes());
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

@@ -232,6 +232,9 @@ struct BufferCacheTestAccess {
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
     }
+    static void CpuWrite(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsCpuModified(address, size);
+    }
 };
 
 } // namespace VideoCommon
@@ -597,9 +600,66 @@ TEST_CASE("Native uniform uploads stop at holes and keep unaligned bank boundari
     f.device.Map(0x22000, 0x22000, 0x1000, f.asid);
     Access::NextFrame(*f.cache);
     Access::Uniform(*f.cache, channel, id, 0x20123, 0x10000);
-    REQUIRE(f.runtime.upload_bytes == 0x11edd);
+    // The two pages sent before are unchanged: only the rest of the bank goes up.
+    REQUIRE(f.runtime.upload_bytes == 0x10000);
     REQUIRE(data[0x10122] == 0x6b);
     REQUIRE(data[0x10123] == 0);
+}
+
+TEST_CASE("Native uniform bank re-uploads send only pages whose guest bytes changed",
+          "[buffer_ports]") {
+    Fixture f;
+    f.memory->EnableNativeTiling();
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    VideoCommon::UniformBufferSizes sizes{};
+    sizes[0][0] = 0x10000;
+    channel.uniform_buffer_sizes = &sizes;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto& data = Access::Get(*f.cache, id).bytes;
+    std::memset(f.bytes + 0x10000, 0x5a, 0x10000);
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    REQUIRE(f.runtime.upload_bytes == 0x10000);
+    // Nothing changed: nothing is sent.
+    Access::NextFrame(*f.cache);
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    REQUIRE(f.runtime.upload_bytes == 0x10000);
+    REQUIRE(f.runtime.uploads == 1);
+    // A write the tracker did not see, in two pages: those two pages go up, in two copies.
+    f.bytes[0x15010] = 0x77;
+    f.bytes[0x17fff] = 0x78;
+    Access::NextFrame(*f.cache);
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    REQUIRE(f.runtime.upload_bytes == 0x12000);
+    REQUIRE(f.runtime.uploads == 3);
+    REQUIRE(data[0x5010] == 0x77);
+    REQUIRE(data[0x7fff] == 0x78);
+    // Adjacent changed pages go up in one copy; the same bank later in the frame is not checked.
+    f.bytes[0x1a000] = 0x79;
+    f.bytes[0x1b000] = 0x7a;
+    Access::NextFrame(*f.cache);
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    f.bytes[0x1c000] = 0x7b;
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    REQUIRE(f.runtime.upload_bytes == 0x14000);
+    REQUIRE(f.runtime.uploads == 4);
+    REQUIRE(data[0xb000] == 0x7a);
+    REQUIRE(data[0xc000] == 0x5a);
+    // A tracked write: the normal upload sends its page, and the next re-upload sends that page
+    // again since the snapshot no longer knows what the host holds there.
+    Access::NextFrame(*f.cache);
+    Access::CpuWrite(*f.cache, 0x23000, 0x1000);
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    REQUIRE(data[0xc000] == 0x7b);
+    const u64 after_tracked = f.runtime.upload_bytes;
+    Access::NextFrame(*f.cache);
+    Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
+    REQUIRE(f.runtime.upload_bytes == after_tracked + 0x1000);
+    // A bank at another address in the same pages reuses the snapshots.
+    Access::Uniform(*f.cache, channel, id, 0x20100, 0xff00);
+    REQUIRE(f.runtime.upload_bytes == after_tracked + 0x1000);
 }
 
 TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_ports]") {
