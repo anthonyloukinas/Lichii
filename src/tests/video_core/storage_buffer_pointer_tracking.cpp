@@ -10,6 +10,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
@@ -22,9 +23,15 @@ class TestEnvironment final : public Shader::Environment {
 public:
     bool native{};
     std::vector<u32> scalar_offsets;
+    /// Set: the c0 slots a stored capture has answers for; others throw, as FileEnvironment does.
+    std::optional<std::vector<u32>> captured_offsets;
     TestEnvironment() { stage = Shader::Stage::Compute; }
     bool IsNativeProgram() const override { return native; }
     bool IsCbufStorageBufferPointer(u32 index, u32 offset) override {
+        if (captured_offsets && (index != 0 || std::ranges::find(*captured_offsets, offset) ==
+                                                   captured_offsets->end())) {
+            throw Shader::LogicError("Uncached storage pointer classification");
+        }
         return index == 0 && std::ranges::find(scalar_offsets, offset) == scalar_offsets.end();
     }
     u64 ReadInstruction(u32) override { return 0; }
@@ -92,6 +99,24 @@ TEST_CASE("Kernel parameter pointers win over 16-byte aligned strides",
     const IR::U32 low{ir.IAdd(ir.IAdd(row, Word(ir, 0x178)), ir.ShiftLeftLogical(lane, ir.Imm32(4)))};
     ir.WriteGlobal32(Address(ir, low, Word(ir, 0x17c)), lane);
     CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x178});
+}
+
+TEST_CASE("Paired native accesses without a loaded pointer ask only what older captures hold",
+          "[shader][storage_buffer][pipeline_cache]") {
+    // A paired access used to ask only about its pair. Searching for loaded pointers there also
+    // asks about c0[0x1c0], which an older capture has no answer for, so the pipeline failed to
+    // load from the disk cache. Without a loaded pointer the search keeps the pair anyway.
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.captured_offsets = std::vector<u32>{0x178};
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 lane{ir.LocalInvocationIdX()};
+    const IR::U32 row{ir.IAdd(ir.ShiftLeftLogical(lane, ir.Imm32(3)), Word(ir, 0x1c0))};
+    const IR::U32 low{ir.IAdd(ir.IAdd(row, Word(ir, 0x178)), ir.ShiftLeftLogical(lane, ir.Imm32(4)))};
+    ir.WriteGlobal32(Address(ir, low, Word(ir, 0x17c)), lane);
+    std::vector<u32> offsets;
+    REQUIRE_NOTHROW(offsets = fixture.TrackedOffsets());
+    CHECK(offsets == std::vector<u32>{0x178});
 }
 
 TEST_CASE("Filter tap offset tables are not taken for the weight pointer",
@@ -424,6 +449,21 @@ TEST_CASE("Native accesses through a cbuf pointer or a pointer loaded from it bi
     CHECK(program.Count(IR::Opcode::LoadStorage64) == 1);
     CHECK(program.Count(IR::Opcode::LoadGlobal128) == 1);
     CHECK(program.Count(IR::Opcode::LoadStorage128) == 0);
+}
+
+TEST_CASE("A loaded pointer competing with the pair is still searched for",
+          "[shader][storage_buffer][pipeline_cache]") {
+    // The search runs when a 64-bit load is on the address's way. Here it asks only about
+    // c0[0x30], which an older capture holds, so the capture loads and binds both.
+    DirectOrLoadedPointer program;
+    program.fixture.env.captured_offsets = std::vector<u32>{0x30};
+    const IR::U64 address{program.RecordAddress(false)};
+    static_cast<void>(program.record->LoadGlobal128(address));
+    std::vector<u32> offsets;
+    REQUIRE_NOTHROW(offsets = program.fixture.TrackedOffsets());
+    CHECK(offsets == std::vector<u32>{0x30, 0x30});
+    CHECK(program.LoadedDescriptors() == 1);
+    CHECK(program.Count(IR::Opcode::LoadGlobal128) == 1);
 }
 
 TEST_CASE("Native accesses the backend cannot route keep their paired cbuf pointer",

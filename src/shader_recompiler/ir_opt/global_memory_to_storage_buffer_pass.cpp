@@ -1115,10 +1115,52 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
     }
 }
 
+/// Whether NativePointerCandidates can find a pointer loaded from memory for this low address: it
+/// reaches a 64-bit global load along the same instructions, without asking the environment. Keep
+/// its operand following in step with NativePointerCandidates.
+bool ReachesLoadedPointer(const IR::U32& low_addr) {
+    small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
+    std::unordered_set<const IR::Inst*> visited{pending.front()};
+    const auto enqueue = [&](const IR::Value& value) {
+        if (!value.IsImmediate() && visited.insert(value.InstRecursive()).second) {
+            pending.push_back(value.InstRecursive());
+        }
+    };
+    for (size_t next = 0; next < pending.size(); ++next) {
+        const IR::Inst* const inst{pending[next]};
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::LoadGlobal64:
+            return true;
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::Phi:
+            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                enqueue(inst->Arg(arg));
+            }
+            break;
+        case IR::Opcode::SelectU32:
+            enqueue(inst->Arg(1));
+            enqueue(inst->Arg(2));
+            break;
+        case IR::Opcode::ShuffleIndex:
+            enqueue(inst->Arg(0));
+            break;
+        case IR::Opcode::CompositeExtractU32x2:
+            if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                enqueue(inst->Arg(0));
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
 /// Native programs: every constant buffer pointer the low address can come from, following only
 /// additions, selects and phis. A predicated address assignment becomes a phi whose other input
 /// can point into a different buffer, so the search does not stop at the first pointer. A pointer
 /// read from an array at a dynamic offset contributes every mapped slot of the array.
+/// ReachesLoadedPointer follows the same operands.
 small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_addr,
                                                            Environment& env, bool& dynamic,
                                                            StorageInfo& info) {
@@ -1346,7 +1388,9 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     // read from c0[12] or from *c0[12]). Rebasing on the constant buffer pointer then reads the
     // loaded path's records out of bounds, as zeros, so look for loaded pointers here as well.
     const bool paired_found = storage_buffer.has_value();
-    if (native && !low_addr.IsImmediate()) {
+    // Without a loaded pointer on the way the search keeps the pair anyway; skipping it also keeps
+    // the classification queries of older pipeline cache captures (which never searched here).
+    if (native && !low_addr.IsImmediate() && (!paired_found || ReachesLoadedPointer(low_addr))) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
         if (it == info.native_candidates.end()) {
