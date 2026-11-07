@@ -1378,8 +1378,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         // Draw macros write these for every instance (~500,000 same values a second in Ocarina of
         // Time). They only store the value, so an unchanged one is the same as a state write.
-        if (IsStoreOnlyExecutable(method) && fs.regs[method] == value && shadow_kept &&
-            fs.skip_same) {
+        // topology_override is not part of an instance loop: any write to it ends a deferred draw.
+        if (IsStoreOnlyExecutable(method) && DrawManager::IsInstanceLoopMethod(method) &&
+            fs.regs[method] == value && shadow_kept && fs.skip_same) {
             if (Profile::Enabled()) [[unlikely]] {
                 Profile::Add(Profile::Counter::SameValueWrites, 1);
             }
