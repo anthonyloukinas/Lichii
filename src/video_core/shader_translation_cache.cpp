@@ -33,7 +33,9 @@ namespace {
 // 4: StorageBufferDescriptor gained indirect_offset (upstream nx2 #150, merged at 27226d2568).
 // 5: Query gained c; IsCbufIndirectStorageBufferPointer is recorded (entries written before
 //    were translated with every table slot taken as a pointer).
-constexpr u32 FormatVersion = 5;
+// 6: stored SPIR-V changed: upstream nx2 #408 DontInline global memory helpers and unrolled
+//    software HMMA. Not the pipeline cache version (#408's 54 also covers its vertex keys).
+constexpr u32 FormatVersion = 6;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
