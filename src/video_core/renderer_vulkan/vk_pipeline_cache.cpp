@@ -830,15 +830,18 @@ bool MaskMeshAttributeTypes() {
 }
 
 // The "Build all cached pipelines at boot" setting (per game), a precompile run, or
-// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before. Read on each
-// LoadDiskResources call: the per-game setting can differ between titles in one process.
+// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before; =0 overrides
+// the setting off (a precompile run still builds all). Read on each LoadDiskResources call: the
+// per-game setting can differ between titles in one process.
 bool PreloadAllPipelines() {
-    static const bool env = [] {
+    static const char env = [] {
         const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr ? value[0] : '\0';
     }();
-    return env || Settings::values.preload_all_pipelines.GetValue() ||
-           Settings::values.force_preload_all_pipelines;
+    if (Settings::values.force_preload_all_pipelines || env == '1') {
+        return true;
+    }
+    return env != '0' && Settings::values.preload_all_pipelines.GetValue();
 }
 } // Anonymous namespace
 
