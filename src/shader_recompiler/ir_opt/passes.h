@@ -55,6 +55,7 @@ bool NativeIndirectGraphicsPointers();
 void VertexATransformPass(IR::Program& program);
 void VertexBTransformPass(IR::Program& program);
 void JoinTextureInfo(Info& base, Info& source);
-void JoinStorageInfo(Info& base, Info& source);
+/// Adds the storage buffers of source to base, at most limit in all
+void JoinStorageInfo(Info& base, Info& source, size_t limit = Info::MAX_SSBOS);
 
 } // namespace Shader::Optimization
