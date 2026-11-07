@@ -336,6 +336,36 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
+// Debug only: with EDEN_NX2_FRAME_DUMP set, EDEN_NX2_MESH_IR_WRITE=<hash prefixes> also writes
+// the first emitted SPIR-V of each matching shader as spv-<hash>.spv.
+void WriteDebugSpirv(u64 hash, std::span<const u32> code) {
+    const char* const prefixes = std::getenv("EDEN_NX2_MESH_IR_WRITE");
+    const char* const dir = std::getenv("EDEN_NX2_FRAME_DUMP");
+    if (prefixes == nullptr || dir == nullptr) [[likely]] {
+        return;
+    }
+    const std::string hex = fmt::format("{:016x}", hash);
+    std::string_view list{prefixes};
+    while (!list.empty()) {
+        const std::string_view prefix = list.substr(0, list.find(','));
+        list.remove_prefix(std::min(list.size(), prefix.size() + 1));
+        if (prefix.empty() || !hex.starts_with(prefix)) {
+            continue;
+        }
+        static std::mutex mutex;
+        std::scoped_lock lock{mutex};
+        const std::string path = fmt::format("{}/spv-{}.spv", dir, hex);
+        std::error_code error;
+        std::filesystem::create_directories(dir, error);
+        if (!std::filesystem::exists(path, error)) {
+            std::ofstream{path, std::ios::binary}.write(
+                reinterpret_cast<const char*>(code.data()),
+                static_cast<std::streamsize>(code.size_bytes()));
+        }
+        return;
+    }
+}
+
 std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
@@ -352,6 +382,7 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  std::span<const u32> reference = {}) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    WriteDebugSpirv(shader_hash, code);
     device.SaveShader(code);
     vk::ShaderModule module{BuildShader(device, code)};
     {
@@ -1789,6 +1820,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
         LogUntrackedGlobal(key.unique_hashes[index], program.stage, program.info);
+        WriteDebugSpirv(key.unique_hashes[index], code);
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
         {
