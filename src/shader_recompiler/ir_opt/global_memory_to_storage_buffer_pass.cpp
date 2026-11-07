@@ -2404,6 +2404,10 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!has_global_memory) {
         return;
     }
+    // The program takes as many storage buffers as the stage binds, at most MAX_SSBOS.
+    const u32 stage_limit{host_info.max_per_stage_descriptor_storage_buffers};
+    const size_t max_ssbos{stage_limit != 0 ? (std::min)(Info::MAX_SSBOS, size_t{stage_limit})
+                                            : Info::MAX_SSBOS};
     TrackingConditions conditions{program};
     StorageInfo info;
     info.iterator_words = CollectIteratorWords(program);
@@ -2421,17 +2425,17 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     };
     collect();
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
+    if (info.tables_seen && info.set.size() < max_ssbos) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
         with_tables.iterator_words = info.iterator_words;
         with_tables.atomic_pointers = info.atomic_pointers;
         with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
+        with_tables.table_budget = max_ssbos - info.set.size();
         with_tables.counted = info.set;
         std::swap(info, with_tables);
         collect();
-        if (info.set.size() > Info::MAX_SSBOS) {
+        if (info.set.size() > max_ssbos) {
             // Never more storage buffers than a stage binds: without the table entries, then.
             info = std::move(with_tables);
         }
@@ -2439,7 +2443,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!info.dynamic_set.empty()) {
         // A pointer slot over the limit stays unbound: accesses through it are dropped, as they
         // were before these slots were bound at all.
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(max_ssbos,
                                             host_info.max_descriptor_set_storage_buffers)};
         for (const StorageBufferAddr& slot : info.dynamic_set) {
             if (!info.set.contains(slot) && info.set.size() >= limit) {
@@ -2468,7 +2472,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         // as the storage buffer limit and MAX_NATIVE_INDIRECT_BINDINGS allow. The dispatch binds
         // the distinct targets of the first records that have one.
         auto& stats{info.stats};
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(max_ssbos,
                                             host_info.max_descriptor_set_storage_buffers)};
         const size_t room{limit > info.set.size() ? limit - info.set.size() : 0};
         const size_t slots{std::min(info.indirect_slots.size(), Info::MAX_NATIVE_INDIRECT_SLOTS)};
