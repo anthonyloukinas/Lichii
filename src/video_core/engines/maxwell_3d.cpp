@@ -1376,6 +1376,15 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         fs.regs[method] = value;
     } else {
+        // Draw macros write these for every instance (~500,000 same values a second in Ocarina of
+        // Time). They only store the value, so an unchanged one is the same as a state write.
+        if (IsStoreOnlyExecutable(method) && fs.regs[method] == value && shadow_kept &&
+            fs.skip_same) {
+            if (Profile::Enabled()) [[unlikely]] {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+            return;
+        }
         fs.regs[method] = value;
         // Where the write changes memory, before the constant buffer offset moves past it.
         if (memory_write_mask[method] && VideoCommon::GpuSplit::RangedWrites()) {
