@@ -70,6 +70,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 
@@ -374,6 +375,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler) {
     dynamic_state_flags = DynamicStateFlags();
     scheduler.SetQueryCache(query_cache);
+    buffer_cache.SetPendingCpuWrites(
+        [this](const std::function<void(DAddr, size_t)>& callback) {
+            gpu.ForEachPendingCpuWrite(callback);
+        });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
@@ -2577,6 +2582,18 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     return false;
 }
 
+void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
+    // on its pages (WriteMemory), which would write over the next collected write.
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ClaimCpuWrites(ranges);
+    }
+    for (const auto& [addr, size] : ranges) {
+        OnCacheInvalidation(addr, size);
+    }
+}
+
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
@@ -3562,10 +3579,10 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
-        GraphicsPipeline* const gp = skip_enabled && pipeline != nullptr
-                                         ? pipeline
-                                         : pipeline_cache.CurrentGraphicsPipeline();
-        if (skip_enabled && pipeline != nullptr && VideoCommon::Nx2FastDraw::g_verify) {
+        // A draw passes the pipeline it looked up: a second lookup was ~2.5% of the back thread.
+        GraphicsPipeline* const gp =
+            pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
+        if (pipeline != nullptr && VideoCommon::Nx2FastDraw::g_verify) {
             skip_stats.dynamic_pipeline_mismatches +=
                 pipeline != pipeline_cache.CurrentGraphicsPipeline() ? 1 : 0;
         }

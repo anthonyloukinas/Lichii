@@ -121,8 +121,7 @@ inline const bool g_inline_invalidate = [] {
     return value != nullptr && value[0] == '1';
 }();
 
-/// EDEN_NX2_DYNAMIC_SKIP=1: a draw with no dynamic state flag set skips the dynamic state updates,
-/// and the vertex input update uses the draw's pipeline instead of looking it up again.
+/// EDEN_NX2_DYNAMIC_SKIP=1: a draw with no dynamic state flag set skips the dynamic state updates.
 inline const bool g_dynamic_skip = [] {
     const char* const value = std::getenv("EDEN_NX2_DYNAMIC_SKIP");
     return value != nullptr && value[0] == '1';
