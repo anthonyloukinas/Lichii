@@ -1381,7 +1381,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         // topology_override is not part of an instance loop: any write to it ends a deferred draw.
         if (IsStoreOnlyExecutable(method) && DrawManager::IsInstanceLoopMethod(method) &&
             fs.regs[method] == value && shadow_kept && fs.skip_same) {
-            if (Profile::Enabled()) [[unlikely]] {
+            if (Profile::Enabled()) {
                 Profile::Add(Profile::Counter::SameValueWrites, 1);
             }
             return;

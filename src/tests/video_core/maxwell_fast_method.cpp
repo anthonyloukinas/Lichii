@@ -9,6 +9,7 @@
 #include <memory>
 #include <random>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -23,9 +24,11 @@
 #include "tests/core/system_test_context.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -198,6 +201,75 @@ u32 RandomArgument(std::mt19937& rng, u32 method, const Maxwell3D& engine) {
     return rng() % 64;
 }
 
+struct DrawRecord {
+    bool indexed;
+    u32 instances;
+    u32 count;
+    u32 first;
+    u32 base_instance;
+    u32 topology;
+    bool operator==(const DrawRecord&) const = default;
+};
+
+class NoDma final : public Tegra::Engines::AccelerateDMAInterface {
+public:
+    bool BufferCopy(GPUVAddr, GPUVAddr, u64) override { return true; }
+    bool BufferClear(GPUVAddr, u64, u32) override { return true; }
+    bool ImageToBuffer(const Tegra::DMA::ImageCopy&, const Tegra::DMA::ImageOperand&,
+                       const Tegra::DMA::BufferOperand&) override { return true; }
+    bool BufferToImage(const Tegra::DMA::ImageCopy&, const Tegra::DMA::BufferOperand&,
+                       const Tegra::DMA::ImageOperand&) override { return true; }
+};
+
+/// Records the draw state of each draw `engine` makes.
+class DrawRecorder final : public VideoCore::RasterizerInterface {
+public:
+    const Maxwell3D* engine{};
+    std::vector<DrawRecord> draws;
+
+    void Draw(bool indexed, u32 instances) override {
+        const auto& state = engine->draw_manager.draw_state;
+        draws.push_back({indexed, instances, state.draw_element_count, state.vertex_buffer.first,
+                         state.base_instance, static_cast<u32>(state.topology)});
+    }
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&& func) override { func(); }
+    void SyncOperation(std::function<void()>&& func) override { func(); }
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override { return false; }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
+        return {addr, addr + size, false};
+    }
+    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void OnCacheInvalidation(PAddr, u64) override {}
+    bool OnCPUWrite(PAddr, u64) override { return false; }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {}
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override { return dma; }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+
+private:
+    NoDma dma;
+};
+
 } // Anonymous namespace
 
 TEST_CASE("Maxwell3D fast method dispatch matches CallMethod on random method streams",
@@ -274,6 +346,68 @@ TEST_CASE("Maxwell3D fast method dispatch issues deferred instanced draws as Cal
     f.Call(MAXWELL3D_REG_INDEX(global_base_instance_index), 9, true);
     f.Compare();
     REQUIRE_FALSE(f.fast.draw_manager.HasDeferredDraw());
+}
+
+TEST_CASE("GpuSplit front keeps same-value topology writes that end a deferred instanced draw",
+          "[video_core][maxwell_fast_method][gpu_split_dispatch]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    constexpr u32 subsequent = 1u << 26;
+    constexpr u32 topology = MAXWELL3D_REG_INDEX(topology_override);
+    constexpr u32 vertex_first = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 vertex_count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    // A draw, a second instance left deferred, the topology written again with its value, then
+    // a new count or first before the next draw begins: the deferred instance keeps the old one.
+    const auto sequence = [=](u32 control, u32 changed, u32 value) {
+        return std::vector<std::pair<u32, u32>>{
+            {ShadowControl, control}, {topology, 5},      {DrawBegin, 0},
+            {vertex_first, 0},        {vertex_count, 3},  {DrawEnd, 0},
+            {DrawBegin, subsequent},  {DrawEnd, 0},       {topology, 5},
+            {changed, value},         {DrawBegin, 0},     {DrawEnd, 0},
+        };
+    };
+    const auto make_engine = [&f](DrawRecorder& recorder, bool fast) {
+        auto engine = std::make_unique<Maxwell3D>(f.memory);
+        engine->fast_maxwell3d = fast;
+        engine->BindRasterizer(&recorder);
+        VideoCommon::Dirty::SetupDirtyFlags(engine->dirty.tables);
+        recorder.engine = engine.get();
+        return engine;
+    };
+    for (const u32 control : {0u, 2u}) { // Track, passthrough
+        for (const auto [changed, value] :
+             {std::pair{vertex_count, 6u}, std::pair{vertex_first, 2u}}) {
+            for (const bool fast : {false, true}) {
+                CAPTURE(control, changed, fast);
+                const auto methods = sequence(control, changed, value);
+                DrawRecorder direct_draws;
+                auto direct = make_engine(direct_draws, fast);
+                for (const auto [method, argument] : methods) {
+                    direct->CallMethod(f.system, method, argument, true);
+                }
+                direct->draw_manager.DrawDeferred(*direct);
+                REQUIRE(direct_draws.draws.size() >= 2);
+                const auto& deferred = direct_draws.draws[direct_draws.draws.size() - 2];
+                REQUIRE(deferred.count == 3);
+                REQUIRE(deferred.first == 0);
+
+                DrawRecorder split_draws;
+                auto engine = make_engine(split_draws, fast);
+                VideoCommon::GpuSplit split;
+                Access::Initialize(split, f.system);
+                for (const auto [method, argument] : methods) {
+                    engine->FrontCallMethod(f.system, split, method, argument, true, {});
+                }
+                u64 position{};
+                while (position < Access::End(split)) {
+                    position = Access::Execute(split, position, Access::End(split));
+                }
+                engine->ConsumeSink(f.system);
+                engine->draw_manager.DrawDeferred(*engine);
+                REQUIRE(split_draws.draws == direct_draws.draws);
+            }
+        }
+    }
 }
 
 TEST_CASE("Maxwell3D constant buffer word runs match single CallMethod writes",
