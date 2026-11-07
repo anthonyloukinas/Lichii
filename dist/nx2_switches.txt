@@ -71,3 +71,10 @@ EDEN_NX2_FENCE_BATCH=1
 # lines; creates with CAPTURE_STATISTICS). =2 also captures the internal representations and
 # writes them to <dump dir>/<hash>.<name>.txt. Not for timing runs.
 #EDEN_NX2_PIPELINE_STATS=1
+
+# Diagnostic (compile anatomy): =1 logs a "Shader stats <hash> <stage>" line per emitted SPIR-V
+# module (compute and graphics; also translation cache hits): word and instruction counts, blocks,
+# loops and their nesting, selections, switches, phis, calls, workgroup size, shared and local
+# memory bytes, barriers, 64/16/8-bit ops, atomics, image and subgroup ops, buffer loads/stores.
+# Computed by walking the SPIR-V words.
+#EDEN_NX2_SHADER_STATS=1

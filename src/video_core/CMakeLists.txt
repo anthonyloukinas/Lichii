@@ -183,6 +183,8 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
+    renderer_vulkan/spirv_complexity.cpp
+    renderer_vulkan/spirv_complexity.h
     renderer_vulkan/renderer_vulkan.h
     renderer_vulkan/renderer_vulkan.cpp
     renderer_vulkan/vk_blit_screen.cpp
