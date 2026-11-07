@@ -106,6 +106,8 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     video_core/spirv_builtin_capabilities.cpp
     video_core/virtual_range_cache.cpp
+    video_core/page_filter.cpp
+    video_core/pipeline_clean.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp

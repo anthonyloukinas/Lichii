@@ -137,7 +137,7 @@ enum class Counter : u32 {
     MustFlushLocked,       ///< Looked up under the mutex
     MustFlushBitmapMisses, ///< EDEN_NX2_WAIT_VERIFY: bitmap said no, the ranges said yes
     // BindSmallUniformReusing's compare in guest memory.
-    UboInPlaceSame,    ///< Small uniform buffers unchanged, nothing copied
+    UboInPlaceSame,    ///< Small uniform buffers whose bytes compared equal
     UboInPlaceChanged, ///< Small uniform buffers changed, copied once
     // PipelineCache::CurrentGraphicsPipeline's clean lookup.
     PipelineCleanHits,        ///< Pipelines kept without Refresh

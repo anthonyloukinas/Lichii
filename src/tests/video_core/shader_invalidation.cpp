@@ -6,6 +6,7 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "core/device_memory.h"
@@ -38,6 +39,14 @@ struct ShaderCacheTestAccess {
     }
     static bool IsRejected(ShaderCache& cache, VAddr address) {
         return cache.IsRejected(address);
+    }
+    /// As the pipeline caches reject a native program: RememberRejection in a catch block.
+    static void RejectThrown(ShaderCache& cache, VAddr address) {
+        try {
+            throw std::runtime_error{"rejected"};
+        } catch (...) {
+            cache.RememberRejection(address);
+        }
     }
 };
 } // namespace VideoCommon
@@ -95,6 +104,53 @@ TEST_CASE("Shader empty batches preserve pending invalidations", "[shader_invali
     const std::array unrelated{std::pair<DAddr, size_t>{address + 0x100000, 4096}};
     cache->InvalidateRegions(unrelated);
     REQUIRE_FALSE(ShaderCacheTestAccess::Find(*cache, address));
+}
+
+TEST_CASE("Shader rejections are marked in the page filter", "[shader_invalidation]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr address = 0x340080;
+    REQUIRE_FALSE(cache->page_filter.Any(0x340000, 0x1000));
+    ShaderCacheTestAccess::RejectThrown(*cache, address);
+    REQUIRE(ShaderCacheTestAccess::IsRejected(*cache, address));
+    // InnerInvalidation skips the shader cache for writes on pages the filter has no bit for;
+    // a write over the rejection must still reach it, and it forgets the rejection.
+    REQUIRE(cache->page_filter.Any(address, 4));
+    REQUIRE(cache->page_filter.Any(0x340000, 0x1000));
+    REQUIRE_FALSE(cache->page_filter.Any(0x341000, 0x1000));
+    const std::array write{std::pair<DAddr, size_t>{address, 4}};
+    cache->InvalidateRegions(write);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, address));
+}
+
+TEST_CASE("Shader pending removals survive a batch the page filter skips",
+          "[shader_invalidation]") {
+    // RasterizerVulkan::InnerInvalidation: with no filter bit on a nonempty batch, the shader
+    // cache only gets SyncGuestHost when removals are pending; that must equal the batch call.
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto batched = ShaderCacheTestAccess::Create(device_memory);
+    auto skipped = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr address = 0x100000;
+    constexpr VAddr kept = 0x180000;
+    for (auto* cache : {batched.get(), skipped.get()}) {
+        ShaderCacheTestAccess::Register(*cache, address, 32768, 123);
+        ShaderCacheTestAccess::Register(*cache, kept, 0x100, 456);
+        cache->OnCacheInvalidation(address, 1);
+    }
+    const std::array unrelated{std::pair<DAddr, size_t>{address + 0x100000, 4096}};
+    REQUIRE_FALSE(skipped->page_filter.Any(unrelated[0].first, unrelated[0].second));
+    REQUIRE(skipped->HasPendingRemovals());
+    batched->InvalidateRegions(unrelated);
+    skipped->SyncGuestHost();
+    for (const VAddr shader : {address, kept}) {
+        CAPTURE(shader);
+        REQUIRE(bool(ShaderCacheTestAccess::Find(*skipped, shader)) ==
+                bool(ShaderCacheTestAccess::Find(*batched, shader)));
+    }
+    REQUIRE_FALSE(ShaderCacheTestAccess::Find(*skipped, address));
+    REQUIRE(ShaderCacheTestAccess::Find(*skipped, kept));
 }
 
 TEST_CASE("Debug server rejections drop matching native programs", "[shader_invalidation]") {
