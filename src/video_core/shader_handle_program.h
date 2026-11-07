@@ -21,7 +21,7 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryMa
                info.handle_programs[program],
                [&](u32 index, u32 offset) -> u32 {
                    const GPUVAddr base{cbuf_address(index)};
-                   return base != 0 ? gpu_memory.Read<u32>(base + offset) : 0U;
+                   return base != 0 ? gpu_memory.ReadHandleWord(base + offset) : 0U;
                },
                [&](u32 binding, u32 offset) -> u32 {
                    if (binding >= info.storage_buffers_descriptors.size()) {
@@ -37,8 +37,8 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryMa
                        base = gpu_memory.Read<u64>(base + descriptor.indirect_offset);
                    }
                    return base != 0
-                              ? gpu_memory.Read<u32>(Common::AlignDown(base, storage_alignment) +
-                                                     offset)
+                              ? gpu_memory.ReadHandleWord(
+                                    Common::AlignDown(base, storage_alignment) + offset)
                               : 0U;
                })
         .value_or(0U);

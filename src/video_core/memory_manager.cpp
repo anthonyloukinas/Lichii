@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -16,12 +18,14 @@
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
+#include "video_core/host_page_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
@@ -355,6 +359,72 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
     }
 
     return memory.GetPointer<u8>(*address);
+}
+
+bool MemoryManager::HandlePointerCacheEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_HANDLE_PTR_CACHE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+namespace {
+// Per thread, as DeviceMemoryManager's translations: a cache shared by threads could be emptied
+// by one between another's lookup and its use.
+thread_local VideoCommon::HostPageCache t_host_pages;
+} // Anonymous namespace
+
+const u8* MemoryManager::CachedPagePointer(GPUVAddr addr) const {
+    namespace Profile = VideoCommon::Nx2Profile;
+    // Both read before the lookup: a map that runs meanwhile leaves the pointer under the older
+    // serial, which the next read drops.
+    const u64 serial = map_serial.load(std::memory_order_acquire);
+    const u64 generation = memory.TranslationGeneration();
+    bool hit;
+    const u8* const host = t_host_pages.Get(
+        unique_identifier, serial, generation, addr,
+        [this](GPUVAddr page) { return GetPointer(page); }, hit);
+    Profile::Add(hit ? Profile::Counter::PtrCacheHits : Profile::Counter::PtrCacheMisses, 1);
+    if (hit && VideoCommon::Nx2Perf::Verify()) {
+        // EDEN_NX2_PERF_VERIFY: a hit must be what the page walk gives now.
+        if (const u8* const walked = GetPointer(addr); walked != host) {
+            Profile::Add(Profile::Counter::PtrCacheVerifyDiffs, 1);
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1) < 16) {
+                LOG_WARNING(HW_GPU, "Handle page pointer cache: stale pointer for {:#x}", addr);
+            }
+            return walked;
+        }
+    }
+    return host;
+}
+
+u32 MemoryManager::ReadHandleWord(GPUVAddr addr) const {
+    if (!HandlePointerCacheEnabled()) {
+        return Read<u32>(addr);
+    }
+    // Across a page, or touching the Switch 2 syncpoint shim: as Read does.
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if ((addr & VideoCommon::HostPageCache::PageMask) >
+            VideoCommon::HostPageCache::PageMask + 1 - sizeof(u32) ||
+        (shim && addr < shim + NumShimSyncpoints * sizeof(u32) && addr + sizeof(u32) > shim)) {
+        return Read<u32>(addr);
+    }
+    const u8* const host = CachedPagePointer(addr);
+    if (host == nullptr) [[unlikely]] {
+        return Read<u32>(addr); // Unmapped: Read logs it and returns 0
+    }
+    u32 value;
+    std::memcpy(&value, host, sizeof(u32));
+    return value;
+}
+
+const u8* MemoryManager::GetPointerForDescriptor(GPUVAddr addr) const {
+    if (!HandlePointerCacheEnabled()) {
+        return GetPointer(addr);
+    }
+    return CachedPagePointer(addr);
 }
 
 #if defined(_MSC_VER) && !defined(__clang__) // no need for gcc / clang but msvc's compiler is more conservative with inlining.

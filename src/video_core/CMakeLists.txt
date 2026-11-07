@@ -109,6 +109,7 @@ add_library(video_core STATIC
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h
+    host_page_cache.h
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h

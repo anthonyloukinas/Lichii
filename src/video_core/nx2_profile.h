@@ -143,6 +143,10 @@ enum class Counter : u32 {
     PipelineCleanHits,        ///< Pipelines kept without Refresh
     PipelineCleanMisses,      ///< Lookups that refreshed the key
     PipelineCleanVerifyDiffs, ///< EDEN_NX2_PERF_VERIFY: hits Refresh would have changed
+    // MemoryManager::CachedPagePointer (EDEN_NX2_HANDLE_PTR_CACHE).
+    PtrCacheHits,        ///< Handle/descriptor reads through a cached page pointer
+    PtrCacheMisses,      ///< Handle/descriptor reads that looked the page up
+    PtrCacheVerifyDiffs, ///< EDEN_NX2_PERF_VERIFY: hits whose pointer GetPointer disagreed with
     Count,
 };
 // What the zones and drain waits measure in: the time stamp counter without the fences the wall
@@ -396,6 +400,17 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(hits) * 1e9 / window,
                             static_cast<double>(misses) * 1e9 / window);
         if (const u64 diffs = data.counters[static_cast<size_t>(Counter::PipelineCleanVerifyDiffs)];
+            diffs != 0) {
+            line += fmt::format(" ({} verify diffs)", diffs);
+        }
+    }
+    if (const u64 hits = data.counters[static_cast<size_t>(Counter::PtrCacheHits)],
+        misses = data.counters[static_cast<size_t>(Counter::PtrCacheMisses)];
+        hits != 0 || misses != 0) {
+        line += fmt::format(" | handle page pointers {:.0f} cached, {:.0f} looked up",
+                            static_cast<double>(hits) * 1e9 / window,
+                            static_cast<double>(misses) * 1e9 / window);
+        if (const u64 diffs = data.counters[static_cast<size_t>(Counter::PtrCacheVerifyDiffs)];
             diffs != 0) {
             line += fmt::format(" ({} verify diffs)", diffs);
         }

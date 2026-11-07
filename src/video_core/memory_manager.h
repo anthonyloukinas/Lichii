@@ -79,6 +79,18 @@ public:
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
 
+    /// EDEN_NX2_HANDLE_PTR_CACHE=1 (default off): the texture handle words and the texture and
+    /// sampler descriptor entries every draw reads go through this thread's host pointers of the
+    /// 16 GPU pages (4 KiB) it read last (VideoCommon::HostPageCache), instead of a page table
+    /// walk each. They are dropped when map_serial or the device memory's translation generation
+    /// changes. The value is still read from guest memory every time.
+    [[nodiscard]] static bool HandlePointerCacheEnabled();
+    /// Read<u32> through the cached page pointers when HandlePointerCacheEnabled.
+    [[nodiscard]] u32 ReadHandleWord(GPUVAddr addr) const;
+    /// GetPointer through the cached page pointers when HandlePointerCacheEnabled (callers read
+    /// within the page of `addr` only).
+    [[nodiscard]] const u8* GetPointerForDescriptor(GPUVAddr addr) const;
+
     template <typename T>
     [[nodiscard]] inline T* GetPointer(GPUVAddr addr) noexcept {
         const auto address = GpuToCpuAddress(addr);
@@ -210,6 +222,8 @@ private:
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
     const MappingSnapshot& CurrentSnapshot() const;
+    /// Host pointer of `addr` through this thread's cached page pointers (HandlePointerCacheEnabled).
+    const u8* CachedPagePointer(GPUVAddr addr) const;
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);

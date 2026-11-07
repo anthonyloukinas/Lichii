@@ -494,12 +494,13 @@ u32 GraphicsPipeline::ReadRawHandle(size_t stage, const Descriptor& desc, u32 in
             const u32 second_offset{desc.secondary_cbuf_offset};
             const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                          second_offset};
-            const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-            const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr) << desc.secondary_shift_left};
+            const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
+            const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
+                              << desc.secondary_shift_left};
             return lhs_raw | rhs_raw;
         }
     }
-    return gpu_memory->Read<u32>(addr);
+    return gpu_memory->ReadHandleWord(addr);
 }
 
 template <typename Spec>
