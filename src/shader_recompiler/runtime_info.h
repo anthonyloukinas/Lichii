@@ -117,6 +117,11 @@ struct RuntimeInfo {
 
     /// Dual source blending
     bool dual_source_blend{};
+
+    /// Debug only (EDEN_NX2_MESH_POS_READBACK): mesh stages append their output positions at this
+    /// device address, tagged with the high half of the stage hash.
+    u64 mesh_positions_address{};
+    u32 mesh_positions_tag{};
 };
 
 } // namespace Shader

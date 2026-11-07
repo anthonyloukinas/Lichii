@@ -344,6 +344,13 @@ private:
     std::condition_variable queue_ready;
     std::deque<Job> queue;
     bool stop_writer{};
+
+    /// Debug only: EDEN_NX2_MESH_POS_READBACK records, armed for each captured frame.
+    vk::Buffer positions;
 };
+
+/// Debug only (EDEN_NX2_MESH_POS_READBACK=<hash prefix>[,...]): the device address mesh stages
+/// whose hash matches append their output positions to, 0 when off. Header: count, armed, cap.
+u64 MeshPositionsAddress(u64 shader_hash);
 
 } // namespace Vulkan

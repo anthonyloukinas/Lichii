@@ -229,7 +229,30 @@ std::string SamplerJson(const Sampler* sampler) {
         tsc);
 }
 
+constexpr size_t POSITIONS_BYTES = 256ULL << 20;
+constexpr u32 POSITIONS_HEADER = 64;
+constexpr u32 POSITION_RECORD = 32;
+std::atomic<u64> positions_address{};
+
 } // Anonymous namespace
+
+u64 MeshPositionsAddress(u64 shader_hash) {
+    const u64 address = positions_address.load(std::memory_order_acquire);
+    const char* const value = std::getenv("EDEN_NX2_MESH_POS_READBACK");
+    if (address == 0 || !value) {
+        return 0;
+    }
+    const std::string hash = fmt::format("{:016x}", shader_hash);
+    for (std::string_view list{value}; !list.empty();) {
+        const size_t comma = list.find(',');
+        const std::string_view prefix = list.substr(0, comma);
+        if (!prefix.empty() && hash.starts_with(prefix)) {
+            return address;
+        }
+        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+    }
+    return 0;
+}
 
 FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
                      Scheduler& scheduler_)
@@ -237,6 +260,23 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     const char* const dir = std::getenv("EDEN_NX2_FRAME_DUMP");
     if (!dir || *dir == '\0') {
         return;
+    }
+    if (const char* const readback = std::getenv("EDEN_NX2_MESH_POS_READBACK");
+        readback && *readback != '\0' && device.IsBufferDeviceAddressSupported()) {
+        positions = memory_allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = POSITIONS_BYTES,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::Download);
+        std::memset(positions.Mapped().data(), 0, POSITIONS_HEADER);
+        positions.Flush();
+        positions_address.store(device.GetLogical().GetBufferDeviceAddress(*positions),
+                                std::memory_order_release);
+        LOG_WARNING(Render_Vulkan, "Frame dump: mesh position readback for {}", readback);
     }
     const char* const sampled_value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
     directory = dir;
@@ -959,6 +999,22 @@ void FrameDump::EndFrame(bool last) {
                       static_cast<int>(result));
         }
     }
+    if (positions) {
+        // Records: tag, workgroup x, payload hash, vertex | count << 16, x, y, z, w.
+        scheduler.Finish();
+        positions.Invalidate();
+        u32* const header = reinterpret_cast<u32*>(positions.Mapped().data());
+        const u32 appended = header[0];
+        const u32 kept = std::min(appended, header[2]);
+        header[1] = 0;
+        positions.Flush();
+        const auto records = positions.Mapped().subspan(POSITIONS_HEADER,
+                                                        size_t{kept} * POSITION_RECORD);
+        Enqueue({.tags = fmt::format(R"("kind":"mesh_positions","records":{},"appended":{})",
+                                     kept, appended),
+                 .data = {records.begin(), records.end()},
+                 .raw = true});
+    }
     Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index, draws,
                                  dispatches),
              .summary = true,
@@ -1024,6 +1080,14 @@ bool FrameDump::BeginFrame(double elapsed) {
         scheduler.Record([pool = *probe_pool](vk::CommandBuffer cmdbuf) {
             cmdbuf.ResetQueryPool(pool, 0, MAX_PROBES);
         });
+    }
+    if (positions) {
+        scheduler.Finish();
+        u32* const header = reinterpret_cast<u32*>(positions.Mapped().data());
+        header[0] = 0;
+        header[1] = 1;
+        header[2] = static_cast<u32>((POSITIONS_BYTES - POSITIONS_HEADER) / POSITION_RECORD);
+        positions.Flush();
     }
     if (schedule.BurstCount() > 1) {
         LOG_INFO(Render_Vulkan, "Frame dump: burst {}/{}", schedule.BurstFrame() + 1,

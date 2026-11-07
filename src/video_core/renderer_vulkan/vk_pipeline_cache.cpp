@@ -57,6 +57,7 @@
 #include "video_core/shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/surface.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -1655,7 +1656,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         const auto stage_begin = Clock::now();
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        if (program.stage == Shader::Stage::Mesh) {
+            runtime_info.mesh_positions_address = MeshPositionsAddress(key.unique_hashes[index]);
+            if (runtime_info.mesh_positions_address != 0) {
+                runtime_info.mesh_positions_tag = static_cast<u32>(key.unique_hashes[index] >> 32);
+            }
+        }
         // Upstream's SPIR-V emission on a pipeline worker (DeferredStages) only without the
         // translation cache: the cache's modules are keyed on the bindings each stage leaves for
         // the next, which a deferred emission computes on the worker.

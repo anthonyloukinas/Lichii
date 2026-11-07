@@ -575,6 +575,8 @@ Digest DigestRuntimeInfo(const Shader::RuntimeInfo& info) {
     hasher.Add(info.alpha_test_reference);
     hasher.Add(info.y_negate);
     hasher.Add(info.glasm_use_storage_buffers);
+    hasher.Add(info.mesh_positions_address);
+    hasher.Add(info.mesh_positions_tag);
     hasher.Add(info.xfb_count);
     for (u32 i = 0; i < std::min<u32>(info.xfb_count, static_cast<u32>(info.xfb_varyings.size()));
          ++i) {

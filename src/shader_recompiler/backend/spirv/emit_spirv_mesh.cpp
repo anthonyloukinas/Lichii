@@ -117,6 +117,71 @@ void TaskEpilogue(EmitContext& ctx) {
     ctx.mesh_tasks_marker = {count, one, one, ctx.mesh_payload};
 }
 
+// Debug only (RuntimeInfo::mesh_positions_address): appends {tag, workgroup x, payload hash,
+// vertex | primitive count << 16, position} while the host has armed the buffer.
+void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
+    const u64 base{ctx.runtime_info.mesh_positions_address};
+    ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+    ctx.AddCapability(spv::Capability::Int64);
+    ctx.AddExtension("SPV_KHR_physical_storage_buffer");
+    ctx.SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+    const Id u64_type{ctx.TypeInt(64, false)};
+    const Id word_pointer{ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ctx.U32[1])};
+    const auto pointer = [&](Id address) { return ctx.OpConvertUToPtr(word_pointer, address); };
+    const auto header = [&](u64 offset) {
+        return pointer(ctx.Constant(u64_type, base + offset));
+    };
+    const Id armed{ctx.OpLoad(ctx.U32[1], header(4), spv::MemoryAccessMask::Aligned, u32{4})};
+    const Id cap{ctx.OpLoad(ctx.U32[1], header(8), spv::MemoryAccessMask::Aligned, u32{4})};
+    If(ctx, ctx.OpINotEqual(ctx.U1, armed, ctx.u32_zero_value), [&] {
+        const Id index{ctx.OpAtomicIAdd(ctx.U32[1], header(0),
+                                        ctx.Const(static_cast<u32>(spv::Scope::Device)),
+                                        ctx.u32_zero_value, ctx.Const(1U))};
+        If(ctx, ctx.OpULessThan(ctx.U1, index, cap), [&] {
+            Id workgroup{ctx.u32_zero_value};
+            Id hash{ctx.Const(2166136261U)};
+            if (Sirit::ValidId(ctx.workgroup_id)) {
+                const Id id{ctx.OpLoad(ctx.U32[3], ctx.workgroup_id)};
+                workgroup = ctx.OpCompositeExtract(ctx.U32[1], id, 0U);
+                hash = ctx.OpIMul(ctx.U32[1],
+                                  ctx.OpBitwiseXor(ctx.U32[1], hash,
+                                                   ctx.OpCompositeExtract(ctx.U32[1], id, 1U)),
+                                  ctx.Const(16777619U));
+            }
+            if (Sirit::ValidId(ctx.mesh_payload)) {
+                for (u32 word = 0; word < std::min(ctx.mesh_info.payload_words, 16U); ++word) {
+                    const Id value{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(word)))};
+                    hash = ctx.OpIMul(ctx.U32[1], ctx.OpBitwiseXor(ctx.U32[1], hash, value),
+                                      ctx.Const(16777619U));
+                }
+            }
+            const Id position_pointer{ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4])};
+            const Id position{ctx.OpLoad(
+                ctx.F32[4], ctx.OpAccessChain(position_pointer, ctx.output_position, vertex))};
+            const Id record{ctx.OpIAdd(
+                u64_type, ctx.Constant(u64_type, base + 64),
+                ctx.OpIMul(u64_type, ctx.OpUConvert(u64_type, index), ctx.Constant(u64_type, u64{32})))};
+            const std::array<Id, 8> words{
+                ctx.Const(ctx.runtime_info.mesh_positions_tag),
+                workgroup,
+                hash,
+                ctx.OpBitwiseOr(ctx.U32[1], vertex,
+                                ctx.OpShiftLeftLogical(ctx.U32[1], count, ctx.Const(16U))),
+                ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 0U)),
+                ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 1U)),
+                ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 2U)),
+                ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 3U)),
+            };
+            for (u32 element = 0; element < words.size(); ++element) {
+                const Id address{ctx.OpIAdd(u64_type, record,
+                                            ctx.Constant(u64_type, u64{element} * 4))};
+                ctx.OpStore(pointer(address), words[element], spv::MemoryAccessMask::Aligned,
+                            u32{4});
+            }
+        });
+    });
+}
+
 void MeshEpilogue(EmitContext& ctx) {
     const MeshInfo& mesh{ctx.mesh_info};
     Barrier(ctx);
@@ -132,12 +197,17 @@ void MeshEpilogue(EmitContext& ctx) {
     const bool convert_depth{ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc &&
                              Sirit::ValidId(ctx.output_position)};
     const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
+    const bool record_positions{ctx.runtime_info.mesh_positions_address != 0 &&
+                                Sirit::ValidId(ctx.output_position)};
     for (u32 first = 0; first < mesh.max_vertices; first += threads) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto copy = [&] {
             CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
             if (convert_depth) {
                 ConvertDepth(ctx, vertex);
+            }
+            if (record_positions) {
+                RecordPosition(ctx, vertex, count);
             }
         };
         if (first + threads > mesh.max_vertices) {
