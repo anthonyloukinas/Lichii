@@ -63,6 +63,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 #endif
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
+        if (Settings::values.pin_gpu_threads.GetValue()) {
+            Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+        }
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
