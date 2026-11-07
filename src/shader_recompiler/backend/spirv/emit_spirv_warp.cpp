@@ -193,14 +193,20 @@ Id EmitVoteEqual(EmitContext& ctx, Id pred) {
 }
 
 Id EmitSubgroupBallot(EmitContext& ctx, Id pred) {
+    const auto record = [&](Id result) {
+        if (ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_positions_address != 0) {
+            RecordMeshBallot(ctx, result);
+        }
+        return result;
+    };
     if (!StageSupportsSubgroups(ctx)) {
-        return ctx.OpSelect(ctx.U32[1], pred, ctx.Const(1u), ctx.u32_zero_value);
+        return record(ctx.OpSelect(ctx.U32[1], pred, ctx.Const(1u), ctx.u32_zero_value));
     }
     const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred)};
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U);
+        return record(ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U));
     }
-    return WarpExtract(ctx, ballot);
+    return record(WarpExtract(ctx, ballot));
 }
 
 Id EmitSubgroupEqMask(EmitContext& ctx) {

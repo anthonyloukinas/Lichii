@@ -69,6 +69,7 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
 void EmitMeshPrologue(EmitContext& ctx);
 void EmitMeshEpilogue(EmitContext& ctx);
 void RecordMeshShuffle(EmitContext& ctx, Id value, Id source, Id result);
+void RecordMeshBallot(EmitContext& ctx, Id result);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value);
 void EmitSetSampleMask(EmitContext& ctx, Id value);
 void EmitSetFragDepth(EmitContext& ctx, Id value);
