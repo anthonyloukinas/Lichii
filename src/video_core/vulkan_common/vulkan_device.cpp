@@ -751,7 +751,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
     // Debug only (EDEN_NX2_MESH_POS_READBACK): the feature stays on for the frame dump's buffer,
     // the rest of the renderer still sees no device addresses.
-    debug_device_address = !extensions.descriptor_buffer && extensions.buffer_device_address &&
+    debug_device_address = !extensions.descriptor_buffer &&
                            features.buffer_device_address.bufferDeviceAddress &&
                            std::getenv("EDEN_NX2_MESH_POS_READBACK") != nullptr;
     if (debug_device_address) {
