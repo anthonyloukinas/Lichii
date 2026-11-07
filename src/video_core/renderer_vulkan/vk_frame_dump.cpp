@@ -277,6 +277,8 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
         positions_address.store(device.GetLogical().GetBufferDeviceAddress(*positions),
                                 std::memory_order_release);
         LOG_WARNING(Render_Vulkan, "Frame dump: mesh position readback for {}", readback);
+    } else if (readback) {
+        LOG_ERROR(Render_Vulkan, "Frame dump: no device addresses, mesh position readback off");
     }
     const char* const sampled_value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
     directory = dir;
