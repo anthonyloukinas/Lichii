@@ -60,6 +60,10 @@ EDEN_NX2_FENCE_BATCH=1
 # hexadecimal hashes, or all). Shorter driver compiles, slower shaders.
 #EDEN_NX2_NOOPT_SHADERS=74ab167d83c54073,f12162b84e9cc190
 
+# Trial (upstream PR #408): =1 emits the global memory load, store and atomic helpers DontInline.
+# NVIDIA inlines every call otherwise, and the slowest compute pipelines take 2-5 s to build.
+#EDEN_NX2_GLOBAL_MEMORY_DONTINLINE=1
+
 # Storage buffer pointer rules: unset = upstream #150 only (default since test/oot-local-7 and
 # test/oot-local-11). =local adds our dynamic constant buffer and record pointer paths on top (the
 # oot-local-6 default; it lost Kokiri Forest's tree canopy there). =upstream is the same as unset.

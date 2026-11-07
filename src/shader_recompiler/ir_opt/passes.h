@@ -47,6 +47,9 @@ bool NativeIndirectPointers();
 /// Also for task and mesh programs (bound per draw); EDEN_NX2_INDIRECT_POINTERS=compute: compute
 /// programs only
 bool NativeIndirectGraphicsPointers();
+/// EDEN_NX2_GLOBAL_MEMORY_DONTINLINE=1 (read once; default off): the global memory helpers are
+/// emitted DontInline (upstream PR #408, d2fe6631fb)
+bool GlobalMemoryDontInline();
 
 // Dual Vertex
 void VertexATransformPass(IR::Program& program);

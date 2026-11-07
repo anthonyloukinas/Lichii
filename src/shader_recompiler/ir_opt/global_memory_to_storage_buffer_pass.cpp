@@ -2584,6 +2584,14 @@ bool NativeIndirectGraphicsPointers() {
     return enabled;
 }
 
+bool GlobalMemoryDontInline() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_GLOBAL_MEMORY_DONTINLINE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 void JoinStorageInfo(Info& base, Info& source) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
