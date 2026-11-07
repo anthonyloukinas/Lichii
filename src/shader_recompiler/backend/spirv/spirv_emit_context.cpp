@@ -2081,8 +2081,6 @@ void EmitContext::DefineMesh(const IR::Program& program) {
             if (!Sirit::ValidId(output_position)) {
                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
-                // Depth prepass and colour pass meshes must give bit-equal positions.
-                Decorate(output_position, spv::Decoration::Invariant);
             }
             return {output_position,
                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
