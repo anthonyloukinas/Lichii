@@ -35,7 +35,9 @@ namespace {
 //    were translated with every table slot taken as a pointer).
 // 6: stored SPIR-V changed: upstream nx2 #408 DontInline global memory helpers and unrolled
 //    software HMMA. Not the pipeline cache version (#408's 54 also covers its vertex keys).
-constexpr u32 FormatVersion = 6;
+// 8: native programs bind up to 64 storage buffers (upstream #421/#434 part); 8 rather than 7
+//    because test/oot-local-17 uses 7.
+constexpr u32 FormatVersion = 8;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
