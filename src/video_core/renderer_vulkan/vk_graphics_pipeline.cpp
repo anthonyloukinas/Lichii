@@ -517,13 +517,8 @@ u32 GraphicsPipeline::ReadRawHandle(size_t stage, const Descriptor& desc, u32 in
     const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
     if (desc.handle_program != ~0U) {
         // Read by the shader from a storage buffer: computed for this draw.
-        // The program's storage offsets are relative to the buffer address aligned down to the
-        // host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=1 reads the words there
-        // instead of at the unaligned address; a handle table's are always read there.
-        static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
-        const bool aligned{align_storage || VideoCommon::IsHandleTable(desc)};
         return EvaluateHandle(stage_infos[stage], desc.handle_program, *gpu_memory, cbufs,
-                              aligned ? device.GetStorageBufferAlignment() : 1, index);
+                              device.GetStorageBufferAlignment(), index);
     }
     ASSERT(cbufs[desc.cbuf_index].enabled);
     const u32 index_offset{index << desc.size_shift};

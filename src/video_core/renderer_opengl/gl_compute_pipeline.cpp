@@ -37,7 +37,8 @@ ComputePipeline::ComputePipeline(const Device& device, TextureCache& texture_cac
                                  const Shader::Info& info_, std::string code,
                                  std::vector<u32> code_v, bool force_context_flush)
     : texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
-      program_manager{program_manager_}, info{info_} {
+      program_manager{program_manager_}, info{info_},
+      storage_buffer_alignment{device.GetShaderStorageBufferAlignment()} {
     switch (::Settings::values.renderer_backend.GetValue()) {
     case Settings::RendererBackend::OpenGL_GLSL:
         source_program = CreateProgram(code, GL_COMPUTE_SHADER);
@@ -119,7 +120,7 @@ void ComputePipeline::Configure() {
                                                   ? cbufs[cbuf].Address()
                                                   : GPUVAddr{};
                                    },
-                                   1, index),
+                                   storage_buffer_alignment, index),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);

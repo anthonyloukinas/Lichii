@@ -187,17 +187,6 @@ template <typename Descriptor>
     });
 }
 
-/// Whether desc is a table of handle program results the shader indexes, also one the descriptor
-/// limits cut to a single element. Its storage words are read from the host-aligned buffer base.
-template <typename Descriptor>
-[[nodiscard]] bool IsHandleTable(const Descriptor& desc) {
-    if constexpr (requires { desc.is_descriptor_array; }) {
-        return desc.handle_program != ~0U && (desc.count > 1 || desc.is_descriptor_array);
-    } else {
-        return false;
-    }
-}
-
 /// A texture handle no table holds: the texture cache binds its null view and sampler.
 inline constexpr std::pair<u32, u32> NULL_TEXTURE_HANDLE{~0U, ~0U};
 

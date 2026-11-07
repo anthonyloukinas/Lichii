@@ -433,18 +433,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                    ? cbufs[cbuf].Address()
                    : GPUVAddr{};
     }};
-    static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
-    // A handle table's storage words are always read from the host-aligned buffer base.
-    const u64 table_alignment{device.GetStorageBufferAlignment()};
-    const u64 storage_alignment{align_storage ? table_alignment : 1};
+    const u64 storage_alignment{device.GetStorageBufferAlignment()};
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch.
             return TexturePair(VideoCommon::EvaluateTextureHandle(
                                    info, desc.handle_program, gpu_memory, cbuf_address,
-                                   VideoCommon::IsHandleTable(desc) ? table_alignment
-                                                                    : storage_alignment,
-                                   index),
+                                   storage_alignment, index),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
@@ -490,7 +485,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             u32 last_sampler_index{~0U};
             VideoCommon::SamplerId sampler{};
             VideoCommon::EvaluateTextureHandles(
-                info, desc.handle_program, gpu_memory, cbuf_address, table_alignment,
+                info, desc.handle_program, gpu_memory, cbuf_address, storage_alignment,
                 desc.count, [&](u32, u32 raw) {
                     const auto handle{TexturePair(raw, via_header_index)};
                     views.push_back({handle.first});
