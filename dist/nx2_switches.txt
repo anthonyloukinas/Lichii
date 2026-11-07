@@ -82,3 +82,10 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_FAST_DRAW_COMPUTED=1
 #EDEN_NX2_FAST_DRAW_HANDLE_DATA=1
 #EDEN_NX2_FAST_DRAW_VERTEX_INPUT=1
+
+# Diagnostic (compile anatomy): =1 logs, at every compute and graphics pipeline create, the
+# driver's creation feedback (duration, cache hit, base pipeline acceleration; per pipeline and per
+# stage) and every statistic VK_KHR_pipeline_executable_properties returns ("Pipeline stats <hash>"
+# lines; creates with CAPTURE_STATISTICS). =2 also captures the internal representations and
+# writes them to <dump dir>/<hash>.<name>.txt. Not for timing runs.
+#EDEN_NX2_PIPELINE_STATS=1

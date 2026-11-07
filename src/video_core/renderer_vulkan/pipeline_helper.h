@@ -243,10 +243,18 @@ public:
         });
     }
 
-    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
+    /// Bytes of the push constant range CreatePipelineLayout makes.
+    u32 PushConstantSize() const noexcept {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+        return uses_native_indirect ? Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET +
+                                          Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_SIZE
+                                    : static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                                          static_cast<u32>(sizeof(RenderAreaLayout));
+    }
+
+    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
@@ -255,11 +263,7 @@ public:
                                               VK_SHADER_STAGE_MESH_BIT_EXT
                                         : VK_SHADER_STAGE_ALL_GRAPHICS)),
             .offset = 0,
-            .size = uses_native_indirect
-                        ? Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_OFFSET +
-                              Shader::Backend::SPIRV::NATIVE_INDIRECT_BASES_SIZE
-                        : static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                              static_cast<u32>(sizeof(RenderAreaLayout)),
+            .size = PushConstantSize(),
         };
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
