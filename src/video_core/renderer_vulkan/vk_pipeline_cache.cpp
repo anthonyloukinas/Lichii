@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -489,6 +490,23 @@ void LogMeshRegisters(u64 hash, const Shader::IR::Program& program, const Shader
         std::scoped_lock lock{mutex};
         if (!logged.insert(hash).second) {
             return;
+        }
+    }
+    // EDEN_NX2_MESH_IR_WRITE=<hash prefixes>: also write the final IR into the frame dump directory.
+    if (const char* const prefixes = std::getenv("EDEN_NX2_MESH_IR_WRITE")) {
+        const std::string hex = fmt::format("{:016x}", hash);
+        std::string_view list{prefixes};
+        while (!list.empty()) {
+            const std::string_view prefix = list.substr(0, list.find(','));
+            list.remove_prefix(std::min(list.size(), prefix.size() + 1));
+            const char* const dir = std::getenv("EDEN_NX2_FRAME_DUMP");
+            if (prefix.empty() || !hex.starts_with(prefix) || dir == nullptr) {
+                continue;
+            }
+            std::error_code error;
+            std::filesystem::create_directories(dir, error);
+            std::ofstream{fmt::format("{}/ir-{}.txt", dir, hex)} << Shader::IR::DumpProgram(program);
+            break;
         }
     }
     const std::array<u32, 3> regs = env ? env->MeshRegisters() : std::array<u32, 3>{};
