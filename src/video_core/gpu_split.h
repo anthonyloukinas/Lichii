@@ -105,20 +105,20 @@ public:
         return enabled;
     }
 
-    /// EDEN_NX2_MACRO_SINK=1 (default off): the state writes the front's 3D macros make
+    /// EDEN_NX2_MACRO_SINK (default on, =0 off): the state writes the front's 3D macros make
     /// (registers outside execution_mask) go to the back's method sink like the command list's
     /// own state writes, instead of one CallMethod each; the back applies its sink, in order,
     /// before the engine's next executable method.
     [[nodiscard]] static bool MacroSink() {
         return macro_sink;
     }
-    /// EDEN_NX2_COMPUTE_SINK=1 (default off): native compute writes that only store their value
+    /// EDEN_NX2_COMPUTE_SINK (default on, =0 off): native compute writes that only store their value
     /// (native_plain_methods), from macros or the command list, are dropped when the front's
     /// register copy shows the back holds the value already, else sent batched (SinkMethod).
     [[nodiscard]] static bool ComputeSink() {
         return compute_sink;
     }
-    /// EDEN_NX2_RING_PAIRS=1 (default off): the state writes that would go to the back's method
+    /// EDEN_NX2_RING_PAIRS (default on, =0 off): the state writes that would go to the back's method
     /// sink (the command list's 3D state writes; the 3D macros' with EDEN_NX2_MACRO_SINK, the
     /// compute ones with EDEN_NX2_COMPUTE_SINK) go as (method, value) pairs in Pairs blocks
     /// (PairWrite), which the back applies in one loop per block (EngineInterface::ApplyPairs),
@@ -357,18 +357,10 @@ private:
     /// Method: into the method sink, tagged (SinkMethod). Call entries use bit 7 as FastDrawNeutral.
     static constexpr u64 Sink = 1 << 7;
 
-    static inline const bool macro_sink = [] {
-        const char* value = std::getenv("EDEN_NX2_MACRO_SINK");
-        return value != nullptr && value[0] != '0';
-    }();
-    static inline const bool compute_sink = [] {
-        const char* value = std::getenv("EDEN_NX2_COMPUTE_SINK");
-        return value != nullptr && value[0] != '0';
-    }();
-    static inline const bool ring_pairs = [] {
-        const char* value = std::getenv("EDEN_NX2_RING_PAIRS");
-        return value != nullptr && value[0] != '0';
-    }();
+    // On by default in this fork (upstream #166 keeps them opt-in); =0 turns each off for A/B.
+    static inline const bool macro_sink = Nx2EnvSwitch("EDEN_NX2_MACRO_SINK", true);
+    static inline const bool compute_sink = Nx2EnvSwitch("EDEN_NX2_COMPUTE_SINK", true);
+    static inline const bool ring_pairs = Nx2EnvSwitch("EDEN_NX2_RING_PAIRS", true);
     static constexpr u32 MaxPairs = 4096;
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
