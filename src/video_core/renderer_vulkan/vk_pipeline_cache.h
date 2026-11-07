@@ -33,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_clean_watch.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -152,12 +153,11 @@ private:
     void BuildCleanWatch();
     [[nodiscard]] bool CleanInputsUnchanged() const;
     void TakeCleanSnapshot();
+    /// EDEN_NX2_PERF_VERIFY: whether Refresh would keep the key a clean hit keeps.
+    [[nodiscard]] bool CleanHitVerified();
 
     struct CleanLookup {
-        struct Range {
-            u32 first;
-            u32 count;
-        };
+        using Range = CleanWatchRange;
         bool built{};
         std::vector<Range> ranges;     ///< Read by every Refresh
         std::vector<Range> xfb_ranges; ///< Read while transform feedback is enabled
