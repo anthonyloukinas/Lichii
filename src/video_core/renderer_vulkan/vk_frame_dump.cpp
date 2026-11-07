@@ -947,12 +947,12 @@ void FrameDump::EndFrame(bool last) {
         for (size_t index = 0; result == VK_SUCCESS && index < probes.size(); ++index) {
             const Probe& probe = probes[index];
             Enqueue({.tags = fmt::format(
-                         R"({{"kind":"draw","draw":{},"primitives_in":{},"primitives":{},"fragments":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}}})",
+                         R"({{"kind":"draw","draw":{},"primitives_in":{},"primitives":{},"fragments":{},"mesh":{},"indirect":{},"first":{},"elements":{},"instances":{},"alpha_test":{},"alpha_ref":{},"alpha_to_coverage":{},"host_alpha_to_coverage":{},"color0":{},"kill":{},"zero_handles":{}{}}})",
                          probe.draw, counts[index][0], counts[index][1], counts[index][2],
                          probe.mesh, probe.indirect, probe.first,
                          probe.elements, probe.instances, probe.alpha_test, probe.alpha_ref,
                          probe.alpha_to_coverage, probe.host_alpha_to_coverage, probe.color0,
-                         probe.kill, probe.zero_handles)});
+                         probe.kill, probe.zero_handles, probe.state)});
         }
         if (result != VK_SUCCESS) {
             LOG_ERROR(Render_Vulkan, "Frame dump: reading the draw probes failed ({})",
