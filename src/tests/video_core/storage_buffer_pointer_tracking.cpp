@@ -444,6 +444,28 @@ TEST_CASE("Programs that read more pointers than a stage binds are rejected",
     CHECK_THROWS_AS(fixture.TrackedOffsets(), Shader::NotImplementedException);
 }
 
+TEST_CASE("Dual vertex halves that bind more storage buffers than the stage are rejected",
+          "[shader][storage_buffer]") {
+    // Vertex B's buffers join Vertex A's; one they share counts once.
+    Shader::Info base;
+    base.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x110, .count = 1});
+    Shader::Info source;
+    source.storage_buffers_descriptors.push_back(
+        {.cbuf_index = 0, .cbuf_offset = 0x110, .count = 1});
+    source.storage_buffers_descriptors.push_back(
+        {.cbuf_index = 0, .cbuf_offset = 0x120, .count = 1});
+    SECTION("Within the limit") {
+        Shader::Optimization::JoinStorageInfo(base, source, 2);
+        CHECK(base.storage_buffers_descriptors.size() == 2);
+    }
+    SECTION("Past the limit") {
+        source.storage_buffers_descriptors.push_back(
+            {.cbuf_index = 0, .cbuf_offset = 0x130, .count = 1});
+        CHECK_THROWS_AS(Shader::Optimization::JoinStorageInfo(base, source, 2),
+                        Shader::NotImplementedException);
+    }
+}
+
 TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding indices",
           "[shader][storage_buffer]") {
     Shader::Info info{};
