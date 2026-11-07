@@ -1221,7 +1221,8 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
 }
 
 /// Whether NativePointerCandidates can find a pointer loaded from memory for this low address: it
-/// reaches a 64-bit global load along the same instructions, without asking the environment.
+/// reaches a 64-bit global load along the same instructions, without asking the environment. Keep
+/// its operand following in step with NativePointerCandidates.
 bool ReachesLoadedPointer(const IR::U32& low_addr) {
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
@@ -1265,7 +1266,7 @@ bool ReachesLoadedPointer(const IR::U32& low_addr) {
 /// can point into a different buffer, so the search does not stop at the first pointer. A pointer
 /// read from an array at a dynamic offset contributes every mapped slot of the array (or, with
 /// EDEN_NX2_DYN_CBUF_POINTERS=1, every pointer slot of its constant buffer that the offset can
-/// reach, in NativeCandidates::dynamic).
+/// reach, in NativeCandidates::dynamic). ReachesLoadedPointer follows the same operands.
 NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& env, bool& dynamic,
                                          StorageInfo& info) {
     NativeCandidates result;

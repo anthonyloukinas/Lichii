@@ -102,11 +102,10 @@ TEST_CASE("Kernel parameter pointers win over 16-byte aligned strides",
 }
 
 TEST_CASE("Paired native accesses without a loaded pointer ask only what older captures hold",
-          "[shader][storage_buffer][translation_cache]") {
-    // Before #410 a paired access asked only about its pair. The search #410 added for paired
-    // accesses also asked about c0[0x1c0], which a capture stored then has no answer for, so the
-    // pipeline failed to load from the disk cache on every boot. Without a loaded pointer the
-    // search keeps the pair anyway.
+          "[shader][storage_buffer][pipeline_cache]") {
+    // A paired access used to ask only about its pair. Searching for loaded pointers there also
+    // asks about c0[0x1c0], which an older capture has no answer for, so the pipeline failed to
+    // load from the disk cache. Without a loaded pointer the search keeps the pair anyway.
     KernelProgram fixture;
     fixture.env.native = true;
     fixture.env.captured_offsets = std::vector<u32>{0x178};
@@ -489,9 +488,9 @@ TEST_CASE("Native accesses through a cbuf pointer or a pointer loaded from it bi
 }
 
 TEST_CASE("A loaded pointer competing with the pair is still searched for",
-          "[shader][storage_buffer][translation_cache]") {
+          "[shader][storage_buffer][pipeline_cache]") {
     // The search runs when a 64-bit load is on the address's way. Here it asks only about
-    // c0[0x30], which a capture made before #410 holds, so the capture loads and binds both.
+    // c0[0x30], which an older capture holds, so the capture loads and binds both.
     DirectOrLoadedPointer program;
     program.fixture.env.captured_offsets = std::vector<u32>{0x30};
     const IR::U64 address{program.RecordAddress(false)};
