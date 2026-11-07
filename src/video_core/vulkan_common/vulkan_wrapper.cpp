@@ -241,6 +241,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetQueryPoolResults);
     X(vkGetPipelineExecutablePropertiesKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
+    X(vkGetPipelineExecutableInternalRepresentationsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
     X(vkQueueBindSparse);
@@ -965,6 +966,50 @@ std::vector<VkPipelineExecutableStatisticKHR> Device::GetPipelineExecutableStati
     Check(dld->vkGetPipelineExecutableStatisticsKHR(handle, &executable_info, &num,
                                                     statistics.data()));
     return statistics;
+}
+
+std::vector<PipelineExecutableInternalRepresentation>
+Device::GetPipelineExecutableInternalRepresentationsKHR(VkPipeline pipeline,
+                                                        u32 executable_index) const {
+    std::vector<PipelineExecutableInternalRepresentation> result;
+    if (!dld->vkGetPipelineExecutableInternalRepresentationsKHR) {
+        return result;
+    }
+    const VkPipelineExecutableInfoKHR executable_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
+        .pNext = nullptr,
+        .pipeline = pipeline,
+        .executableIndex = executable_index,
+    };
+    u32 num{};
+    Check(dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                                 nullptr));
+    std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(num);
+    for (auto& representation : representations) {
+        representation.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
+        representation.pData = nullptr;
+        representation.dataSize = 0;
+    }
+    // The first call with null data gives each representation's size.
+    Check(dld->vkGetPipelineExecutableInternalRepresentationsKHR(handle, &executable_info, &num,
+                                                                 representations.data()));
+    result.resize(num);
+    for (u32 i = 0; i < num; ++i) {
+        result[i].data.resize(representations[i].dataSize);
+        representations[i].pData = result[i].data.data();
+    }
+    const VkResult filled = dld->vkGetPipelineExecutableInternalRepresentationsKHR(
+        handle, &executable_info, &num, representations.data());
+    if (filled != VK_SUCCESS && filled != VK_INCOMPLETE) {
+        Check(filled);
+    }
+    for (u32 i = 0; i < num && i < result.size(); ++i) {
+        result[i].name = representations[i].name;
+        result[i].description = representations[i].description;
+        result[i].is_text = representations[i].isText == VK_TRUE;
+        result[i].data.resize(representations[i].dataSize);
+    }
+    return result;
 }
 
 void Device::UpdateDescriptorSets(Span<VkWriteDescriptorSet> writes,

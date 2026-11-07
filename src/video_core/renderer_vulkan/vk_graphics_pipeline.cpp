@@ -5,11 +5,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <set>
 #include <span>
+#include <string>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -20,6 +23,7 @@
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/pipeline_creation_stats.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
@@ -1443,9 +1447,17 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .requiredSubgroupSize = GuestWarpSize,
     };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+    std::array<std::string, PipelineCreationStats::Feedback::MaxStages> stage_labels;
     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
         if (!spv_modules[stage]) {
             continue;
+        }
+        if (shader_stages.size() < stage_labels.size()) {
+            // spv_modules[stage] holds program stage + 1 (unique_hashes[0] is VertexA).
+            static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval",
+                                                    "geometry", "fragment"};
+            stage_labels[shader_stages.size()] =
+                fmt::format("{} {:016x}", stage_names[stage], key.unique_hashes[stage + 1]);
         }
         [[maybe_unused]] auto& stage_ci =
             shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
@@ -1466,10 +1478,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (uses_descriptor_buffer) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
+    // EDEN_NX2_PIPELINE_STATS (diagnostic): creation feedback and executable statistics.
+    const bool log_stats = PipelineCreationStats::Level() > 0;
+    PipelineCreationStats::Feedback feedback;
+    const void* const pipeline_next =
+        log_stats && device.ApiVersion() >= VK_API_VERSION_1_3
+            ? feedback.Chain(nullptr, static_cast<u32>(shader_stages.size()))
+            : nullptr;
+    if (log_stats) {
+        flags |= PipelineCreationStats::CaptureFlags(device);
+    }
+    const auto create_start = std::chrono::steady_clock::now();
 
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
+        .pNext = pipeline_next,
         .flags = flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
@@ -1488,6 +1511,15 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    if (log_stats) {
+        const double create_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - create_start)
+                                     .count();
+        PipelineCreationStats::Report(
+            device, *pipeline, "graphics", key.Hash(),
+            pipeline_next != nullptr ? &feedback : nullptr,
+            std::span<const std::string>(stage_labels.data(), shader_stages.size()), create_ms);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

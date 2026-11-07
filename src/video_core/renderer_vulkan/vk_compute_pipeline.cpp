@@ -5,10 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -28,6 +30,7 @@
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/pipeline_creation_stats.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -238,6 +241,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
     pipeline_layout = builder.CreatePipelineLayout(*descriptor_set_layout);
+    const u32 push_constant_size = builder.PushConstantSize();
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
             builder.CreateTemplate(*descriptor_set_layout, *pipeline_layout, uses_push_descriptor);
@@ -247,7 +251,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics] {
+    auto func{[this, shader_notify, pipeline_statistics, push_constant_size] {
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -268,16 +272,25 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         if (BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
             flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         }
+        // EDEN_NX2_PIPELINE_STATS (diagnostic): creation feedback and executable statistics.
+        const bool log_stats = PipelineCreationStats::Level() > 0;
+        PipelineCreationStats::Feedback feedback;
+        const void* const compute_next =
+            log_stats && device.ApiVersion() >= VK_API_VERSION_1_3 ? feedback.Chain(nullptr, 1)
+                                                                   : nullptr;
+        if (log_stats) {
+            flags |= PipelineCreationStats::CaptureFlags(device);
+        }
+        const bool uses_subgroup_size_ci = device.IsExtSubgroupSizeControlSupported() &&
+                                           uses_warp_ops &&
+                                           device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         const VkComputePipelineCreateInfo compute_ci{
             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = nullptr,
+            .pNext = compute_next,
             .flags = flags,
             .stage{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
-                             ? &subgroup_size_ci
-                             : nullptr,
+                .pNext = uses_subgroup_size_ci ? &subgroup_size_ci : nullptr,
                 .flags = 0,
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                 .module = *spv_module,
@@ -291,15 +304,34 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         const auto create_start = std::chrono::steady_clock::now();
         try {
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            const double create_ms = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - create_start)
+                                         .count();
             // The driver's compile (or its cache lookup), to time freezes after live builds.
             LOG_INFO(Render_Vulkan, "Compute pipeline {:016x}: driver create {:.1f} ms on the {}{}",
-                     shader_hash,
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                               create_start)
-                         .count(),
-                     build_thread,
+                     shader_hash, create_ms, build_thread,
                      (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0 ? ", unoptimized"
                                                                                  : "");
+            if (log_stats) {
+                // What the standalone compile harness needs to rebuild the same create.
+                LOG_INFO(Render_Vulkan,
+                         "Pipeline stats {:016x} compute layout: flags={:#x} push_descriptor={} "
+                         "descriptor_buffer={} required_subgroup_size={} push_constants={} "
+                         "ubo={} ssbo={} texel_buffers={} image_buffers={} textures={} images={}",
+                         shader_hash, flags, uses_push_descriptor ? 1 : 0,
+                         uses_descriptor_buffer ? 1 : 0,
+                         uses_subgroup_size_ci ? GuestWarpSize : 0, push_constant_size,
+                         Shader::NumDescriptors(info.constant_buffer_descriptors),
+                         Shader::NumDescriptors(info.storage_buffers_descriptors),
+                         Shader::NumDescriptors(info.texture_buffer_descriptors),
+                         Shader::NumDescriptors(info.image_buffer_descriptors),
+                         Shader::NumDescriptors(info.texture_descriptors),
+                         Shader::NumDescriptors(info.image_descriptors));
+                static const std::array<std::string, 1> stage_labels{"compute"};
+                PipelineCreationStats::Report(device, *pipeline, "compute", shader_hash,
+                                              compute_next != nullptr ? &feedback : nullptr,
+                                              stage_labels, create_ms);
+            }
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
