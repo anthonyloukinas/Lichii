@@ -12,6 +12,10 @@
 #include <span>
 #include <vector>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 #include "common/scope_exit.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
@@ -520,7 +524,9 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
                 break;
             }
             for (int i = 0; i < 32; ++i) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+                _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
                 __builtin_ia32_pause();
 #elif defined(__aarch64__)
                 asm volatile("yield");

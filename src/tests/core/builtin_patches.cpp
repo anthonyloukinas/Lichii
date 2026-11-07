@@ -500,15 +500,15 @@ private:
     std::vector<std::pair<std::string, bool>> items;
 };
 
-enum class SpeedPatch { None, RealTime, DynamicFps };
+enum class SpeedPatch { None, Real, Dynamic };
 
 SpeedPatch AppliedSpeedPatch(const FileSys::PatchManager& manager) {
     const u32 word = WordAt(manager.PatchNSO(MakeDynamicMain(), "main"), DynamicCallOffset);
     if (word == 0x14D57D48) {
-        return SpeedPatch::RealTime;
+        return SpeedPatch::Real;
     }
     REQUIRE((word == DynamicCallInstruction || word == DynamicOriginalInstruction));
-    return word == DynamicCallInstruction ? SpeedPatch::DynamicFps : SpeedPatch::None;
+    return word == DynamicCallInstruction ? SpeedPatch::Dynamic : SpeedPatch::None;
 }
 
 bool SavedDisabled(std::string_view name) {
@@ -542,7 +542,7 @@ TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only re
         REQUIRE(dialog.Ticked(MaxResolution));
         dialog.Apply();
         REQUIRE(Settings::values.disabled_addons[OcarinaTitleId].empty());
-        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::RealTime);
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::Real);
     }
     // Ticking Dynamic FPS unticks Real-time speed.
     {
@@ -552,7 +552,7 @@ TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only re
         dialog.Apply();
         REQUIRE(SavedDisabled(RealTime));
         REQUIRE_FALSE(SavedDisabled(DynamicFps));
-        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::DynamicFps);
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::Dynamic);
     }
     // ...and ticking Real-time speed again unticks Dynamic FPS without saving it as disabled.
     {
@@ -563,7 +563,7 @@ TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only re
         REQUIRE_FALSE(dialog.Ticked(DynamicFps));
         dialog.Apply();
         REQUIRE(Settings::values.disabled_addons[OcarinaTitleId].empty());
-        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::RealTime);
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::Real);
     }
     // Both unticked: neither applies, and the list shows both unticked again.
     {
@@ -578,7 +578,7 @@ TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only re
         REQUIRE_FALSE(reloaded.Ticked(DynamicFps));
         reloaded.Tick(DynamicFps, true);
         reloaded.Apply();
-        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::DynamicFps);
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::Dynamic);
     }
     // An explicit Dynamic FPS disable saved earlier survives while Real-time speed is enabled.
     {
@@ -589,7 +589,7 @@ TEST_CASE("The Add-Ons list shows the speed patch that applies and saves only re
         dialog.Apply();
         REQUIRE(Settings::values.disabled_addons[OcarinaTitleId] ==
                 std::vector<std::string>{std::string{DynamicFps}});
-        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::RealTime);
+        REQUIRE(AppliedSpeedPatch(manager) == SpeedPatch::Real);
         AddonsDialog unticked{manager};
         unticked.Tick(RealTime, false);
         unticked.Apply();
