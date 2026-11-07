@@ -86,17 +86,15 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_FAST_DRAW_HANDLE_DATA=1
 #EDEN_NX2_FAST_DRAW_VERTEX_INPUT=1
 
-# Split GPU thread experiments from upstream #166, off by default (=1 turns each on). MACRO_SINK:
+# Split GPU thread batching from upstream #166, on by default (=0 turns each off). MACRO_SINK:
 # the front's 3D macro state writes go to the back's method sink instead of one call each.
 # COMPUTE_SINK: native compute writes that only store a value are batched the same way, and
 # dropped when the back holds the value already. RING_PAIRS: the writes that would go to the sink
-# travel as blocks of (method, value) pairs applied in one loop. EDEN_NX2_SPLIT_VERIFY=1 checks
-# them. HANDLE_PTR_CACHE: per-draw texture handle and descriptor reads keep the host pointers of
-# the last 16 pages they read (dropped at every map change); EDEN_NX2_PERF_VERIFY=1 checks it.
-#EDEN_NX2_MACRO_SINK=1
-#EDEN_NX2_COMPUTE_SINK=1
-#EDEN_NX2_RING_PAIRS=1
-#EDEN_NX2_HANDLE_PTR_CACHE=1
+# travel as blocks of (method, value) pairs applied in one loop. They pay together (the macro
+# writes are what RING_PAIRS packs); EDEN_NX2_SPLIT_VERIFY=1 checks them.
+#EDEN_NX2_MACRO_SINK=0
+#EDEN_NX2_COMPUTE_SINK=0
+#EDEN_NX2_RING_PAIRS=0
 
 # Diagnostic (compile anatomy): =1 logs, at every compute and graphics pipeline create, the
 # driver's creation feedback (duration, cache hit, base pipeline acceleration; per pipeline and per
