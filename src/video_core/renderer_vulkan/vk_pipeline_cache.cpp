@@ -1823,7 +1823,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
-    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    std::string shaders;
+    for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+        if (key.unique_hashes[index] != 0) {
+            shaders += fmt::format(" s{}:{:016x}", index, key.unique_hashes[index]);
+        }
+    }
+    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed pipeline={:016x}{}: {}", hash,
+              shaders, exception.what());
     return nullptr;
 }
 
