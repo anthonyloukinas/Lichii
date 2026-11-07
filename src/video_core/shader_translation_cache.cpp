@@ -137,7 +137,7 @@ constexpr size_t InfoFields = 88;
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
 constexpr size_t ProfileFields = 76;
 
-constexpr size_t HostFields = 22;
+constexpr size_t HostFields = 23;
 constexpr size_t RuntimeInfoFields = 19;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
@@ -514,6 +514,7 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(host_info.min_ssbo_alignment);
     hasher.Add(host_info.max_per_stage_descriptor_sampled_images);
     hasher.Add(host_info.max_per_stage_resources);
+    hasher.Add(host_info.max_per_stage_descriptor_storage_buffers);
     hasher.Add(host_info.max_descriptor_set_samplers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers_dynamic);
