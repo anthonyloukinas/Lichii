@@ -64,3 +64,21 @@ EDEN_NX2_FENCE_BATCH=1
 # test/oot-local-11). =local adds our dynamic constant buffer and record pointer paths on top (the
 # oot-local-6 default; it lost Kokiri Forest's tree canopy there). =upstream is the same as unset.
 #EDEN_NX2_POINTER_RULES=local
+
+# Fast draws (EDEN_NX2_FAST_DRAW=2), handle checks of the existing paths, on by default: a delta
+# draw after writes with no known range, and a reused draw of a pipeline whose texture handles come
+# from storage buffers, read the handles again and are resolved in full if one changed. =0 skips.
+#EDEN_NX2_FAST_DRAW_CHECK_INVALIDATED=0
+#EDEN_NX2_FAST_DRAW_CHECK_REUSED=0
+
+# Feedback loop barriers: the cached answer also needs the same sampled views (default). =0 keys it
+# by the render target and texture table serials only, as before.
+#EDEN_NX2_FEEDBACK_VIEWS=0
+
+# Fast draws (EDEN_NX2_FAST_DRAW=2), more delta draws, off by default (=1 turns each on):
+# pipelines with texture handles computed from storage buffers (handles read again each draw);
+# handle constant buffer writes (handles read again, changed ones resolved again); vertex stream
+# stride/enable and attribute format changes on dynamic vertex input pipelines.
+#EDEN_NX2_FAST_DRAW_COMPUTED=1
+#EDEN_NX2_FAST_DRAW_HANDLE_DATA=1
+#EDEN_NX2_FAST_DRAW_VERTEX_INPUT=1

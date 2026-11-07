@@ -41,6 +41,10 @@ struct DynamicFeatures {
     bool has_provoking_vertex_tf_preserve;
 };
 
+/// The vertex attribute part of the pipeline key with VK_EXT_vertex_input_dynamic_state: two
+/// bits of type class per attribute, 0 for constant attributes.
+[[nodiscard]] u64 VertexAttributeTypes(const Maxwell& regs);
+
 struct FixedPipelineState {
     static u32 PackComparisonOp(Maxwell::ComparisonOp op) noexcept;
     static Maxwell::ComparisonOp UnpackComparisonOp(u32 packed) noexcept;

@@ -14,6 +14,7 @@
 #include <vector>
 #include <optional>
 #include <bit>
+#include <cstring>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -528,6 +529,44 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 }
 
 template <class P>
+bool TextureCache<P>::FeedbackLoopRequiresBarrier(std::span<const ImageViewInOut> views) {
+    if (rt_active_mask == 0) {
+        return false;
+    }
+    const u32 depth_bit = 1u << NUM_RT;
+    const bool depth_active = (rt_active_mask & depth_bit) != 0;
+    for (const auto& view : views) {
+        if (!view.id) {
+            continue;
+        }
+
+        {
+            bool is_continue = false;
+            for (size_t i = 0; i < 8; ++i)
+                is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
+            if (is_continue)
+                continue;
+        }
+
+        if (depth_active && view.id == render_targets.depth_buffer_id)
+            continue;
+
+        const ImageId view_image_id = slot_image_views[view.id].image_id;
+        {
+            bool is_continue = false;
+            for (size_t i = 0; i < 8; ++i)
+                is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
+            if (is_continue)
+                continue;
+        }
+        if (depth_active && view_image_id == rt_depth_image_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;
@@ -546,62 +585,41 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
         }
     };
 
-    if (render_targets_serial == last_feedback_loop_serial &&
-        texture_bindings_serial == last_feedback_texture_serial) {
-        if (last_feedback_loop_result) {
+    // The texture binding serial changes only with the descriptor tables, not with the handles
+    // or the pipeline, so the cached answer also needs the same views, and the same view lifetime
+    // epoch (view ids are recycled slots). EDEN_NX2_FEEDBACK_VIEWS=0: serials only, as before.
+    static const bool key_views = Nx2FastDraw::SwitchNotOff("EDEN_NX2_FEEDBACK_VIEWS");
+    boost::container::small_vector<ImageViewId, 32> view_ids;
+    for (const auto& view : views) {
+        view_ids.push_back(view.id);
+    }
+    const bool serials_hit = feedback_cache.Hit(render_targets_serial, texture_bindings_serial,
+                                                view_lifetime_epoch, view_ids, false);
+    const bool views_hit = serials_hit && feedback_cache.Hit(render_targets_serial,
+                                                             texture_bindings_serial,
+                                                             view_lifetime_epoch, view_ids, true);
+    if (Nx2FastDraw::g_verify && serials_hit) [[unlikely]] {
+        // EDEN_NX2_FAST_DRAW_VERIFY: each cached answer against one worked out again. These count
+        // answers of the predicate, before the depth dirty gate, not barriers recorded.
+        const bool fresh = FeedbackLoopRequiresBarrier(views);
+        ++feedback_stats.checked;
+        if (fresh != feedback_cache.Answer()) {
+            ++(fresh ? feedback_stats.serial_false_negative : feedback_stats.serial_false_positive);
+            feedback_stats.views_wrong += views_hit ? 1 : 0;
+        }
+    }
+    if (key_views ? views_hit : serials_hit) {
+        if (feedback_cache.Answer()) {
             barrier();
         }
         return;
     }
-    if (render_targets_serial != last_feedback_loop_serial) {
+    if (render_targets_serial != feedback_cache.RenderTargetsSerial()) {
         feedback_depth_dirty = true;
     }
-
-    if (rt_active_mask == 0) {
-        last_feedback_loop_serial = render_targets_serial;
-        last_feedback_texture_serial = texture_bindings_serial;
-        last_feedback_loop_result = false;
-        return;
-    }
-    const u32 depth_bit = 1u << NUM_RT;
-    const bool depth_active = (rt_active_mask & depth_bit) != 0;
-
-    const bool requires_barrier = [&] {
-        for (const auto& view : views) {
-            if (!view.id) {
-                continue;
-            }
-
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
-                if (is_continue)
-                    continue;
-            }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
-                continue;
-
-            const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
-                if (is_continue)
-                    continue;
-            }
-            if (depth_active && view_image_id == rt_depth_image_id) {
-                return true;
-            }
-        }
-
-        return false;
-    }();
-
-    last_feedback_loop_serial = render_targets_serial;
-    last_feedback_texture_serial = texture_bindings_serial;
-    last_feedback_loop_result = requires_barrier;
+    const bool requires_barrier = FeedbackLoopRequiresBarrier(views);
+    feedback_cache.Store(render_targets_serial, texture_bindings_serial, view_lifetime_epoch,
+                         view_ids, requires_barrier);
     if (requires_barrier) {
         barrier();
     }
@@ -869,6 +887,31 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
     last_framebuffer_id = framebuffer_id;
     last_framebuffer_serial = render_targets_serial;
     return &slot_framebuffers[framebuffer_id];
+}
+
+template <class P>
+typename TextureCache<P>::ViewProbe TextureCache<P>::ProbeGraphicsView(u32 index,
+                                                                       ImageViewId id) const {
+    ViewProbe probe;
+    const auto& table = channel_state->graphics_image_table;
+    index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
+                                               gpu_memory->UsesNativeTiling());
+    const auto peeked = table.Peek(*gpu_memory, index);
+    static_assert(sizeof(peeked.guest) == sizeof(probe.guest_tic));
+    std::memcpy(probe.guest_tic.data(), &peeked.guest, sizeof(probe.guest_tic));
+    std::memcpy(probe.cached_tic.data(), &peeked.cached, sizeof(probe.cached_tic));
+    probe.tic_cached = peeked.cached_valid;
+    probe.bound_id = index < table.bound_ids.size() ? table.bound_ids[index].index : ~0U;
+    probe.live = slot_image_views.contains(id);
+    if (probe.live) {
+        const ImageViewBase& view = slot_image_views[id];
+        probe.image = view.image_id.index;
+        probe.format = static_cast<u32>(view.format);
+        probe.flags = static_cast<u32>(view.flags);
+        probe.base_level = static_cast<u32>(view.range.base.level);
+        probe.base_layer = static_cast<u32>(view.range.base.layer);
+    }
+    return probe;
 }
 
 template <class P>
@@ -2274,6 +2317,8 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     }
     RemoveImageViewReferences(image_view_ids);
     RemoveFramebuffers(image_view_ids);
+    // The slots become reusable: answers cached for these ids no longer hold.
+    ++view_lifetime_epoch;
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
@@ -3608,6 +3653,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         ASSERT_MSG(num_removed_overlaps == 1, "Invalid number of removed overlapps: {}",
                    num_removed_overlaps);
     }
+    // The slots become reusable: answers cached for these ids no longer hold.
+    ++view_lifetime_epoch;
     for (const ImageViewId image_view_id : image_view_ids) {
         if (!immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));

@@ -40,6 +40,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
+#include "video_core/texture_cache/feedback_loop_cache.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
@@ -240,6 +241,40 @@ public:
 
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+
+    /// EDEN_NX2_FAST_DRAW_VERIFY: cached feedback loop predicate answers checked, wrong with the
+    /// serials-only key (false negative: the fresh answer needs the feedback operation, false
+    /// positive: it does not), and wrong with the views and view lifetime compared as well. These
+    /// are answers before the depth dirty gate, not barriers recorded. With the view key on, the
+    /// serials-only count uses the cache as the view key refreshes it, not the old cache's history.
+    struct FeedbackStats {
+        u64 checked{};
+        u64 serial_false_negative{};
+        u64 serial_false_positive{};
+        u64 views_wrong{};
+    };
+    /// EDEN_NX2_FAST_DRAW_VERIFY diagnostics: a graphics texture slot as the cache sees it now,
+    /// the TIC bytes in guest memory and cached, and the identity behind a view id.
+    struct ViewProbe {
+        std::array<u64, 4> guest_tic{};
+        std::array<u64, 4> cached_tic{};
+        bool tic_cached{};
+        u32 bound_id{}; ///< the view the table holds for the slot
+        bool live{};    ///< the view id names a live slot
+        u32 image{};
+        u32 format{};
+        u32 flags{};
+        u32 base_level{};
+        u32 base_layer{};
+    };
+    [[nodiscard]] ViewProbe ProbeGraphicsView(u32 index, ImageViewId id) const;
+    /// The view lifetime epoch (diagnostics).
+    [[nodiscard]] u64 ViewLifetimeEpoch() const noexcept {
+        return view_lifetime_epoch;
+    }
+    FeedbackStats TakeFeedbackStats() {
+        return std::exchange(feedback_stats, FeedbackStats{});
+    }
 
     [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
 
@@ -551,9 +586,11 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
-    u64 last_feedback_loop_serial = 0;
-    u64 last_feedback_texture_serial = 0;
-    bool last_feedback_loop_result = false;
+    FeedbackLoopCache feedback_cache;
+    /// Advanced whenever image views are retired (their slot ids can be reused).
+    u64 view_lifetime_epoch = 0;
+    FeedbackStats feedback_stats;
+    bool FeedbackLoopRequiresBarrier(std::span<const ImageViewInOut> views);
     bool feedback_depth_dirty = true;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;

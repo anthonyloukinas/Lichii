@@ -73,6 +73,27 @@ public:
         return result;
     }
 
+    /// Diagnostics: the guest entry at index now and the copy cached by the last Read, without
+    /// the read bookkeeping. cached is false when there is no cached copy.
+    struct Peeked {
+        T guest{};
+        T cached{};
+        bool cached_valid{};
+    };
+    template <class MemoryManager>
+    [[nodiscard]] Peeked Peek(const MemoryManager& gpu_memory, u32 index) const noexcept {
+        Peeked result;
+        if (index > current_limit || index >= descriptors.size()) {
+            return result;
+        }
+        gpu_memory.ReadBlockUnsafe(current_gpu_addr + index * sizeof(T),
+                                   std::addressof(result.guest), sizeof(T));
+        result.cached_valid =
+            !invalidated && (read_descriptors[index / 64] & (1ULL << (index % 64))) != 0;
+        result.cached = descriptors[index];
+        return result;
+    }
+
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;

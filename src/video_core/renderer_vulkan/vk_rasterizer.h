@@ -324,6 +324,7 @@ private:
         u64 render_pass{};
         Maxwell::PrimitiveTopology topology{};
         bool is_indexed{};
+        u64 attribute_types{}; ///< EDEN_NX2_FAST_DRAW_VERTEX_INPUT: VertexAttributeTypes then
     };
     enum class FullDraw : u8 {
         NoCandidate,
@@ -336,6 +337,8 @@ private:
         HandleBind,
         HandleData,
         DeltaBuffers,
+        HandlesChanged,
+        VertexInput,
         Count,
     };
     /// Why a fully resolved draw can't be reused by the next one.
@@ -354,6 +357,8 @@ private:
         Count,
     };
     enum class DrawPath : u8 { Full, Reused, Delta, Count };
+    enum class HandleCheck : u8 { ReusedComputed, Invalidated, Count };
+    enum class HandleVerify : u8 { ReusedDirect, ReusedComputed, DeltaInvalidated, DeltaOther, Count };
     struct FastDrawStats {
         u64 reused{};
         u64 delta{};
@@ -367,6 +372,23 @@ private:
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
+        /// Handle rechecks: delta draws by result; with verify, draws checked and mismatches.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::RecheckResult::Count)> rechecks{};
+        u64 vertex_input_deltas{};
+        u64 vertex_input_verified{};
+        u64 vertex_input_pipeline_mismatches{};
+        u64 handle_data_rechecks{}; ///< delta draws rechecking for handle data (not computed)
+        u64 recheck_verified{};
+        u64 recheck_predicted_full{};
+        u64 recheck_mismatches{};
+        /// Handle checks of the existing paths (EDEN_NX2_FAST_DRAW_CHECK_REUSED, _INVALIDATED):
+        /// draws checked and draws whose handles changed, by HandleCheck.
+        std::array<u64, static_cast<size_t>(HandleCheck::Count)> handle_checks{};
+        std::array<u64, static_cast<size_t>(HandleCheck::Count)> handle_checks_changed{};
+        /// With verify: draws whose candidate path keeps the views without reading the handles
+        /// again, by HandleVerify, and those whose handles changed since (stale views).
+        std::array<u64, static_cast<size_t>(HandleVerify::Count)> handle_verified{};
+        std::array<u64, static_cast<size_t>(HandleVerify::Count)> handle_stale{};
         /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
         /// StateChanged draws by the reason of the last break, and by its 3D method.
@@ -380,6 +402,9 @@ private:
         GraphicsPipeline* pipeline{}; ///< null: resolve the draw in full
         bool delta{};                 ///< light changes since: ConfigureDelta
         bool vertex_buffers{};        ///< a delta draw binds the vertex buffers again
+        bool recheck_handles{};       ///< a delta draw reads the handles again
+        bool vertex_input{};          ///< vertex input changed (vertex buffers bound again)
+        bool invalidated{};           ///< unknown writes since (diagnostics)
     };
     /// The pipeline the draw can reuse with what the previous draw bound, if any.
     ReusableTake TakeReusableDraw(bool is_indexed, bool is_indirect);

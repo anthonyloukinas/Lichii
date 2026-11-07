@@ -67,6 +67,44 @@ inline const bool g_verify = [] {
     return value != nullptr && value[0] == '1';
 }();
 
+inline bool SwitchOn(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && value[0] == '1';
+}
+
+/// On unless the variable is 0.
+inline bool SwitchNotOff(const char* name) {
+    const char* const value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
+/// Unknown writes (the pre-draw invalidation, hot pages) leave no ranges, so they may have
+/// changed a handle in a constant buffer: a delta draw after them reads its pipeline's handles
+/// again and is resolved in full if one changed. =0 keeps the views without looking.
+inline const bool g_check_invalidated_handles =
+    SwitchNotOff("EDEN_NX2_FAST_DRAW_CHECK_INVALIDATED");
+
+/// Handles computed from storage buffers can change without any 3D state change (a draw or a
+/// copy writing the storage): a reused draw of such a pipeline reads its handles again and is
+/// resolved in full if one changed. =0 reuses without looking.
+inline const bool g_check_reused_handles = SwitchNotOff("EDEN_NX2_FAST_DRAW_CHECK_REUSED");
+
+/// With EDEN_NX2_FAST_DRAW=2. A delta draw that rechecks handles reads every texture and image
+/// handle of the pipeline again and keeps the views and samplers of the unchanged ones; changed
+/// texture and image handles are resolved again, a changed texture buffer handle makes the draw
+/// full. EDEN_NX2_FAST_DRAW_COMPUTED=1: pipelines with handles computed from storage buffers take
+/// delta draws, which always recheck.
+inline const bool g_computed_delta = SwitchOn("EDEN_NX2_FAST_DRAW_COMPUTED");
+
+/// EDEN_NX2_FAST_DRAW_HANDLE_DATA=1: constant buffer data written over, or a bind of, a constant
+/// buffer the pipeline reads handles from makes the delta draw recheck instead of a full draw.
+inline const bool g_handle_data_delta = SwitchOn("EDEN_NX2_FAST_DRAW_HANDLE_DATA");
+
+/// Whether any delta draw can recheck handles (full draws then keep the raw handles).
+inline bool RechecksHandles() {
+    return g_computed_delta || g_handle_data_delta;
+}
+
 /// EDEN_NX2_BUFFER_SKIP=1: the buffer cache keeps vertex buffer lookups while their registers and
 /// the page table stay the same, skips the upload scan of vertex buffers no CPU write reached, and
 /// touches each buffer's LRU entry once a frame.
@@ -166,9 +204,11 @@ struct Delta {
     bool index_buffer{};
     bool vertex_buffers{};
     bool invalidated{};
+    bool vertex_input{}; ///< EDEN_NX2_FAST_DRAW_VERTEX_INPUT
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && !index_buffer && !vertex_buffers && !invalidated &&
+               !vertex_input &&
                (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
     }
 };
@@ -187,6 +227,21 @@ inline void NoteIndexBuffer(u32 method) {
 inline void NoteVertexBuffer(u32 method) {
     if (g_delta_enabled) {
         g_delta.vertex_buffers = true;
+    } else {
+        Break(Reason::Register, method);
+    }
+}
+
+/// EDEN_NX2_FAST_DRAW_VERTEX_INPUT=1 (with =2): a vertex stream's stride or enable, or a vertex
+/// attribute format, is a light change. The delta draw keeps the pipeline only while it uses
+/// dynamic vertex input and extended dynamic state, the attributes' type classes (the vertex
+/// part of its key) are the ones the last draw resolved with and no binding needs the 69-byte
+/// repack; it binds the vertex buffers again.
+inline const bool g_vertex_input_delta = SwitchOn("EDEN_NX2_FAST_DRAW_VERTEX_INPUT");
+
+inline void NoteVertexInput(u32 method) {
+    if (g_delta_enabled && g_vertex_input_delta) {
+        g_delta.vertex_input = true;
     } else {
         Break(Reason::Register, method);
     }
