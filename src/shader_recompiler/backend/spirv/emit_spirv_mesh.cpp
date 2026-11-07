@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <span>
+#include <vector>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -117,8 +118,27 @@ void TaskEpilogue(EmitContext& ctx) {
     ctx.mesh_tasks_marker = {count, one, one, ctx.mesh_payload};
 }
 
+constexpr u32 DEBUG_SHUFFLES = 7;
+
+void DefineDebugShuffles(EmitContext& ctx) {
+    if (!ctx.mesh_debug_shuffles.empty()) {
+        return;
+    }
+    const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
+    for (u32 i = 0; i < DEBUG_SHUFFLES * 3; ++i) {
+        const Id variable{ctx.AddGlobalVariable(pointer_type, spv::StorageClass::Private,
+                                                ctx.Const(0xdeadbeefU))};
+        if (ctx.profile.supported_spirv >= 0x00010400) {
+            ctx.interfaces.push_back(variable);
+        }
+        ctx.mesh_debug_shuffles.push_back(variable);
+    }
+}
+
 // Debug only (RuntimeInfo::mesh_positions_address): appends {tag, workgroup x, payload hash,
-// vertex | primitive count << 16, position} while the host has armed the buffer.
+// vertex | primitive count << 16, position, subgroup lane, local invocation x, flags, then value,
+// source and result of the first DEBUG_SHUFFLES ShuffleIndex ops} while the host has armed the
+// buffer.
 void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
     const u64 base{ctx.runtime_info.mesh_positions_address};
     ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
@@ -160,8 +180,22 @@ void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
                 ctx.F32[4], ctx.OpAccessChain(position_pointer, ctx.output_position, vertex))};
             const Id record{ctx.OpIAdd(
                 u64_type, ctx.Constant(u64_type, base + 64),
-                ctx.OpIMul(u64_type, ctx.OpUConvert(u64_type, index), ctx.Constant(u64_type, u64{32})))};
-            const std::array<Id, 8> words{
+                ctx.OpIMul(u64_type, ctx.OpUConvert(u64_type, index), ctx.Constant(u64_type, u64{128})))};
+            const bool subgroups{ctx.profile.SupportsSubgroupStage(ctx.stage)};
+            if (subgroups && !Sirit::ValidId(ctx.subgroup_local_invocation_id)) {
+                ctx.AddCapability(spv::Capability::GroupNonUniform);
+                ctx.subgroup_local_invocation_id = ctx.AddGlobalVariable(
+                    ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]), spv::StorageClass::Input);
+                ctx.Decorate(ctx.subgroup_local_invocation_id, spv::Decoration::BuiltIn,
+                             spv::BuiltIn::SubgroupLocalInvocationId);
+                ctx.interfaces.push_back(ctx.subgroup_local_invocation_id);
+            }
+            DefineDebugShuffles(ctx);
+            const u32 flags{(subgroups ? 1U : 0U) |
+                            (ctx.profile.warp_size_potentially_larger_than_guest ? 2U : 0U) |
+                            (ctx.mesh_threads << 8) |
+                            (std::min(ctx.mesh_debug_shuffle_count, 0xffU) << 24)};
+            std::vector<Id> words{
                 ctx.Const(ctx.runtime_info.mesh_positions_tag),
                 workgroup,
                 hash,
@@ -171,7 +205,14 @@ void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
                 ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 1U)),
                 ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 2U)),
                 ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], position, 3U)),
+                subgroups ? ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id)
+                          : ctx.Const(0xffffffffU),
+                LocalInvocation(ctx),
+                ctx.Const(flags),
             };
+            for (const Id variable : ctx.mesh_debug_shuffles) {
+                words.push_back(ctx.OpLoad(ctx.U32[1], variable));
+            }
             for (u32 element = 0; element < words.size(); ++element) {
                 const Id address{ctx.OpIAdd(u64_type, record,
                                             ctx.Constant(u64_type, u64{element} * 4))};
@@ -290,6 +331,18 @@ void EmitMeshPrologue(EmitContext& ctx) {
     // predecessor for later blocks.
     ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
     Barrier(ctx);
+}
+
+void RecordMeshShuffle(EmitContext& ctx, Id value, Id source, Id result) {
+    if (ctx.mesh_debug_shuffle_count >= DEBUG_SHUFFLES) {
+        ++ctx.mesh_debug_shuffle_count;
+        return;
+    }
+    DefineDebugShuffles(ctx);
+    const u32 base{ctx.mesh_debug_shuffle_count++ * 3};
+    ctx.OpStore(ctx.mesh_debug_shuffles[base], value);
+    ctx.OpStore(ctx.mesh_debug_shuffles[base + 1], source);
+    ctx.OpStore(ctx.mesh_debug_shuffles[base + 2], result);
 }
 
 void EmitMeshEpilogue(EmitContext& ctx) {

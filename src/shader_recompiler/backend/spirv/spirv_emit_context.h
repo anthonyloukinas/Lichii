@@ -403,6 +403,10 @@ public:
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     std::array<Id, 4> mesh_tasks_marker{};
+    /// Debug only (mesh position readback): value, source lane and result of the first
+    /// ShuffleIndex ops, in Private variables.
+    std::vector<Id> mesh_debug_shuffles;
+    u32 mesh_debug_shuffle_count{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};

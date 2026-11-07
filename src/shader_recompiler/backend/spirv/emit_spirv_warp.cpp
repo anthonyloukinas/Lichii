@@ -250,17 +250,29 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
+    // Debug readback: source word = lane | in range << 31 | broadcast path << 30 | no subgroups << 29.
+    const auto record = [&](Id result, u32 flags) {
+        if (ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_positions_address != 0) {
+            const Id source{ctx.OpBitwiseOr(
+                ctx.U32[1], src_thread_id,
+                ctx.OpSelect(ctx.U32[1], in_range, ctx.Const(0x80000000U | flags),
+                             ctx.Const(flags)))};
+            RecordMeshShuffle(ctx, value, source, result);
+        }
+        return result;
+    };
     if (!StageSupportsSubgroups(ctx)) {
-        return value;
+        return record(value, 0x20000000U);
     }
     const IR::Value lane{inst->Arg(1).Resolve()};
     const IR::Value segment{inst->Arg(3).Resolve()};
     if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
-        return ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
-                            value);
+        return record(ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
+                                   value),
+                      0x40000000U);
     }
     const Id shuffled{ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))};
-    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    return record(ctx.OpSelect(ctx.U32[1], in_range, shuffled, value), 0);
 }
 
 Id EmitShuffleUp(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
