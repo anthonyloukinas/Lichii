@@ -250,6 +250,45 @@ VkViewport GetViewportState(const Device& device, const Maxwell& regs, size_t in
     return viewport;
 }
 
+// Frame dump draw record: guest depth/clip/raster state, the host viewport 0 z range and the
+// pipeline key fields that carry it.
+std::string FrameDumpDrawState(const Device& device, const Maxwell& regs,
+                               const GraphicsPipeline& pipeline) {
+    const auto& clip = regs.viewport_clip_control;
+    const auto& transform = regs.viewport_transform[0];
+    const auto& viewport = regs.viewports[0];
+    const auto& scissor = regs.scissor_test[0];
+    const VkViewport host = GetViewportState(device, regs, 0, 1.0f);
+    const auto& key = pipeline.Key();
+    const auto& dynamic = key.state.dynamic_state;
+    return fmt::format(
+        R"(,"depth_test":{},"depth_func":{},"depth_write":{},"depth_mode":{},"clip_depth_0_to_1":{},)"
+        R"("clip_pixel_min_z":{},"clip_pixel_max_z":{},"geometry_clip":{},"guardband_z":{},)"
+        R"("bias_fill":{},"bias":{},"bias_slope":{},"bias_clamp":{},"vp0_scale_z":{},)"
+        R"("vp0_translate_z":{},"vp0_near":{},"vp0_far":{},"vp0_host_min":{},"vp0_host_max":{},)"
+        R"("vp0_scale_xy":[{},{}],"vp0_translate_xy":[{},{}],"viewports":{},)"
+        R"("scissor0":[{},{},{},{},{}],"cull":{},"cull_face":{},"front_face":{},"raster":{},)"
+        R"("zeta":"{:#x}","zeta_format":{},"zeta_enable":{},"pipeline_key":"{:016x}",)"
+        R"("key_eds":{},"key_ndc_m1":{},"key_clamp_disabled":{},"key_depth_test":{},)"
+        R"("key_depth_func":{},"key_depth_write":{},"key_bias":{},"key_early_z":{})",
+        regs.depth_test_enable, static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
+        static_cast<u32>(regs.depth_mode), clip.depth_0_to_1.Value(), clip.pixel_min_z.Value(),
+        clip.pixel_max_z.Value(), static_cast<u32>(clip.geometry_clip.Value()),
+        static_cast<u32>(clip.geometry_guardband_z.Value()), regs.polygon_offset_fill_enable,
+        regs.depth_bias, regs.slope_scale_depth_bias, regs.depth_bias_clamp, transform.scale_z,
+        transform.translate_z, viewport.depth_range_near, viewport.depth_range_far, host.minDepth,
+        host.maxDepth, transform.scale_x, transform.scale_y, transform.translate_x,
+        transform.translate_y, std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports),
+        scissor.enable, scissor.min_x.Value(), scissor.max_x.Value(), scissor.min_y.Value(),
+        scissor.max_y.Value(), regs.gl_cull_test_enabled, static_cast<u32>(regs.gl_cull_face),
+        static_cast<u32>(regs.gl_front_face), regs.rasterize_enable, regs.zeta.Address(),
+        static_cast<u32>(regs.zeta.format), regs.zeta_enable, key.Hash(),
+        key.state.extended_dynamic_state.Value(), key.state.ndc_minus_one_to_one.Value(),
+        dynamic.depth_clamp_disabled.Value(), dynamic.depth_test_enable.Value(),
+        dynamic.depth_test_func.Value(), dynamic.depth_write_enable.Value(),
+        dynamic.depth_bias_enable.Value(), key.state.early_z.Value());
+}
+
 VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u32 down_shift = 0) {
     const auto& src = regs.scissor_test[index];
     VkRect2D scissor{};
@@ -1188,6 +1227,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 .color0 = pipeline->SupportsAlphaToCoverage(),
                 .kill = pipeline->FragmentCanDiscard(),
                 .zero_handles = pipeline->ZeroTextureHandles(),
+                .state = FrameDumpDrawState(device, regs, *pipeline),
             });
     }
     submitted = true;

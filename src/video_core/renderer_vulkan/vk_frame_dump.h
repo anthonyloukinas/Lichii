@@ -211,6 +211,7 @@ public:
         bool color0;                 ///< The fragment program writes colour 0
         bool kill;                   ///< The fragment program can discard
         u32 zero_handles;            ///< Texture handles whose handle program gave 0
+        std::string state;           ///< Depth, clip and raster state as JSON members
     };
     /// Ends the query; the draw index comes from BeginProbe.
     void EndProbe(u32 query, Probe probe);
