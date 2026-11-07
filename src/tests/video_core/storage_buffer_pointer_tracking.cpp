@@ -51,7 +51,8 @@ struct KernelProgram {
     IR::Block loop{pool};
     IR::Program program;
     TestEnvironment env;
-    u32 storage_buffer_limit{}; ///< The stage's storage buffer limit, none when 0
+    u32 storage_buffer_limit{};     ///< The stage's storage buffer limit, none when 0
+    u32 set_storage_buffer_limit{}; ///< The descriptor set's storage buffer limit, none when 0
 
     KernelProgram() {
         program.stage = Shader::Stage::Compute;
@@ -63,6 +64,7 @@ struct KernelProgram {
         Shader::HostTranslateInfo host{};
         host.min_ssbo_alignment = 16;
         host.max_per_stage_descriptor_storage_buffers = storage_buffer_limit;
+        host.max_descriptor_set_storage_buffers = set_storage_buffer_limit;
         Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
         std::vector<u32> offsets;
         for (const auto& descriptor : program.info.storage_buffers_descriptors) {
@@ -427,7 +429,12 @@ TEST_CASE("Programs that read more pointers than a stage binds are rejected",
           "[shader][storage_buffer]") {
     KernelProgram fixture;
     fixture.env.native = true;
-    fixture.storage_buffer_limit = 4;
+    SECTION("Stage limit") {
+        fixture.storage_buffer_limit = 4;
+    }
+    SECTION("Descriptor set limit") {
+        fixture.set_storage_buffer_limit = 4;
+    }
     IR::IREmitter ir{fixture.entry};
     for (u32 slot = 0; slot < 5; ++slot) {
         const u32 offset{0x100 + slot * 8};
