@@ -37,7 +37,8 @@ namespace {
 //    software HMMA. Not the pipeline cache version (#408's 54 also covers its vertex keys).
 // 7: stored SPIR-V changed: upstream nx2 #410 binds loaded pointers that compete with a paired
 //    constant buffer pointer, #398 lowers second-descriptor gathers to TLD4.B.
-constexpr u32 FormatVersion = 7;
+// 8: native programs bind up to 64 storage buffers (upstream #421/#434 part).
+constexpr u32 FormatVersion = 8;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
