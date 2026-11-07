@@ -118,29 +118,28 @@ void TaskEpilogue(EmitContext& ctx) {
     ctx.mesh_tasks_marker = {count, one, one, ctx.mesh_payload};
 }
 
-constexpr u32 DEBUG_BALLOTS = 4;
-constexpr u32 DEBUG_SHUFFLES = 53;
-constexpr u32 DEBUG_RECORD_WORDS = 176;
+constexpr u32 DEBUG_EVENTS = 101;
+constexpr u32 DEBUG_RECORD_WORDS = 16 + DEBUG_EVENTS * 3;
 
-void DefineDebugShuffles(EmitContext& ctx) {
-    if (!ctx.mesh_debug_shuffles.empty()) {
+void DefineDebugEvents(EmitContext& ctx) {
+    if (!ctx.mesh_debug_events.empty()) {
         return;
     }
     const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
-    for (u32 i = 0; i < DEBUG_BALLOTS + DEBUG_SHUFFLES * 3; ++i) {
+    for (u32 i = 0; i < DEBUG_EVENTS * 3; ++i) {
         const Id variable{ctx.AddGlobalVariable(pointer_type, spv::StorageClass::Private,
                                                 ctx.Const(0xdeadbeefU))};
         if (ctx.profile.supported_spirv >= 0x00010400) {
             ctx.interfaces.push_back(variable);
         }
-        ctx.mesh_debug_shuffles.push_back(variable);
+        ctx.mesh_debug_events.push_back(variable);
     }
 }
 
 // Debug only (RuntimeInfo::mesh_positions_address): appends {tag, workgroup x, payload hash,
-// vertex | primitive count << 16, position, subgroup lane, local invocation x, flags, ballot count,
-// the first DEBUG_BALLOTS ballots, then value, source and result of the first DEBUG_SHUFFLES
-// ShuffleIndex ops} while the host has armed the buffer.
+// vertex | primitive count << 16, position, subgroup lane, local invocation x, flags, event count,
+// 4 zero words, then DEBUG_EVENTS x {tag, operand, value} (RecordMeshEvent)} while the host has
+// armed the buffer.
 void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
     const u64 base{ctx.runtime_info.mesh_positions_address};
     ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
@@ -192,11 +191,10 @@ void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
                              spv::BuiltIn::SubgroupLocalInvocationId);
                 ctx.interfaces.push_back(ctx.subgroup_local_invocation_id);
             }
-            DefineDebugShuffles(ctx);
+            DefineDebugEvents(ctx);
             const u32 flags{(subgroups ? 1U : 0U) |
                             (ctx.profile.warp_size_potentially_larger_than_guest ? 2U : 0U) |
-                            (ctx.mesh_threads << 8) |
-                            (std::min(ctx.mesh_debug_shuffle_count, 0xffU) << 24)};
+                            (ctx.mesh_threads << 8)};
             std::vector<Id> words{
                 ctx.Const(ctx.runtime_info.mesh_positions_tag),
                 workgroup,
@@ -211,9 +209,12 @@ void RecordPosition(EmitContext& ctx, Id vertex, Id count) {
                           : ctx.Const(0xffffffffU),
                 LocalInvocation(ctx),
                 ctx.Const(flags),
-                ctx.Const(ctx.mesh_debug_ballot_count),
+                ctx.Const(ctx.mesh_debug_event_count),
             };
-            for (const Id variable : ctx.mesh_debug_shuffles) {
+            while (words.size() < 16) {
+                words.push_back(ctx.u32_zero_value);
+            }
+            for (const Id variable : ctx.mesh_debug_events) {
                 words.push_back(ctx.OpLoad(ctx.U32[1], variable));
             }
             while (words.size() < DEBUG_RECORD_WORDS) {
@@ -299,11 +300,14 @@ Id EmitIsbeRead(EmitContext& ctx, Id address) {
     }
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
     const Id word{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index))};
-    return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value), workgroup,
-                        word);
+    const Id result{ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value),
+                                 workgroup, word)};
+    RecordMeshEvent(ctx, 1U << 28, address, result);
+    return result;
 }
 
 void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value) {
+    RecordMeshEvent(ctx, 4U << 28, address, value);
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
     if (ctx.stage == Stage::Task) {
         ctx.OpStore(PayloadWord(ctx, index), value);
@@ -339,24 +343,18 @@ void EmitMeshPrologue(EmitContext& ctx) {
     Barrier(ctx);
 }
 
-void RecordMeshShuffle(EmitContext& ctx, Id value, Id source, Id result) {
-    if (ctx.mesh_debug_shuffle_count >= DEBUG_SHUFFLES) {
-        ++ctx.mesh_debug_shuffle_count;
+// Tag: kind << 28 | event ordinal << 12 | detail (1 stage buffer read, 2 storage load with
+// binding << 4 | words, 3 global load with words, 4 attribute write).
+void RecordMeshEvent(EmitContext& ctx, u32 tag, Id operand, Id value) {
+    if (ctx.stage != Stage::Mesh || ctx.runtime_info.mesh_positions_address == 0 ||
+        ctx.mesh_debug_event_count >= DEBUG_EVENTS) {
         return;
     }
-    DefineDebugShuffles(ctx);
-    const u32 base{DEBUG_BALLOTS + ctx.mesh_debug_shuffle_count++ * 3};
-    ctx.OpStore(ctx.mesh_debug_shuffles[base], value);
-    ctx.OpStore(ctx.mesh_debug_shuffles[base + 1], source);
-    ctx.OpStore(ctx.mesh_debug_shuffles[base + 2], result);
-}
-
-void RecordMeshBallot(EmitContext& ctx, Id result) {
-    if (ctx.mesh_debug_ballot_count++ >= DEBUG_BALLOTS) {
-        return;
-    }
-    DefineDebugShuffles(ctx);
-    ctx.OpStore(ctx.mesh_debug_shuffles[ctx.mesh_debug_ballot_count - 1], result);
+    DefineDebugEvents(ctx);
+    const u32 base{ctx.mesh_debug_event_count++ * 3};
+    ctx.OpStore(ctx.mesh_debug_events[base], ctx.Const(tag | (ctx.mesh_debug_event_count << 12)));
+    ctx.OpStore(ctx.mesh_debug_events[base + 1], operand);
+    ctx.OpStore(ctx.mesh_debug_events[base + 2], value);
 }
 
 void EmitMeshEpilogue(EmitContext& ctx) {

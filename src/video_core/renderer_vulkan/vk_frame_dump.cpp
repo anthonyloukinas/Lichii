@@ -231,7 +231,7 @@ std::string SamplerJson(const Sampler* sampler) {
 
 constexpr size_t POSITIONS_BYTES = 256ULL << 20;
 constexpr u32 POSITIONS_HEADER = 64;
-constexpr u32 POSITION_RECORD = 176 * 4;
+constexpr u32 POSITION_RECORD = 319 * 4;
 std::atomic<u64> positions_address{};
 
 } // Anonymous namespace
@@ -1002,9 +1002,9 @@ void FrameDump::EndFrame(bool last) {
         }
     }
     if (positions) {
-        // Records (176 words, one per invocation): tag, workgroup x, payload hash,
-        // vertex | count << 16, x, y, z, w, subgroup lane, local invocation x, flags, ballot count,
-        // 4 ballots, 53 x {shuffle value, source, result}.
+        // Records (319 words, one per invocation): tag, workgroup x, payload hash,
+        // vertex | count << 16, x, y, z, w, subgroup lane, local invocation x, flags, event count,
+        // 4 zero words, 101 x {event tag, operand, value}.
         scheduler.Finish();
         positions.Invalidate();
         u32* const header = reinterpret_cast<u32*>(positions.Mapped().data());
@@ -1014,7 +1014,7 @@ void FrameDump::EndFrame(bool last) {
         positions.Flush();
         const auto records = positions.Mapped().subspan(POSITIONS_HEADER,
                                                         size_t{kept} * POSITION_RECORD);
-        Enqueue({.tags = fmt::format(R"("kind":"mesh_positions","words":176,"records":{},"appended":{})",
+        Enqueue({.tags = fmt::format(R"("kind":"mesh_positions","words":319,"records":{},"appended":{})",
                                      kept, appended),
                  .data = {records.begin(), records.end()},
                  .raw = true});
