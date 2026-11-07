@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/pipeline_build.h"
+#include "video_core/renderer_vulkan/pipeline_residency.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 
 namespace {
@@ -380,4 +381,28 @@ TEST_CASE("Concurrent prebuild completion and adoption never return a pipeline t
             REQUIRE(*b == 42);
         }
     }
+}
+
+TEST_CASE("Pipeline eviction only trims the live count down to its threshold",
+          "[video_core][pipeline_residency]") {
+    using Vulkan::PipelinesToEvict;
+    // At or below the threshold nothing goes, however many are stale.
+    REQUIRE(PipelinesToEvict(3000, 2500, 8000) == 0);
+    REQUIRE(PipelinesToEvict(8000, 8000, 8000) == 0);
+    // Above it, only the excess, and never more than the stale ones.
+    REQUIRE(PipelinesToEvict(8500, 2000, 8000) == 500);
+    REQUIRE(PipelinesToEvict(9000, 300, 8000) == 300);
+    // A threshold of 0 is the old rule: every stale pipeline goes.
+    REQUIRE(PipelinesToEvict(3000, 2500, 0) == 2500);
+    REQUIRE(PipelinesToEvict(0, 0, 0) == 0);
+}
+
+TEST_CASE("Pipeline residency counts parse from the environment", "[video_core][pipeline_residency]") {
+    using Vulkan::ParseEnvCount;
+    REQUIRE(ParseEnvCount(nullptr, 8000) == 8000);
+    REQUIRE(ParseEnvCount("", 8000) == 8000);
+    REQUIRE(ParseEnvCount("0", 8000) == 0);
+    REQUIRE(ParseEnvCount("12000", 8000) == 12000);
+    REQUIRE(ParseEnvCount("12k", 8000) == 8000);
+    REQUIRE(ParseEnvCount("-1", 8000) == 8000);
 }

@@ -45,6 +45,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_residency.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/spirv_complexity.h"
@@ -1407,6 +1408,16 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
 }
 
 namespace {
+size_t EvictAbove() {
+    static const size_t threshold = [] {
+        const size_t value = ParseEnvCount(std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE"),
+                                           DefaultPipelineEvictAbove);
+        LOG_INFO(Render_Vulkan, "Pipeline eviction applies above {} live graphics pipelines", value);
+        return value;
+    }();
+    return threshold;
+}
+
 // EDEN_NX2_PIPELINE_DIFF=1: for a new graphics pipeline whose shaders an earlier one uses too,
 // log which parts of the fixed state differ from that one (finds state that splits the same
 // draws into many pipelines, each translated on the GPU thread).
@@ -1500,13 +1511,14 @@ void PipelineCache::TickFrame() {
 
 void PipelineCache::EvictUnusedPipelines() {
     // "Evict unused pipelines" (per game, read on each call); EDEN_NX2_PIPELINE_EVICT=0 forces it
-    // off. Building a pipeline again on MoltenVK means a Metal compile mid-game, so none are
-    // evicted there either.
-    static const bool env_off = [] {
+    // off and =1 on. Building a pipeline again on MoltenVK means a Metal compile mid-game, so none
+    // are evicted there either.
+    static const char env = [] {
         const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT");
-        return value != nullptr && value[0] == '0';
+        return value != nullptr ? value[0] : '\0';
     }();
-    if (env_off || !Settings::values.evict_unused_pipelines.GetValue() || device.IsMoltenVK()) {
+    if (env == '0' || (env != '1' && !Settings::values.evict_unused_pipelines.GetValue()) ||
+        device.IsMoltenVK()) {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
@@ -1520,17 +1532,22 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    // Below EvictAbove() live pipelines nothing is evicted; above it, the least recently used of
+    // those unused for the window go until EvictAbove() remain.
+    const size_t threshold = EvictAbove();
+    if (graphics_cache.size() <= threshold) {
+        return;
+    }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     // ~0.9 GB of driver memory at ~0.45 MB each.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
     size_t kept_prebuilt = 0;
-    size_t evicted = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
+    std::vector<decltype(graphics_cache)::iterator> stale;
+    for (auto it = graphics_cache.begin(); it != graphics_cache.end(); ++it) {
         GraphicsPipeline* const pipeline = it->second.get();
         if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
-            ++it;
             continue;
         }
         // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
@@ -1540,15 +1557,24 @@ void PipelineCache::EvictUnusedPipelines() {
         // large cache can't hold their driver memory for the whole session.
         if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
             ++kept_prebuilt;
-            ++it;
             continue;
         }
+        stale.push_back(it);
+    }
+    const size_t evicted = PipelinesToEvict(graphics_cache.size(), stale.size(), threshold);
+    if (evicted < stale.size()) {
+        std::ranges::nth_element(stale, stale.begin() + evicted, {}, [](const auto& it) {
+            return it->second->LastUse();
+        });
+    }
+    for (size_t i = 0; i < evicted; ++i) {
+        const auto it = stale[i];
+        GraphicsPipeline* const pipeline = it->second.get();
         if (used_this_session.erase(pipeline) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
         evicted_pipelines.emplace_back(tick, std::move(it->second));
-        it = graphics_cache.erase(it);
-        ++evicted;
+        graphics_cache.erase(it);
     }
     if (evicted == 0) {
         return;
@@ -1558,8 +1584,9 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} of {} graphics pipelines unused for {} frames (live above {}), {} left",
+             evicted, stale.size(), EvictAfterFrames, threshold, graphics_cache.size());
 }
 
 /// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the

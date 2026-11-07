@@ -183,6 +183,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_creation_stats.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
+    renderer_vulkan/pipeline_residency.h
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
