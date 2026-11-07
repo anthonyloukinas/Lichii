@@ -45,6 +45,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/renderer_vulkan/spirv_complexity.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -351,6 +352,11 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
     device.SaveShader(code);
     vk::ShaderModule module{BuildShader(device, code)};
+    {
+        static constexpr std::array stats_stage_names{"vertex", "tess_control", "tess_eval",
+                                                      "geometry", "fragment"};
+        LogShaderStats(shader_hash, stats_stage_names[stage_index], code, false);
+    }
 
     // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
     // is independent and gated only by gpu_log_shader_dumps.
@@ -1723,6 +1729,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         LogUntrackedGlobal(key.unique_hashes[index], program.stage, program.info);
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
+        {
+            static constexpr std::array stats_stage_names{"vertex", "tess_control", "tess_eval",
+                                                          "geometry", "fragment"};
+            LogShaderStats(key.unique_hashes[index], stats_stage_names[stage_index], code,
+                           variant && !translation_cache_verify && from_cache[index]);
+        }
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
         // is independent and gated only by gpu_log_shader_dumps.
@@ -2091,6 +2103,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
             env.Dump(hash, key.unique_hash);
         }
         vk::ShaderModule cached_module{BuildShader(device, variant->spirv)};
+        LogShaderStats(key.unique_hash, "compute", variant->spirv, true);
+        if (Settings::values.gpu_log_shader_dumps.GetValue()) {
+            GPU::Logging::DumpSpirvShader(key.unique_hash, std::span<const u32>(variant->spirv));
+        }
         ++translation_cache.stage_hits;
         translation_cache.hit_ns += static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -2165,6 +2181,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
+    LogShaderStats(key.unique_hash, "compute", code, false);
 
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
