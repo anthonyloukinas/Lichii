@@ -540,8 +540,12 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
 #endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
+#include <atomic>
+#include <cerrno>
 #include <fstream>
+#include <mutex>
 #include <optional>
+#include <utility>
 
 namespace {
 // The CPUs of a sysfs CPU list file; empty when the file is missing.
@@ -561,15 +565,10 @@ cpu_set_t ReadCpuList(const char* path) {
     return set;
 }
 
-// The logical processors this process may run on, with their physical core (package and core id)
-// and, on hybrid CPUs, their relative capacity as the efficiency class.
-std::vector<Common::LogicalProcessor> LinuxProcessors() {
+// The logical processors in allowed, with their physical core (package and core id) and, on
+// hybrid CPUs, their relative capacity as the efficiency class.
+std::vector<Common::LogicalProcessor> LinuxProcessors(const cpu_set_t& allowed) {
     std::vector<Common::LogicalProcessor> processors;
-    cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-        return processors;
-    }
     // Intel hybrid CPUs list their efficiency cores here (the cpu_atom PMU), also on kernels
     // that don't report cpu_capacity on x86. Without it, all cores rank equal and a CPU with
     // fewer than MinCoresForGpuThreadPinning performance cores would pass the check.
@@ -601,16 +600,154 @@ std::vector<Common::LogicalProcessor> LinuxProcessors() {
     return processors;
 }
 
-void SetCurrentThreadAffinity(const std::vector<u32>& cpus) {
+cpu_set_t ToCpuSet(const std::vector<u32>& cpus) {
     cpu_set_t set;
     CPU_ZERO(&set);
     for (const u32 cpu : cpus) {
         CPU_SET(cpu, &set);
     }
-    if (const int error = pthread_setaffinity_np(pthread_self(), sizeof(set), &set); error != 0) {
-        LOG_WARNING(Common, "pthread_setaffinity_np failed: {}", std::strerror(error));
+    return set;
+}
+
+// "0-7,16-23", for the log.
+std::string FormatCpus(const cpu_set_t& set) {
+    std::string text;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &set)) {
+            continue;
+        }
+        int last = cpu;
+        while (last + 1 < CPU_SETSIZE && CPU_ISSET(last + 1, &set)) {
+            ++last;
+        }
+        text += (text.empty() ? "" : ",") + std::to_string(cpu);
+        if (last != cpu) {
+            text += "-" + std::to_string(last);
+        }
+        cpu = last;
+    }
+    return text;
+}
+
+// The CPUs of the process's main thread. GameMode's core pinning (pin_cores, on by default on
+// X3D and hybrid CPUs) sets every thread of the game to its CPU list when the game registers and
+// again on each of its reaper ticks (every 5 s by default), which undoes the GPU thread pinning.
+// The pinned threads are re-pinned from PollThreadPolicies, planned within the CPUs that GameMode
+// (or taskset) left the process.
+cpu_set_t ProcessCpus() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) {
+        CPU_ZERO(&set);
+    }
+    return set;
+}
+
+struct PinnedThread {
+    pid_t tid;
+    Common::PinnedRole role;
+};
+
+struct PinningState {
+    std::mutex mutex;
+    bool planned = false;
+    cpu_set_t planned_within{};
+    Common::GpuThreadPinning plan;
+    std::vector<PinnedThread> threads;
+    u64 reapplied = 0;
+    std::atomic<bool> active{false};
+    std::atomic<s64> next_poll_ns{0};
+};
+
+PinningState& Pinning() {
+    // Never destroyed: pinned threads unregister on exit.
+    static PinningState* const state = new PinningState;
+    return *state;
+}
+
+const std::vector<u32>& RoleCpus(const Common::GpuThreadPinning& plan, Common::PinnedRole role) {
+    return role == Common::PinnedRole::GpuFront  ? plan.front
+           : role == Common::PinnedRole::GpuBack ? plan.back
+                                                 : plan.guest;
+}
+
+void PlanLocked(PinningState& state, const cpu_set_t& cpus, bool replan) {
+    state.plan = Common::PlanGpuThreadPinning(LinuxProcessors(cpus));
+    state.planned_within = cpus;
+    state.planned = true;
+    const char* const when = replan ? ", re-planned after the process CPUs changed" : "";
+    if (state.plan.front.empty()) {
+        LOG_WARNING(Common,
+                    "GPU thread pinning skipped: {} physical performance cores, needs {} (CPUs {}{})",
+                    state.plan.performance_cores, Common::MinCoresForGpuThreadPinning,
+                    FormatCpus(cpus), when);
+        return;
+    }
+    LOG_INFO(Common,
+             "GPU thread pinning: front and back on a physical core each, guest cores on the other "
+             "{} performance cores ({} logical processors); front {}, back {}, within CPUs {}{}",
+             state.plan.performance_cores - 2, state.plan.guest.size(),
+             FormatCpus(ToCpuSet(state.plan.front)), FormatCpus(ToCpuSet(state.plan.back)),
+             FormatCpus(cpus), when);
+}
+
+// Re-plans when the process CPUs changed and re-pins the threads that are not where the plan puts
+// them.
+void ReapplyPinningLocked(PinningState& state) {
+    const cpu_set_t cpus = ProcessCpus();
+    if (CPU_COUNT(&cpus) == 0) {
+        return;
+    }
+    const bool replanned = !CPU_EQUAL(&cpus, &state.planned_within);
+    if (replanned) {
+        PlanLocked(state, cpus, true);
+    }
+    if (state.plan.front.empty()) {
+        return;
+    }
+    u32 moved = 0;
+    std::erase_if(state.threads, [&](const PinnedThread& thread) {
+        const cpu_set_t wanted = ToCpuSet(RoleCpus(state.plan, thread.role));
+        cpu_set_t current;
+        CPU_ZERO(&current);
+        if (sched_getaffinity(thread.tid, sizeof(current), &current) != 0) {
+            return errno == ESRCH;
+        }
+        if (CPU_EQUAL(&current, &wanted)) {
+            return false;
+        }
+        if (sched_setaffinity(thread.tid, sizeof(wanted), &wanted) != 0) {
+            return errno == ESRCH;
+        }
+        ++moved;
+        return false;
+    });
+    if (moved == 0 || replanned) {
+        return;
+    }
+    if (state.reapplied++ == 0) {
+        LOG_INFO(Common,
+                 "GPU thread pinning re-applied to {} threads that another process moved within "
+                 "CPUs {} (GameMode core pinning does this every few seconds; repeats log at debug)",
+                 moved, FormatCpus(cpus));
+    } else {
+        LOG_DEBUG(Common, "GPU thread pinning re-applied to {} threads ({} times)", moved,
+                  state.reapplied);
     }
 }
+
+// Removes the thread from the pinned list when it exits, so a reused thread id is never re-pinned.
+struct PinnedThreadRegistration {
+    pid_t tid = 0;
+    ~PinnedThreadRegistration() {
+        if (tid == 0) {
+            return;
+        }
+        PinningState& state = Pinning();
+        std::scoped_lock lock{state.mutex};
+        std::erase_if(state.threads, [this](const PinnedThread& thread) { return thread.tid == tid; });
+    }
+};
 } // Anonymous namespace
 #endif
 
@@ -751,25 +888,23 @@ void PinCurrentThread(PinnedRole role) {
         SelectCurrentThreadCpuSets(ids);
     }
 #elif defined(__linux__) && !defined(__ANDROID__)
-    static const GpuThreadPinning plan = [] {
-        GpuThreadPinning result = PlanGpuThreadPinning(LinuxProcessors());
-        if (result.front.empty()) {
-            LOG_WARNING(Common,
-                        "GPU thread pinning skipped: {} physical performance cores, needs {}",
-                        result.performance_cores, MinCoresForGpuThreadPinning);
-        } else {
-            LOG_INFO(Common,
-                     "GPU thread pinning: front and back on a physical core each, guest cores on "
-                     "the other {} performance cores ({} logical processors)",
-                     result.performance_cores - 2, result.guest.size());
+    PinningState& state = Pinning();
+    std::scoped_lock lock{state.mutex};
+    if (!state.planned) {
+        PlanLocked(state, ProcessCpus(), false);
+    }
+    thread_local PinnedThreadRegistration registration;
+    registration.tid = gettid();
+    std::erase_if(state.threads,
+                  [](const PinnedThread& thread) { return thread.tid == registration.tid; });
+    state.threads.push_back({registration.tid, role});
+    state.active.store(true, std::memory_order_relaxed);
+    if (const std::vector<u32>& cpus = RoleCpus(state.plan, role); !cpus.empty()) {
+        const cpu_set_t set = ToCpuSet(cpus);
+        if (const int error = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            error != 0) {
+            LOG_WARNING(Common, "pthread_setaffinity_np failed: {}", std::strerror(error));
         }
-        return result;
-    }();
-    const std::vector<u32>& cpus = role == PinnedRole::GpuFront  ? plan.front
-                                   : role == PinnedRole::GpuBack ? plan.back
-                                                                 : plan.guest;
-    if (!cpus.empty()) {
-        SetCurrentThreadAffinity(cpus);
     }
 #else
     (void)role;
@@ -836,6 +971,13 @@ void RefreshThreadPolicies() {
         return gone;
     });
     SnapshotCanaryLocked(state);
+#elif defined(__linux__)
+    PinningState& state = Pinning();
+    if (!state.active.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::scoped_lock lock{state.mutex};
+    ReapplyPinningLocked(state);
 #endif
 }
 
@@ -866,6 +1008,21 @@ void PollThreadPolicies() {
     CPU_ZERO(&current);
     if (sched_getaffinity(tid, sizeof(current), &current) == 0 &&
         std::memcmp(&current, &expected, sizeof(current)) == 0) {
+        return;
+    }
+    RefreshThreadPolicies();
+#elif defined(__linux__)
+    // Called on each vsync: two getaffinity calls per pinned thread every 50 ms at most.
+    PinningState& state = Pinning();
+    if (!state.active.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    s64 next = state.next_poll_ns.load(std::memory_order_relaxed);
+    if (now_ns < next || !state.next_poll_ns.compare_exchange_strong(
+                             next, now_ns + 50'000'000, std::memory_order_relaxed)) {
         return;
     }
     RefreshThreadPolicies();

@@ -10,6 +10,7 @@
 #include <gamemode_client.h>
 #endif
 #include "common/logging.h"
+#include "common/thread.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/gamemode.h"
 
@@ -27,6 +28,9 @@ void Start() noexcept {
 #endif
         } else {
             LOG_INFO(Frontend, "Done");
+            // GameMode's core pinning has moved every thread: pin the GPU threads again within
+            // the CPUs it left us.
+            Common::RefreshThreadPolicies();
         }
 #endif
     }
@@ -44,6 +48,8 @@ void Stop() noexcept {
 #endif
         } else {
             LOG_INFO(Frontend, "Done");
+            // GameMode gives the threads back all online CPUs.
+            Common::RefreshThreadPolicies();
         }
 #endif
     }
