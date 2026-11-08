@@ -375,14 +375,14 @@ TEST_CASE("GpuSplit front keeps same-value topology writes that end a deferred i
         return engine;
     };
     for (const u32 control : {0u, 2u}) { // Track, passthrough
-        for (const auto [changed, value] :
+        for (const auto& [changed, value] :
              {std::pair{vertex_count, 6u}, std::pair{vertex_first, 2u}}) {
             for (const bool fast : {false, true}) {
                 CAPTURE(control, changed, fast);
                 const auto methods = sequence(control, changed, value);
                 DrawRecorder direct_draws;
                 auto direct = make_engine(direct_draws, fast);
-                for (const auto [method, argument] : methods) {
+                for (const auto& [method, argument] : methods) {
                     direct->CallMethod(f.system, method, argument, true);
                 }
                 direct->draw_manager.DrawDeferred(*direct);
@@ -395,7 +395,7 @@ TEST_CASE("GpuSplit front keeps same-value topology writes that end a deferred i
                 auto engine = make_engine(split_draws, fast);
                 VideoCommon::GpuSplit split;
                 Access::Initialize(split, f.system);
-                for (const auto [method, argument] : methods) {
+                for (const auto& [method, argument] : methods) {
                     engine->FrontCallMethod(f.system, split, method, argument, true, {});
                 }
                 u64 position{};
