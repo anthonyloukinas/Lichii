@@ -1157,6 +1157,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         // The translation dropped accesses through a pointer that was null back then. Which slots
         // the game fills depends on the area, so the new one keeps binding every pointer this one
         // binds, null now or not: a null pointer binds nothing.
+        // The stored capture is stale: the rebuild is appended as its replacement, the record a
+        // later boot loads.
+        disk_compute.NoteFailed(key);
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             if (entry.pipeline) {
