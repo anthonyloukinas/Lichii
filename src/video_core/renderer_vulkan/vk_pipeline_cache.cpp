@@ -1197,6 +1197,15 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
             entry.null_pointer_slots = std::move(rebuilt.null_pointer_slots);
             entry.mapped_pointers = std::move(rebuilt.mapped_pointers);
             ++entry.rebuilds;
+        } else if (rebuilt.pipeline && entry.pipeline && !rebuilt.pipeline->IsBound()) {
+            // The worker finished already and the driver rejected it: keep the working pipeline,
+            // as when a pending rebuild is rejected.
+            LOG_WARNING(Render_Vulkan,
+                        "Keeping compute shader {:016x}: the driver rejected its rebuild",
+                        key.unique_hash);
+            retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                   std::move(rebuilt.pipeline));
+            entry.rebuilds = MaxComputeRebuilds;
         } else if (rebuilt.pipeline) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
