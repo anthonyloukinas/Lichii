@@ -558,6 +558,7 @@ TEST_CASE("Loaded pointers that compete with a pair do not take the last storage
     CHECK(program.Count(IR::Opcode::LoadGlobal128) == 0);
 }
 
+namespace {
 // The loop reads its records through the table entry at *c0[0x30] or *c0[0x38], loaded before
 // it. That load binds c0[0x30] and c0[0x38] in the first pass, with `pointers` more pointers.
 void EmitTableLoop(KernelProgram& fixture, u32 pointers) {
@@ -583,6 +584,7 @@ void EmitTableLoop(KernelProgram& fixture, u32 pointers) {
     static_cast<void>(
         body.LoadGlobal128(Address(body, record, IR::U32{body.CompositeExtract(table, 1)})));
 }
+} // Anonymous namespace
 
 TEST_CASE("Pointer table entries are charged only for bindings the first pass left free",
           "[shader][storage_buffer]") {
