@@ -18,6 +18,7 @@
 #include <span>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <thread>
 #include <vector>
 #include <bit>
@@ -38,6 +39,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -52,6 +54,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
@@ -673,6 +676,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_per_stage_descriptor_sampled_images = device.GetMaxPerStageDescriptorSampledImages(),
         .max_per_stage_resources = device.GetMaxPerStageResources(),
+        .max_per_stage_descriptor_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers(),
         .max_descriptor_set_samplers = device.GetMaxDescriptorSetSamplers(),
         .max_descriptor_set_uniform_buffers = device.GetMaxDescriptorSetUniformBuffers(),
         .max_descriptor_set_uniform_buffers_dynamic = device.GetMaxDescriptorSetUniformBuffersDynamic(),
@@ -963,12 +967,104 @@ void PipelineCache::SaveUsedPipelines() {
     }
 }
 
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+void PipelineCache::BuildCleanWatch() {
+    CleanWatch watch = Vulkan::BuildCleanWatch(maxwell3d->regs, dynamic_features);
+    clean.ranges = std::move(watch.ranges);
+    clean.xfb_ranges = std::move(watch.xfb_ranges);
+    size_t words = 0;
+    for (const CleanWatchRange& range : clean.ranges) {
+        words += range.count;
+    }
+    clean.snapshot.assign(words, 0);
+    size_t xfb_words = 0;
+    for (const CleanWatchRange& range : clean.xfb_ranges) {
+        xfb_words += range.count;
+    }
+    clean.xfb_snapshot.assign(xfb_words, 0);
+    clean.built = true;
+    LOG_INFO(Render_Vulkan, "Pipeline lookup watches {} register words in {} ranges", words,
+             clean.ranges.size());
+}
 
+bool PipelineCache::CleanInputsUnchanged() const {
+    const u32* const words = maxwell3d->regs.reg_array.data();
+    if (!CleanWordsEqual(words, clean.ranges, clean.snapshot.data())) {
+        return false;
+    }
+    return maxwell3d->regs.transform_feedback_enabled == 0 ||
+           CleanWordsEqual(words, clean.xfb_ranges, clean.xfb_snapshot.data());
+}
+
+void PipelineCache::TakeCleanSnapshot() {
+    const u32* const words = maxwell3d->regs.reg_array.data();
+    SaveCleanWords(words, clean.ranges, clean.snapshot.data());
+    if (maxwell3d->regs.transform_feedback_enabled != 0) {
+        SaveCleanWords(words, clean.xfb_ranges, clean.xfb_snapshot.data());
+    }
+    clean.hashes = graphics_key.unique_hashes;
+    clean.maxwell3d = maxwell3d;
+    clean.topology = maxwell3d->draw_manager.draw_state.topology;
+    clean.engine_state = maxwell3d->engine_state;
+}
+
+bool PipelineCache::CleanHitVerified() {
+    // What the Refresh path below would make of the key (its flags are clear on a clean hit, so
+    // Refresh changes nothing else).
+    GraphicsPipelineCacheKey check = graphics_key;
+    if (check.state.dynamic_vertex_input) {
+        check.state.attribute_types = vertex_attribute_types;
+    }
+    check.state.Refresh(*maxwell3d, dynamic_features);
+    if (check.state.dynamic_vertex_input && last_shaders_mesh) {
+        ClearMeshVertexInput(check);
+    }
+    if (check == graphics_key) {
+        return true;
+    }
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::PipelineCleanVerifyDiffs, 1);
+    static bool warned = false;
+    if (!std::exchange(warned, true)) {
+        LOG_WARNING(Render_Vulkan,
+                    "EDEN_NX2_PERF_VERIFY: the clean pipeline lookup kept a key Refresh changes "
+                    "(a register it doesn't watch); refreshing instead");
+    }
+    return false;
+}
+
+// The key is (unique_hashes, FixedPipelineState). Refresh's output depends only on: the
+// registers in clean.ranges (and clean.xfb_ranges while transform feedback is on), the dirty
+// flags VertexInput, ViewportSwizzles and Blending (it recomputes those groups only while set,
+// and clears some), dynamic_features (set once at construction), the draw's topology and the
+// engine hint. When all of these equal their values at the last Refresh and the flags are
+// clear, Refresh would rewrite the same key and Next(graphics_key) would return
+// current_pipeline (whose key it is): the lookup returns it as that fast path does.
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
+        clean.pipeline = nullptr;
         return nullptr;
     }
+    if (!clean.built) {
+        BuildCleanWatch();
+    }
+    const auto& flags = maxwell3d->dirty.flags;
+    const bool blending_dirty =
+        !dynamic_features.has_extended_dynamic_state_3_blend && flags[Dirty::Blending];
+    if (clean.pipeline != nullptr && clean.pipeline == current_pipeline &&
+        clean.maxwell3d == maxwell3d && !flags[Dirty::VertexInput] &&
+        !flags[Dirty::ViewportSwizzles] && !blending_dirty &&
+        clean.hashes == graphics_key.unique_hashes &&
+        clean.topology == maxwell3d->draw_manager.draw_state.topology &&
+        clean.engine_state == maxwell3d->engine_state && CleanInputsUnchanged() &&
+        (!VideoCommon::Nx2Perf::Verify() || CleanHitVerified())) {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::PipelineCleanHits, 1);
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline);
+    }
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::PipelineCleanMisses, 1);
+    clean.pipeline = nullptr;
+
+    TakeCleanSnapshot();
     if (graphics_key.state.dynamic_vertex_input) {
         // Refresh only rewrites the types when the vertex input is dirty.
         graphics_key.state.attribute_types = vertex_attribute_types;
@@ -985,11 +1081,18 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
         if (next) {
             current_pipeline = next;
+            clean.pipeline = next;
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline);
         }
     }
-    return CurrentGraphicsPipelineSlowPath();
+    // The slow path makes graphics_cache[graphics_key] current, unless it has no pipeline.
+    GraphicsPipeline* const previous = current_pipeline;
+    GraphicsPipeline* const result = CurrentGraphicsPipelineSlowPath();
+    if (current_pipeline != previous) {
+        clean.pipeline = current_pipeline;
+    }
+    return result;
 }
 
 ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
@@ -1001,6 +1104,36 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
             failure.empty() ? "No compiler diagnostic was recorded" : failure);
     }
     return pipeline.get();
+}
+
+constexpr u32 MaxComputeRebuilds = 4;
+
+bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
+    const auto& qmd{kepler_compute->launch_description};
+    for (const auto& [index, offset] : entry.null_pointer_slots) {
+        if (index >= qmd.const_buffer_config.size() ||
+            ((qmd.const_buffer_enable_mask >> index) & 1) == 0) {
+            continue;
+        }
+        const auto& cbuf{qmd.const_buffer_config[index]};
+        if (offset + sizeof(u64) > cbuf.size) {
+            continue; // The translator reads past the bound size as zero, too
+        }
+        const GPUVAddr slot{cbuf.Address() + offset};
+        if (!gpu_memory->IsFullyMappedRange(slot, sizeof(u64))) {
+            continue;
+        }
+        const GPUVAddr address{gpu_memory->Read<u64>(slot)};
+        if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+            gpu_memory->IsFullyMappedRange(address, 1)) {
+            LOG_INFO(Render_Vulkan,
+                     "Rebuilding compute program {:#x}: c{}[{:#x}] was null at translation and "
+                     "now points to {:#x}",
+                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset, address);
+            return true;
+        }
+    }
+    return false;
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
@@ -1019,6 +1152,29 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
+    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+               StaleNullPointerSlot(entry)) {
+        // The translation dropped accesses through a pointer that was null back then. Which slots
+        // the game fills depends on the area, so the new one keeps binding every pointer this one
+        // binds, null now or not: a null pointer binds nothing.
+        // The stored capture is stale: the rebuild is appended as its replacement, the record a
+        // later boot loads.
+        disk_compute.NoteFailed(key);
+        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
+        if (rebuilt.pipeline) {
+            if (entry.pipeline) {
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.pipeline));
+            }
+            rebuilt.rebuilds = entry.rebuilds + 1;
+            entry = std::move(rebuilt);
+        } else {
+            // Keep the working translation when the new one cannot be built (for example a
+            // narrow access that now stays global across two buffers), and stop retrying.
+            LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed: {}",
+                        key.unique_hash, rebuilt.failure);
+            entry.rebuilds = MaxComputeRebuilds;
+        }
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
@@ -1085,6 +1241,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t built{};
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
+        size_t compute_entries{};
+        ::Common::unordered_map<ComputePipelineCacheKey, size_t> compute_order;
     } state;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
@@ -1096,14 +1254,33 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
         disk_compute.NoteStored(key);
 
-        workers.QueueWork([this, key, env_ = std::move(env), build = disk_compute.StartBuild(key),
+        const size_t order{state.compute_entries++};
+        workers.QueueWork([this, key, order, env_ = std::move(env), build = disk_compute.StartBuild(key),
                            &state, &callback]() mutable {
             ShaderPools pools;
             auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
             build.Finish(VideoCommon::PipelineBuilt(entry.pipeline.get()));
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
-                compute_cache.emplace(key, std::move(entry));
+                // A rebuilt translation is cached beside the stale one. Keep the one that binds
+                // more pointers; on a tie keep the earlier entry, as before. An entry built at run
+                // time before a cache reload stays (marked with the largest order).
+                constexpr size_t runtime_entry = ~size_t{0};
+                auto [it, inserted]{state.compute_order.try_emplace(key, order)};
+                const auto current{compute_cache.find(key)};
+                if (inserted && current != compute_cache.end()) {
+                    it->second = runtime_entry;
+                }
+                const bool replace =
+                    it->second != runtime_entry &&
+                    (current == compute_cache.end() || inserted ||
+                     entry.mapped_pointers.size() > current->second.mapped_pointers.size() ||
+                     (entry.mapped_pointers.size() == current->second.mapped_pointers.size() &&
+                      order < it->second));
+                if (replace) {
+                    it->second = order;
+                    compute_cache.insert_or_assign(key, std::move(entry));
+                }
             }
             ++state.built;
             if (state.has_loaded) {
@@ -1390,6 +1567,11 @@ void PipelineCache::TickFrame() {
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
+    while (!retired_compute_pipelines.empty() &&
+           scheduler.IsFree(retired_compute_pipelines.front().first) &&
+           retired_compute_pipelines.front().second->IsBuildTaskDone()) {
+        retired_compute_pipelines.pop_front();
+    }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
@@ -1574,7 +1756,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 // VertexB path when VertexA is present.
                 auto& program_va{programs[0]};
                 auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-                programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+                programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
             }
 
             if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
@@ -1823,7 +2005,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
-    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    std::string shaders;
+    for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+        if (key.unique_hashes[index] != 0) {
+            shaders += fmt::format(" s{}:{:016x}", index, key.unique_hashes[index]);
+        }
+    }
+    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed pipeline={:016x}{}: {}", hash,
+              shaders, exception.what());
     return nullptr;
 }
 
@@ -1985,8 +2174,9 @@ void PipelineCache::QueueGraphicsSerialization(
     });
 }
 
-ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
-    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
+                                                               const ShaderInfo* shader,
+                                                               std::span<const u64> keep_pointers) {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         ReportRuntimePipeline("Compute", begin,
@@ -2000,6 +2190,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
                            shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
+    env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
     auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
@@ -2114,10 +2305,16 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 .count());
         LogUntrackedGlobal(key.unique_hash, Shader::Stage::Compute, variant->info);
         Common::ThreadWorker* const cached_worker{build_in_parallel ? &workers : nullptr};
+        // FindEntry replayed the entry's queries against env, so env holds the pointer answers
+        // this translation was made with: a slot it found null is rebuilt like a fresh one.
         return {.pipeline = std::make_unique<ComputePipeline>(
                     device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                     guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
-                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash)};
+                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash),
+                .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                            : std::vector<std::pair<u32, u32>>{},
+                .mapped_pointers =
+                    env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
     }
     std::optional<TC::RecordingEnvironment> recording;
     if (cacheable && !entry) {
@@ -2207,7 +2404,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash)};
+                std::move(spv_module), key.unique_hash),
+            .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                        : std::vector<std::pair<u32, u32>>{},
+            .mapped_pointers =
+                env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

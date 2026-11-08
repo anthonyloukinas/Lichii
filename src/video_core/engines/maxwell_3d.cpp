@@ -372,6 +372,31 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
+void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
+    // EDEN_NX2_RING_PAIRS: state writes the front would have sunk (never in execution_mask),
+    // applied as ConsumeSinkImpl applies the sink. The shadow RAM mode cannot change inside a
+    // block: shadow_ram_control is executable, and any other entry ends the block.
+    const auto control = shadow_state.shadow_ram_control;
+    const bool track = control == Regs::ShadowRamControl::Track ||
+                       control == Regs::ShadowRamControl::TrackWithFilter;
+    const bool replay = control == Regs::ShadowRamControl::Replay;
+    const bool skip_same = SkipSameValueWrites();
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(pairs[i] & 0xffff);
+        u32 value = static_cast<u32>(pairs[i] >> 32);
+        if (track) {
+            shadow_state.reg_array[method] = value;
+        } else if (replay) {
+            value = shadow_state.reg_array[method];
+        }
+        if (!skip_same || regs.reg_array[method] != value) {
+            ProcessDirtyRegisters(method, value);
+        } else if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
+            VideoCommon::Nx2DrawRuns::OnWrite(method, false, false);
+        }
+    }
+}
+
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     // The instances after the first are drawn together once their loop ends, and they must see
     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
@@ -1262,6 +1287,9 @@ struct Maxwell3D::FrontState {
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
+    /// The back holds state writes in its method sink, which its next executable method consumes
+    /// (issuing a deferred draw a changed one ends). Front starts once the sink is consumed.
+    bool sink_pending{};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
 };
 
@@ -1376,6 +1404,18 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         fs.regs[method] = value;
     } else {
+        // Draw macros write these for every instance (~500,000 same values a second in Ocarina of
+        // Time). They only store the value, so an unchanged one is the same as a state write.
+        // topology_override is not part of an instance loop: any write to it ends a deferred draw.
+        // Kept while state writes wait in the back's sink: it would consume them before the next
+        // engine's work.
+        if (IsStoreOnlyExecutable(method) && DrawManager::IsInstanceLoopMethod(method) &&
+            fs.regs[method] == value && shadow_kept && fs.skip_same && !fs.sink_pending) {
+            if (Profile::Enabled()) {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+            return;
+        }
         fs.regs[method] = value;
         // Where the write changes memory, before the constant buffer offset moves past it.
         if (memory_write_mask[method] && VideoCommon::GpuSplit::RangedWrites()) {
@@ -1417,10 +1457,28 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         }
     }
-    if (from_macro) {
+    if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
+        // Direct writes consume the sink first.
         split.MacroWrite(this, method, argument, range_count != 0);
+        fs.sink_pending = false;
     } else {
-        split.Method(this, method, argument, is_last_call, nullptr, range_count != 0);
+        // EDEN_NX2_MACRO_SINK: a macro's state write goes to the back's method sink as the
+        // command list's own do; the back applies the sink in order (shadow RAM and same-value
+        // skip as CallMethod) before the next executable or Direct write and in
+        // FinishFrontMacro, so the order against executable writes and deferred draws is kept.
+        // EDEN_NX2_RING_PAIRS: the same writes as pairs, applied the same way (ApplyPairs) when
+        // the back reaches them, which is never later than the sink would. The back consumes
+        // its sink before a block, so nothing waits in it afterwards.
+        if (!execution_mask[method] && VideoCommon::GpuSplit::RingPairs()) {
+            split.PairWrite(this, method, argument);
+            fs.sink_pending = false;
+        } else {
+            split.Method(this, method, argument, is_last_call, nullptr, range_count != 0);
+            fs.sink_pending = !execution_mask[method];
+        }
+        if (from_macro) {
+            split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
+        }
     }
     for (u32 i = 0; i < range_count; ++i) {
         split.NoteRangedWrite(ranges[i].address, ranges[i].size);
@@ -1607,6 +1665,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr,
                       range_count != 0);
+    fs.sink_pending = false; // The back consumes the sink before a run.
     for (u32 i = 0; i < range_count; ++i) {
         split.NoteRangedWrite(ranges[i].address, ranges[i].size);
     }
@@ -2008,9 +2067,21 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
                                ? shadow_state.reg_array[method]
                                : value;
     }
+    // EDEN_NX2_MACRO_SINK sinks macro writes too: in a tracking mode their shadow RAM copies are
+    // written only when the sink is applied, so they count as done for the shadow check as well
+    // (else the check would "resynchronize" the front's shadow to older values).
+    std::array<u32, Regs::NUM_REGS> expected_shadow;
+    std::memcpy(expected_shadow.data(), shadow_state.reg_array.data(), sizeof(expected_shadow));
+    if (VideoCommon::GpuSplit::MacroSink() &&
+        (shadow_state.shadow_ram_control == Regs::ShadowRamControl::Track ||
+         shadow_state.shadow_ram_control == Regs::ShadowRamControl::TrackWithFilter)) {
+        for (const auto& [method, value] : method_sink) {
+            expected_shadow[method] = value;
+        }
+    }
     static u64 control_differences{};
     if ((fs.control != shadow_state.shadow_ram_control ||
-         fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != shadow_state.reg_array[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
+         fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected_shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
          fs.regs[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected[MAXWELL3D_REG_INDEX(shadow_ram_control)]) &&
         control_differences < 4) {
         LOG_WARNING(HW_GPU, "Split shadow RAM control writes, front ({} total) / back ({} total):",
@@ -2040,12 +2111,12 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
         fs.control = shadow_state.shadow_ram_control;
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
-        if (fs.shadow[i] != shadow_state.reg_array[i]) {
+        if (fs.shadow[i] != expected_shadow[i]) {
             if (control_differences++ < 16) {
                 LOG_WARNING(HW_GPU, "Split front shadow register {:#x}: front {:#x}, back {:#x}", i,
-                            fs.shadow[i], shadow_state.reg_array[i]);
+                            fs.shadow[i], expected_shadow[i]);
             }
-            fs.shadow[i] = shadow_state.reg_array[i];
+            fs.shadow[i] = expected_shadow[i];
         }
     }
     if ((checks & 63) == 1) {

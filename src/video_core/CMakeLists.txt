@@ -112,6 +112,7 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    page_filter.h
     native_qmd.h
     native_query_trace.h
     nx2.h
@@ -172,6 +173,8 @@ add_library(video_core STATIC
     renderer_vulkan/blit_image.h
     renderer_vulkan/fixed_pipeline_state.cpp
     renderer_vulkan/fixed_pipeline_state.h
+    renderer_vulkan/pipeline_clean_watch.cpp
+    renderer_vulkan/pipeline_clean_watch.h
     renderer_vulkan/framebuffer_clear_layers.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h

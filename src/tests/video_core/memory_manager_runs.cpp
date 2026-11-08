@@ -4,12 +4,15 @@
 #include <exception>
 #include <limits>
 #include <random>
+#include <utility>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "tests/core/system_test_context.h"
+#include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -17,6 +20,8 @@ namespace {
 
 class NullRasterizer final : public VideoCore::RasterizerInterface {
 public:
+    std::vector<std::pair<GPUVAddr, u64>> modified;
+
     void Draw(bool, u32) override {}
     void DrawTexture() override {}
     void Clear(u32) override {}
@@ -46,7 +51,9 @@ public:
     }
     void InvalidateGPUCache() override {}
     void UnmapMemory(DAddr, u64) override {}
-    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr addr, u64 size) override {
+        modified.emplace_back(addr, size);
+    }
     void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
     void WaitForIdle() override {}
     void FragmentBarrier() override {}
@@ -189,4 +196,36 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
         check(address_space_end - back, back);
         check(address_space_end - back, back + 1);
     }
+}
+
+TEST_CASE("Remapping mapped pages changes the map serial, not the caches' notifications",
+          "[memory_manager][virtual_range_cache]") {
+    const bool big = GENERATE(false, true);
+    CAPTURE(big);
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31, 16};
+    memory.BindRasterizer(&rasterizer);
+    const u64 page = big ? 1ULL << 16 : 0x1000;
+    constexpr GPUVAddr window = 0x4000'0000;
+
+    memory.Map(window, 0x1000'0000, 4 * page, Tegra::PTEKind::PITCH, big);
+    REQUIRE_FALSE(rasterizer.modified.empty());
+    VideoCommon::VirtualRangeCache cache;
+    REQUIRE(cache.Query(memory, window, static_cast<u32>(4 * page))->size() == 1);
+
+    // A mapped page mapped again to other device memory (nvhost_as_gpu replaces sparse mappings
+    // so): no ModifyGPUMemory, so no cache Unmap. Only the serial tells.
+    const u64 serial = memory.MapSerial();
+    const size_t notified = rasterizer.modified.size();
+    memory.Map(window + page, 0x2000'0000, page, Tegra::PTEKind::PITCH, big);
+    REQUIRE(memory.MapSerial() != serial);
+    REQUIRE(rasterizer.modified.size() == notified);
+    REQUIRE(cache.Query(memory, window, static_cast<u32>(2 * page))->size() == 2);
+    const auto* segments = cache.Query(memory, window, static_cast<u32>(4 * page));
+    REQUIRE(segments->size() == 3);
+    REQUIRE((*segments)[1].device_addr == 0x2000'0000);
 }

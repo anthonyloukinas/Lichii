@@ -33,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_clean_watch.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -113,6 +114,11 @@ struct ShaderPools {
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
+    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
+    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
+    std::vector<u64> mapped_pointers;
+    u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -148,6 +154,28 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    /// The registers Refresh reads with these features, as (first word, words) ranges.
+    void BuildCleanWatch();
+    [[nodiscard]] bool CleanInputsUnchanged() const;
+    void TakeCleanSnapshot();
+    /// EDEN_NX2_PERF_VERIFY: whether Refresh would keep the key a clean hit keeps.
+    [[nodiscard]] bool CleanHitVerified();
+
+    struct CleanLookup {
+        using Range = CleanWatchRange;
+        bool built{};
+        std::vector<Range> ranges;     ///< Read by every Refresh
+        std::vector<Range> xfb_ranges; ///< Read while transform feedback is enabled
+        std::vector<u32> snapshot;     ///< ranges' words at the last Refresh
+        std::vector<u32> xfb_snapshot;
+        std::array<u64, 6> hashes{};   ///< graphics_key.unique_hashes at the last Refresh
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        Maxwell::PrimitiveTopology topology{};
+        Tegra::Engines::Maxwell3D::EngineHint engine_state{};
+        /// current_pipeline when its key was graphics_key after the last Refresh, else null.
+        GraphicsPipeline* pipeline{};
+    } clean; ///< CurrentGraphicsPipeline skips Refresh while nothing it reads changed
+
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
@@ -160,8 +188,13 @@ private:
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
 
+    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
+
+    /// Translates the current compute program, binding the pointers in keep_pointers whatever
+    /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
-                                                     const ShaderInfo* shader);
+                                                    const ShaderInfo* shader,
+                                                    std::span<const u64> keep_pointers = {});
 
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
@@ -202,6 +235,9 @@ private:
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
+    /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with
+    /// them (tick, pipeline)
+    std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;

@@ -1141,10 +1141,20 @@ template <class P>
 bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
+    // A deferred clear parked before this copy has to land before it: realizing it afterwards
+    // starts its clear pass after the copy and wipes what the copy wrote. That is what made
+    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
+    // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
+    // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
+    // second frame. Texture cache copies bypass render passes and keep stream order here.
+    // Only when the copy proceeds: a rejected blit writes nothing and must not realize the
+    // clear ahead of the next draw that consumes it as its load-op. GetBlitImages cannot
+    // invalidate the parked clear: framebuffer removal flushes first (RemoveFramebuffers).
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
         return false;
     }
+    runtime.FlushDeferredClear();
     const BlitImages images = *result;
     const ImageId dst_id = images.dst_id;
     const ImageId src_id = images.src_id;
@@ -3116,6 +3126,11 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
 template <class P>
 std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                      bool mark_as_modified) {
+    // As in BlitImage: land a parked deferred clear before the DMA write, but only when the
+    // write happens (mark_as_modified); a read-only access writes nothing.
+    if (mark_as_modified) {
+        runtime.FlushDeferredClear();
+    }
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
@@ -3428,6 +3443,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     if (False(image.flags & ImageFlagBits::Sparse)) {
         auto map_id =
             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
+        page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
                        [this, map_id](u64 page) { page_table[page].push_back(map_id); });
         image.map_view_id = map_id;
@@ -3437,6 +3453,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ForEachSparseSegment(
         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
+            page_filter.Mark(cpu_addr, size);
             ForEachCPUPage(cpu_addr, size,
                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
             sparse_maps.push_back(map_id);
@@ -3877,6 +3894,8 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         // same guest data, which is uploaded from guest memory instead.
         return;
     }
+    // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
+    runtime.FlushDeferredClear();
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));

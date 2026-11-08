@@ -38,11 +38,13 @@ void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
 }
 
 VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
+    const auto type = ContentRecordType::Program;
     if (!updatable) {
+        // A NUP's ReadRomFS already layers the LayeredFS mods over its merged tree
+        // (AppLoader_NUP::romfs_mod_layers); layering them here again would apply them twice.
         return file;
     }
 
-    const auto type = ContentRecordType::Program;
     const auto nca = content_provider.GetEntry(current_process_title_id, type);
     const PatchManager patch_manager{current_process_title_id, filesystem_controller,
                                      content_provider};

@@ -23,6 +23,7 @@
 #include "common/alignment.h"
 #include "common/logging.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -105,6 +106,11 @@ struct StorageInfo {
     bool untracked_writes{};
     /// Native accesses whose candidates include slots of a dynamically indexed pointer array.
     std::unordered_set<const IR::Inst*> native_dynamic;
+    /// Paired accesses bind the loaded pointers that compete with their pair; cleared when those
+    /// leave too few bindings.
+    bool bind_competing_loaded{true};
+    /// A paired access bound the loaded pointers that compete with its pair.
+    bool competing_loaded_bound{};
     /// Pointer table entries reached through a phi or select of table pointers, or through a
     /// table pointer read from a dynamically indexed constant buffer array. They are bound only
     /// in the bindings the program's other storage buffers leave free (table_budget).
@@ -112,6 +118,9 @@ struct StorageInfo {
     bool tables_seen{};
     size_t table_budget{};
     size_t table_used{};
+    /// The storage buffers the pass without table entries bound; bound again, they take nothing
+    /// from table_budget, which they were left out of.
+    StorageBufferSet counted;
     small_vector<StorageBufferAddr, 8> table_candidates;
 };
 
@@ -169,6 +178,24 @@ bool IsGlobalMemory(const IR::Inst& inst) {
     case IR::Opcode::GlobalAtomicMinF32x2:
     case IR::Opcode::GlobalAtomicMaxF16x2:
     case IR::Opcode::GlobalAtomicMaxF32x2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Returns true when the backend can pick a global access's buffer among the bound ones at run time
+bool IsRuntimeRoutable(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadGlobal32:
+    case IR::Opcode::LoadGlobal64:
+    case IR::Opcode::LoadGlobal128:
+    case IR::Opcode::WriteGlobal32:
+    case IR::Opcode::WriteGlobal64:
+    case IR::Opcode::WriteGlobal128:
+    case IR::Opcode::GlobalAtomicIAdd32:
+    case IR::Opcode::GlobalAtomicUMax32:
+    case IR::Opcode::GlobalAtomicCompareExchange32:
         return true;
     default:
         return false;
@@ -1197,12 +1224,53 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
     }
 }
 
+/// Whether NativePointerCandidates can find a pointer loaded from memory for this low address: it
+/// reaches a 64-bit global load along the same instructions, without asking the environment. Keep
+/// its operand following in step with NativePointerCandidates.
+bool ReachesLoadedPointer(const IR::U32& low_addr) {
+    small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
+    std::unordered_set<const IR::Inst*> visited{pending.front()};
+    const auto enqueue = [&](const IR::Value& value) {
+        if (!value.IsImmediate() && visited.insert(value.InstRecursive()).second) {
+            pending.push_back(value.InstRecursive());
+        }
+    };
+    for (size_t next = 0; next < pending.size(); ++next) {
+        const IR::Inst* const inst{pending[next]};
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::LoadGlobal64:
+            return true;
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::Phi:
+            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                enqueue(inst->Arg(arg));
+            }
+            break;
+        case IR::Opcode::SelectU32:
+            enqueue(inst->Arg(1));
+            enqueue(inst->Arg(2));
+            break;
+        case IR::Opcode::ShuffleIndex:
+            enqueue(inst->Arg(0));
+            break;
+        case IR::Opcode::CompositeExtractU32x2:
+            if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                enqueue(inst->Arg(0));
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
 /// Native programs: every constant buffer pointer the low address can come from, following only
 /// additions, selects and phis. A predicated address assignment becomes a phi whose other input
 /// can point into a different buffer, so the search does not stop at the first pointer. A pointer
 /// read from an array at a dynamic offset contributes every mapped slot of the array (or, with
 /// EDEN_NX2_DYN_CBUF_POINTERS=1, every pointer slot of its constant buffer that the offset can
-/// reach, in NativeCandidates::dynamic).
+/// reach, in NativeCandidates::dynamic). ReachesLoadedPointer follows the same operands.
 NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& env, bool& dynamic,
                                          StorageInfo& info) {
     NativeCandidates result;
@@ -1701,7 +1769,14 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         !env.IsCbufStorageBufferPointer(storage_buffer->index, storage_buffer->offset)) {
         storage_buffer.reset();
     }
-    if (native && !storage_buffer && !low_addr.IsImmediate()) {
+    // A paired constant buffer pointer can be only one input of a select or phi whose other input
+    // is a pointer loaded from that buffer (Ocarina of Time's foliage unit placement records are
+    // read from c0[12] or from *c0[12]). Rebasing on the constant buffer pointer then reads the
+    // loaded path's records out of bounds, as zeros, so look for loaded pointers here as well.
+    const bool paired_found = storage_buffer.has_value();
+    // Without a loaded pointer on the way the search keeps the pair anyway; skipping it also keeps
+    // the classification queries of older pipeline cache captures (which never searched here).
+    if (native && !low_addr.IsImmediate() && (!paired_found || ReachesLoadedPointer(low_addr))) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
         if (it == info.native_candidates.end()) {
@@ -1715,22 +1790,40 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         }
         const auto& candidates{it->second.fixed};
         const auto& dynamic{it->second.dynamic};
-        if (candidates.size() > 1 || (!candidates.empty() && info.native_dynamic.contains(start)) ||
-            !dynamic.empty()) {
+        const bool has_loaded_pointer{std::ranges::any_of(
+            candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
+        if (paired_found &&
+            (!has_loaded_pointer || !info.bind_competing_loaded || !IsRuntimeRoutable(inst))) {
+            // No pointer loaded from memory competes with the paired one, or the access cannot
+            // stay global: keep the pair.
+        } else if (candidates.size() > 1 || paired_found ||
+                   (!candidates.empty() && info.native_dynamic.contains(start)) ||
+                   !dynamic.empty()) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             const bool write{IsGlobalMemoryWrite(inst)};
             bool accepted{};
+            if (paired_found) {
+                // The paired pointer is the other input of the select or phi; bind it too.
+                info.competing_loaded_bound = true;
+                info.set.insert(*storage_buffer);
+                if (write) {
+                    info.writes.insert(*storage_buffer);
+                    info.unbounded_writes.insert(*storage_buffer);
+                }
+            }
             for (const StorageBufferAddr& candidate : candidates) {
                 if (std::ranges::find(info.table_candidates, candidate) !=
                     info.table_candidates.end()) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
+                    const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
+                        return info.set.find(buffer) == info.set.end() &&
+                               !info.counted.contains(buffer);
+                    };
                     const size_t added{
-                        (info.set.find(candidate) == info.set.end() ? 1U : 0U) +
-                        (candidate.indirect != ~0U && info.set.find(holder) == info.set.end()
-                             ? 1U
-                             : 0U)};
+                        (takes_binding(candidate) ? 1U : 0U) +
+                        (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
                     if (info.table_used + added > info.table_budget) {
                         continue;
                     }
@@ -1765,7 +1858,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 return true;
             }
             // Only table entries, and no free binding for them: as if none had been found.
-        } else if (candidates.size() == 1) {
+        } else if (candidates.size() == 1 && !paired_found) {
             // The one pointer the address is built from. The NVN search below only takes 16-byte
             // aligned slots, so for a pointer at an 8-byte slot it can return a dimension or stride
             // the address arithmetic reads instead, and the access then lands in the wrong buffer.
@@ -1871,10 +1964,15 @@ u32 StoreSize(IR::Opcode opcode) {
 /// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
 /// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
 /// bound is largest at the largest ids.
+/// An exact bound is the value itself modulo 2^32, so a negative c means the value can wrap below
+/// zero and is no bound for an unsigned operation. An inexact bound (a select, mask, shift or field
+/// extract) is only an upper bound, with c >= 0: subtracting from it or scaling a value that can
+/// wrap by it can wrap too, so those leave the value unknown.
 struct IdBound {
     s64 c{};
     std::array<u64, 6> coef{};
     u32 base{};
+    bool exact{true};
 
     bool IsConstant() const {
         return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
@@ -1965,39 +2063,57 @@ private:
         return IdBound{.c = value};
     }
 
+    static std::optional<IdBound> Inexact(IdBound value) {
+        value.exact = false;
+        return value;
+    }
+
     static std::optional<IdBound> Sum(const IdBound& lhs, const IdBound& rhs) {
-        IdBound result{.c = lhs.c + rhs.c, .base = lhs.base + rhs.base};
+        // An upper bound minus a constant: the value itself can be below the constant
+        if ((!lhs.exact && rhs.c < 0) || (!rhs.exact && lhs.c < 0)) {
+            return std::nullopt;
+        }
+        IdBound result{
+            .c = lhs.c + rhs.c, .base = lhs.base + rhs.base, .exact = lhs.exact && rhs.exact};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = lhs.coef[i] + rhs.coef[i];
         }
         return Checked(result);
     }
 
-    /// Component-wise maximum: a bound of either value (ids are non-negative)
+    /// Component-wise maximum: a bound of either value (ids are non-negative). A value that can
+    /// wrap below zero is larger than any bound of the other.
     static std::optional<IdBound> Max(const IdBound& lhs, const IdBound& rhs) {
-        if (lhs.base != rhs.base) {
+        if (lhs.base != rhs.base || lhs.c < 0 || rhs.c < 0) {
             return std::nullopt;
         }
-        IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base};
+        IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base, .exact = false};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = (std::max)(lhs.coef[i], rhs.coef[i]);
         }
         return result;
     }
 
-    static std::optional<IdBound> Scale(const IdBound& value, u64 factor) {
-        if (value.base != 0 || factor >= COEF_LIMIT) {
+    /// value * factor, where an inexact factor only bounds the multiplier: then the value must not
+    /// wrap below zero
+    static std::optional<IdBound> Scale(const IdBound& value, u64 factor,
+                                        bool exact_factor = true) {
+        if (value.base != 0 || factor >= COEF_LIMIT || (!exact_factor && value.c < 0)) {
             return std::nullopt;
         }
-        IdBound result{.c = value.c * static_cast<s64>(factor)};
+        // Before multiplying: |c| is at most 2^40 and the factor below 2^32, so the product can
+        // overflow 64 bits (either sign)
+        const u64 magnitude{static_cast<u64>(value.c < 0 ? -value.c : value.c)};
+        if (magnitude != 0 && factor > static_cast<u64>(CONST_LIMIT) / magnitude) {
+            return std::nullopt;
+        }
+        IdBound result{.c = value.c * static_cast<s64>(factor),
+                       .exact = value.exact && exact_factor};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             if (value.coef[i] != 0 && factor > (COEF_LIMIT - 1) / value.coef[i]) {
                 return std::nullopt;
             }
             result.coef[i] = value.coef[i] * factor;
-        }
-        if (value.c > 0 && factor > static_cast<u64>(CONST_LIMIT / value.c)) {
-            return std::nullopt;
         }
         return Checked(result);
     }
@@ -2008,7 +2124,7 @@ private:
             return std::nullopt;
         }
         const auto up = [shift](u64 x) { return (x + (u64{1} << shift) - 1) >> shift; };
-        IdBound result{.c = static_cast<s64>(up(static_cast<u64>(value.c)))};
+        IdBound result{.c = static_cast<s64>(up(static_cast<u64>(value.c))), .exact = false};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = up(value.coef[i]);
         }
@@ -2064,7 +2180,7 @@ private:
         }
         const std::optional<IdBound> source{Evaluate(inst.Arg(0), depth + 1)};
         const std::optional<IdBound> field_max{
-            count <= 24 ? Constant((s64{1} << count) - 1) : std::nullopt};
+            count <= 24 ? Inexact(IdBound{.c = (s64{1} << count) - 1}) : std::nullopt};
         if (!source || source->base != 0 || source->c < 0) {
             return field_max;
         }
@@ -2075,7 +2191,7 @@ private:
         }
         if (offset == 0) {
             // A low field is at most the whole value
-            return source;
+            return count == 32 ? source : Inexact(*source);
         }
         if (offset >= 16) {
             // The high half of a lowered 32-bit multiplication's operand: zero while the operand
@@ -2143,7 +2259,8 @@ private:
         case IR::Opcode::ISub32: {
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
-            if (!lhs || !rhs || !rhs->IsConstant()) {
+            // Subtracting a bound of the subtrahend bounds nothing
+            if (!lhs || !rhs || !rhs->IsConstant() || !rhs->exact) {
                 return std::nullopt;
             }
             return Sum(*lhs, IdBound{.c = -rhs->c});
@@ -2155,10 +2272,10 @@ private:
                 return std::nullopt;
             }
             if (rhs->IsConstant() && rhs->c >= 0) {
-                return Scale(*lhs, static_cast<u64>(rhs->c));
+                return Scale(*lhs, static_cast<u64>(rhs->c), rhs->exact);
             }
             if (lhs->IsConstant() && lhs->c >= 0) {
-                return Scale(*rhs, static_cast<u64>(lhs->c));
+                return Scale(*rhs, static_cast<u64>(lhs->c), lhs->exact);
             }
             return std::nullopt;
         }
@@ -2185,12 +2302,12 @@ private:
             }};
             for (const auto* side : {&rhs, &lhs}) {
                 if (usable(*side) && (*side)->IsConstant() && (*side)->c <= 0xffffff) {
-                    return *side;
+                    return Inexact(**side);
                 }
             }
             for (const auto* side : {&lhs, &rhs}) {
                 if (usable(*side)) {
-                    return *side;
+                    return Inexact(**side);
                 }
             }
             return std::nullopt;
@@ -2204,14 +2321,15 @@ private:
             if (!lhs || !rhs || lhs->base != 0 || rhs->base != 0 || lhs->c < 0 || rhs->c < 0) {
                 return std::nullopt;
             }
-            return Sum(*lhs, *rhs);
+            const auto sum{Sum(*lhs, *rhs)};
+            return sum ? Inexact(*sum) : std::nullopt;
         }
         case IR::Opcode::UMin32: {
             const auto lhs{arg(0)};
             const auto rhs{arg(1)};
             for (const auto* side : {&rhs, &lhs}) {
                 if (*side && (*side)->base == 0 && (*side)->c >= 0) {
-                    return *side;
+                    return Inexact(**side);
                 }
             }
             return std::nullopt;
@@ -2231,7 +2349,8 @@ private:
                 return std::nullopt;
             }
             const auto shifted{Scale(*insert, u64{1} << inst.Arg(2).U32())};
-            return shifted ? Sum(*base_value, *shifted) : std::nullopt;
+            const auto sum{shifted ? Sum(*base_value, *shifted) : std::nullopt};
+            return sum ? Inexact(*sum) : std::nullopt;
         }
         case IR::Opcode::SelectU32: {
             const auto lhs{arg(1)};
@@ -2399,8 +2518,11 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!has_global_memory) {
         return;
     }
+    const size_t max_ssbos{StorageBufferLimit(host_info)};
     TrackingConditions conditions{program};
     StorageInfo info;
+    // Without 64-bit integers the backend cannot route global accesses among bound buffers.
+    info.bind_competing_loaded = host_info.support_int64;
     info.iterator_words = CollectIteratorWords(program);
     info.atomic_pointers = CollectAtomicPointers(program);
     const auto collect = [&] {
@@ -2416,20 +2538,41 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     };
     collect();
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
+    if (info.competing_loaded_bound && info.set.size() > max_ssbos) {
+        // Not enough bindings for the loaded pointers that compete with paired ones: keep the
+        // pairs, as if no loaded pointer competed.
+        StorageInfo paired;
+        paired.iterator_words = std::move(info.iterator_words);
+        paired.atomic_pointers = std::move(info.atomic_pointers);
+        paired.bind_competing_loaded = false;
+        info = std::move(paired);
+        collect();
+    }
+    if (info.tables_seen && info.set.size() < max_ssbos) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
-        with_tables.iterator_words = std::move(info.iterator_words);
-        with_tables.atomic_pointers = std::move(info.atomic_pointers);
+        with_tables.iterator_words = info.iterator_words;
+        with_tables.atomic_pointers = info.atomic_pointers;
+        with_tables.bind_competing_loaded = info.bind_competing_loaded;
         with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
-        info = std::move(with_tables);
+        with_tables.table_budget = max_ssbos - info.set.size();
+        with_tables.counted = info.set;
+        std::swap(info, with_tables);
         collect();
+        if (info.set.size() > max_ssbos) {
+            // Never more storage buffers than a stage binds: without the table entries, then.
+            info = std::move(with_tables);
+        }
+    }
+    if (info.set.size() > max_ssbos) {
+        // Binding only some of them would drop the accesses through the others.
+        throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                      info.set.size(), max_ssbos);
     }
     if (!info.dynamic_set.empty()) {
         // A pointer slot over the limit stays unbound: accesses through it are dropped, as they
         // were before these slots were bound at all.
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(max_ssbos,
                                             host_info.max_descriptor_set_storage_buffers)};
         for (const StorageBufferAddr& slot : info.dynamic_set) {
             if (!info.set.contains(slot) && info.set.size() >= limit) {
@@ -2458,7 +2601,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         // as the storage buffer limit and MAX_NATIVE_INDIRECT_BINDINGS allow. The dispatch binds
         // the distinct targets of the first records that have one.
         auto& stats{info.stats};
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(max_ssbos,
                                             host_info.max_descriptor_set_storage_buffers)};
         const size_t room{limit > info.set.size() ? limit - info.set.size() : 0};
         const size_t slots{std::min(info.indirect_slots.size(), Info::MAX_NATIVE_INDIRECT_SLOTS)};
@@ -2485,9 +2628,11 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     }
     program.info.native_global_bounds |= info.native_runtime_bounds;
     program.info.native_global_stats = info.stats;
-    // Store extents, before the accesses are rebased (the analysis reads the guest addresses)
+    // Store extents, before the accesses are rebased (the analysis reads the guest addresses).
+    // None while a store stays global: the backend routes it to the descriptor whose pointer is the
+    // closest one at or below the address, which need not be one of the store's candidates.
     std::map<StorageBufferAddr, StorageWriteExtent> extents;
-    if (!info.untracked_writes) {
+    if (!info.untracked_writes && info.unbounded_writes.empty()) {
         std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
         for (const StorageInst& storage_inst : info.to_replace) {
             if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
@@ -2584,7 +2729,18 @@ bool NativeIndirectGraphicsPointers() {
     return enabled;
 }
 
-void JoinStorageInfo(Info& base, Info& source) {
+size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
+    size_t limit{Info::MAX_SSBOS};
+    for (const u32 device_limit : {host_info.max_per_stage_descriptor_storage_buffers,
+                                   host_info.max_descriptor_set_storage_buffers}) {
+        if (device_limit != 0) {
+            limit = (std::min)(limit, size_t{device_limit});
+        }
+    }
+    return limit;
+}
+
+void JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
     {
@@ -2625,6 +2781,10 @@ void JoinStorageInfo(Info& base, Info& source) {
             }
             it->is_written |= desc.is_written;
             continue;
+        }
+        if (descriptors.size() >= limit) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descriptors.size() + 1, limit);
         }
         descriptors.push_back(desc);
     }

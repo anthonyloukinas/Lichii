@@ -3320,6 +3320,8 @@ private:
 
     void ConsumeSinkImpl(Core::System& system) override;
 
+    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
+
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
     /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
@@ -3344,12 +3346,13 @@ private:
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
     static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+        return skip_same_value_writes;
     }
+    /// Read once at startup: state writes check it one by one (no guard to check).
+    static inline const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
 
     /// Handles writes to the macro uploading register.
     void ProcessMacroUpload(u32 data);

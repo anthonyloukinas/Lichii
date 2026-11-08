@@ -35,7 +35,10 @@ namespace {
 //    were translated with every table slot taken as a pointer).
 // 6: stored SPIR-V changed: upstream nx2 #408 DontInline global memory helpers and unrolled
 //    software HMMA. Not the pipeline cache version (#408's 54 also covers its vertex keys).
-constexpr u32 FormatVersion = 6;
+// 7: stored SPIR-V changed: upstream nx2 #410 binds loaded pointers that compete with a paired
+//    constant buffer pointer, #398 lowers second-descriptor gathers to TLD4.B.
+// 8: native programs bind up to 64 storage buffers (upstream #421/#434 part).
+constexpr u32 FormatVersion = 8;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -134,7 +137,7 @@ constexpr size_t InfoFields = 88;
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
 constexpr size_t ProfileFields = 76;
 
-constexpr size_t HostFields = 22;
+constexpr size_t HostFields = 23;
 constexpr size_t RuntimeInfoFields = 19;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
@@ -347,6 +350,14 @@ u32 RecordingEnvironment::TranslateProgramAddress(u32 address) const {
     return inner.TranslateProgramAddress(address);
 }
 
+std::vector<std::pair<u32, u32>> RecordingEnvironment::NullStoragePointerSlots() const {
+    return inner.NullStoragePointerSlots();
+}
+
+std::vector<u64> RecordingEnvironment::MappedStoragePointerKeys() const {
+    return inner.MappedStoragePointerKeys();
+}
+
 bool RecordingEnvironment::IsNativeProgram() const {
     return inner.IsNativeProgram();
 }
@@ -511,6 +522,7 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(host_info.min_ssbo_alignment);
     hasher.Add(host_info.max_per_stage_descriptor_sampled_images);
     hasher.Add(host_info.max_per_stage_resources);
+    hasher.Add(host_info.max_per_stage_descriptor_storage_buffers);
     hasher.Add(host_info.max_descriptor_set_samplers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers_dynamic);

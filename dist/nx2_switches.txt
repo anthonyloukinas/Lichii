@@ -4,6 +4,9 @@
 # Between files, the user copy (%APPDATA%\eden\nx2_switches.txt, or
 # $XDG_CONFIG_HOME/eden/nx2_switches.txt) wins over this one, so editing this file is never
 # needed: copy the lines you want into your own and restart.
+# Beside-application files accept EDEN_NX2_* and the emulator's diagnostic switches only.
+# Host environment settings, including library paths such as EDEN_STREAMLINE_DIR, must be
+# set in the real environment or the user configuration file at an absolute config location.
 #
 # Restart the emulator after editing.
 
@@ -82,6 +85,16 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_FAST_DRAW_COMPUTED=1
 #EDEN_NX2_FAST_DRAW_HANDLE_DATA=1
 #EDEN_NX2_FAST_DRAW_VERTEX_INPUT=1
+
+# Split GPU thread batching from upstream #166, on by default (=0 turns each off). MACRO_SINK:
+# the front's 3D macro state writes go to the back's method sink instead of one call each.
+# COMPUTE_SINK: native compute writes that only store a value are batched the same way, and
+# dropped when the back holds the value already. RING_PAIRS: the writes that would go to the sink
+# travel as blocks of (method, value) pairs applied in one loop. They pay together (the macro
+# writes are what RING_PAIRS packs); EDEN_NX2_SPLIT_VERIFY=1 checks them.
+#EDEN_NX2_MACRO_SINK=0
+#EDEN_NX2_COMPUTE_SINK=0
+#EDEN_NX2_RING_PAIRS=0
 
 # Diagnostic (compile anatomy): =1 logs, at every compute and graphics pipeline create, the
 # driver's creation feedback (duration, cache hit, base pipeline acceleration; per pipeline and per
