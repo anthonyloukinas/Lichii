@@ -2305,10 +2305,16 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 .count());
         LogUntrackedGlobal(key.unique_hash, Shader::Stage::Compute, variant->info);
         Common::ThreadWorker* const cached_worker{build_in_parallel ? &workers : nullptr};
+        // FindEntry replayed the entry's queries against env, so env holds the pointer answers
+        // this translation was made with: a slot it found null is rebuilt like a fresh one.
         return {.pipeline = std::make_unique<ComputePipeline>(
                     device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                     guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
-                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash)};
+                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash),
+                .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                            : std::vector<std::pair<u32, u32>>{},
+                .mapped_pointers =
+                    env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
     }
     std::optional<TC::RecordingEnvironment> recording;
     if (cacheable && !entry) {
