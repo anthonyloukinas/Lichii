@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -113,6 +114,12 @@ struct ShaderPools {
 
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
+    /// A stale-slot rebuild whose driver compile is still running on a worker; `pipeline` keeps
+    /// dispatching until it is built
+    std::unique_ptr<ComputePipeline> pending;
+    /// The capture of `pending`, appended as the replacement record once it built
+    std::optional<VideoCommon::ComputeEnvironment> pending_capture;
+    std::chrono::steady_clock::time_point pending_since{};
     std::string failure;
     /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
     std::vector<std::pair<u32, u32>> null_pointer_slots;
@@ -191,10 +198,17 @@ private:
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
     /// Translates the current compute program, binding the pointers in keep_pointers whatever
-    /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
-    ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
-                                                    const ShaderInfo* shader,
-                                                    std::span<const u64> keep_pointers = {});
+    /// their slots hold now (see GenericEnvironment::KeepStoragePointers). With capture, the
+    /// environment is handed back there for AppendComputeRebuild instead of being stored.
+    ComputePipelineCacheEntry CreateComputePipeline(
+        const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+        std::span<const u64> keep_pointers = {},
+        std::optional<VideoCommon::ComputeEnvironment>* capture = nullptr);
+
+    /// Appends a stale-slot rebuild as the replacement of the key's stored capture (built_live:
+    /// see QueueComputeSerialization).
+    void AppendComputeRebuild(const ComputePipelineCacheKey& key,
+                              VideoCommon::ComputeEnvironment&& env, bool built_live);
 
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
@@ -277,11 +291,13 @@ private:
         const GraphicsPipelineCacheKey& key,
         VideoCommon::DiskPipelineRecords<GraphicsPipelineCacheKey>::Write write,
         decltype(GraphicsEnvironments::envs)&& envs);
-    /// The same for a compute capture.
+    /// The same for a compute capture. built_live: a live build of this capture was compiled by
+    /// the driver already, so a replacement is checked by replaying its translation, not by
+    /// compiling it again.
     void QueueComputeSerialization(
         const ComputePipelineCacheKey& key,
         VideoCommon::DiskPipelineRecords<ComputePipelineCacheKey>::Write write,
-        VideoCommon::ComputeEnvironment&& env);
+        VideoCommon::ComputeEnvironment&& env, bool built_live = false);
 
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;

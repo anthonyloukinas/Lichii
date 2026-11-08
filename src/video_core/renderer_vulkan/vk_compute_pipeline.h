@@ -90,6 +90,11 @@ public:
         return build_task_done.load(std::memory_order::acquire);
     }
 
+    /// Whether the driver create has run (bound or rejected)
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order::acquire);
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first: the pipeline worker it was
     /// queued on, the Vulkan scheduler thread of the first dispatch that needs it, or the creating

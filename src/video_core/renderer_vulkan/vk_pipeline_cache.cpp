@@ -1153,21 +1153,59 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
-    if (is_new) {
-        entry = CreateComputePipeline(key, shader);
-    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-               StaleNullPointerSlot(entry)) {
-        // The translation dropped accesses through a pointer that was null back then. Which slots
-        // the game fills depends on the area, so the new one keeps binding every pointer this one
-        // binds, null now or not: a null pointer binds nothing.
-        // The stored capture is stale: the rebuild is appended as its replacement, the record a
-        // later boot loads.
-        disk_compute.NoteFailed(key);
-        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
-        if (rebuilt.pipeline) {
+    if (entry.pending && entry.pending->IsBuilt()) {
+        if (entry.pending->IsBound()) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(entry.pipeline));
+            }
+            entry.pipeline = std::move(entry.pending);
+            LOG_INFO(Render_Vulkan, "Compute shader {:016x}: rebuild swapped in after {:.1f} ms",
+                     key.unique_hash,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               entry.pending_since)
+                         .count());
+            if (entry.pending_capture) {
+                AppendComputeRebuild(key, std::move(*entry.pending_capture), true);
+            }
+        } else {
+            LOG_WARNING(Render_Vulkan,
+                        "Keeping compute shader {:016x}: the driver rejected its rebuild",
+                        key.unique_hash);
+            retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                   std::move(entry.pending));
+            entry.rebuilds = MaxComputeRebuilds;
+        }
+        entry.pending_capture.reset();
+    }
+    if (is_new) {
+        entry = CreateComputePipeline(key, shader);
+    } else if (!entry.pending && !entry.null_pointer_slots.empty() &&
+               entry.rebuilds < MaxComputeRebuilds && StaleNullPointerSlot(entry)) {
+        // The translation dropped accesses through a pointer that was null back then. Which slots
+        // the game fills depends on the area, so the new one keeps binding every pointer this one
+        // binds, null now or not: a null pointer binds nothing.
+        std::optional<ComputeEnvironment> capture;
+        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers, &capture)};
+        if (rebuilt.pipeline && entry.pipeline && !rebuilt.pipeline->IsBuilt()) {
+            // As Eglantine 3eb64cb1ed (compute_rebuild_async): the old pipeline keeps dispatching
+            // while the driver compiles the new one on a worker, instead of the scheduler thread
+            // waiting for it; the first dispatch after the compile swaps it in.
+            entry.pending = std::move(rebuilt.pipeline);
+            entry.pending_capture = std::move(capture);
+            entry.pending_since = std::chrono::steady_clock::now();
+            entry.null_pointer_slots = std::move(rebuilt.null_pointer_slots);
+            entry.mapped_pointers = std::move(rebuilt.mapped_pointers);
+            ++entry.rebuilds;
+        } else if (rebuilt.pipeline) {
+            if (entry.pipeline) {
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.pipeline));
+            }
+            if (capture) {
+                const bool built_live =
+                    rebuilt.pipeline->IsBuilt() && rebuilt.pipeline->IsBound();
+                AppendComputeRebuild(key, std::move(*capture), built_live);
             }
             rebuilt.rebuilds = entry.rebuilds + 1;
             entry = std::move(rebuilt);
@@ -2177,9 +2215,9 @@ void PipelineCache::QueueGraphicsSerialization(
     });
 }
 
-ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
-                                                               const ShaderInfo* shader,
-                                                               std::span<const u64> keep_pointers) {
+ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
+    const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+    std::span<const u64> keep_pointers, std::optional<ComputeEnvironment>* capture) {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         ReportRuntimePipeline("Compute", begin,
@@ -2211,6 +2249,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     if (!entry.pipeline || pipeline_cache_filename.empty()) {
         return entry;
     }
+    if (capture) {
+        capture->emplace(std::move(env));
+        QueueVulkanPipelineCacheFlush();
+        return entry;
+    }
     using Write = decltype(disk_compute)::Write;
     decltype(disk_compute)::Writer writer = [this, key, env_ = std::move(env)](
                                                 Write write) mutable {
@@ -2229,12 +2272,24 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     return entry;
 }
 
+void PipelineCache::AppendComputeRebuild(const ComputePipelineCacheKey& key,
+                                         ComputeEnvironment&& env, bool built_live) {
+    using Write = decltype(disk_compute)::Write;
+    // The stored capture is stale: the rebuild is appended as its replacement, the record a
+    // later boot loads.
+    disk_compute.NoteFailed(key);
+    const auto write = disk_compute.ClaimWrite(key);
+    if (write == Write::New || write == Write::Replacement) {
+        QueueComputeSerialization(key, write, std::move(env), built_live);
+    }
+}
+
 void PipelineCache::QueueComputeSerialization(
     const ComputePipelineCacheKey& key,
     VideoCommon::DiskPipelineRecords<ComputePipelineCacheKey>::Write write,
-    ComputeEnvironment&& env) {
+    ComputeEnvironment&& env, bool built_live) {
     using Write = decltype(disk_compute)::Write;
-    serialization_thread.QueueWork([this, key, write, env_ = std::move(env)] {
+    serialization_thread.QueueWork([this, key, write, built_live, env_ = std::move(env)] {
         if (const char* reason = env_.NotSerializableReason()) {
             LOG_INFO(Render_Vulkan, "Pipeline not stored: compute {:016x} s6:{:016x} {}",
                      key.Hash(), key.unique_hash, reason);
@@ -2251,7 +2306,21 @@ void PipelineCache::QueueComputeSerialization(
         // The stored capture failed to build: append this one only if it builds as read back.
         const auto result = AppendCheckedPipeline(
             key, envs, pipeline_cache_filename, CACHE_VERSION,
-            [this, &key](std::span<FileEnvironment> loaded) {
+            [this, &key, built_live](std::span<FileEnvironment> loaded) {
+                namespace TC = VideoCommon::TranslationCache;
+                FileEnvironment& read_back = loaded.front();
+                if (built_live && translation_cache.Enabled() &&
+                    IsTranslationCacheable(read_back)) {
+                    // The record replays into the translation the driver just compiled live: a
+                    // later boot builds that same code, so a second compile proves nothing.
+                    const auto cached = translation_cache.FindEntry(
+                        TC::MakeStageKey(read_back, key.unique_hash, 5, translation_config),
+                        read_back);
+                    if (cached && translation_cache.FindVariant(TC::MakeVariantKey(
+                                      cached->id, TC::Digest{}, Shader::Backend::Bindings{}))) {
+                        return true;
+                    }
+                }
                 ShaderPools pools;
                 const auto candidate =
                     CreateComputePipeline(pools, key, loaded.front(), nullptr, false);
