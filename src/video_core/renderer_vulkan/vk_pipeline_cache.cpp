@@ -1154,8 +1154,10 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         entry = CreateComputePipeline(key, shader);
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
-        // The translation dropped accesses through a pointer that was null back then.
-        auto rebuilt{CreateComputePipeline(key, shader)};
+        // The translation dropped accesses through a pointer that was null back then. Which slots
+        // the game fills depends on the area, so the new one keeps binding every pointer this one
+        // binds, null now or not: a null pointer binds nothing.
+        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
@@ -1269,8 +1271,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 const bool replace =
                     it->second != runtime_entry &&
                     (current == compute_cache.end() || inserted ||
-                     entry.mapped_pointers > current->second.mapped_pointers ||
-                     (entry.mapped_pointers == current->second.mapped_pointers &&
+                     entry.mapped_pointers.size() > current->second.mapped_pointers.size() ||
+                     (entry.mapped_pointers.size() == current->second.mapped_pointers.size() &&
                       order < it->second));
                 if (replace) {
                     it->second = order;
@@ -2169,8 +2171,9 @@ void PipelineCache::QueueGraphicsSerialization(
     });
 }
 
-ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
-    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
+                                                               const ShaderInfo* shader,
+                                                               std::span<const u64> keep_pointers) {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         ReportRuntimePipeline("Compute", begin,
@@ -2184,6 +2187,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
                            shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
+    env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
     auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
@@ -2394,7 +2398,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
-            .mapped_pointers = env.MappedStoragePointerCount()};
+            .mapped_pointers =
+                env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",
