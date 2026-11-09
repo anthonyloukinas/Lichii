@@ -118,6 +118,7 @@ add_executable(tests
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp
