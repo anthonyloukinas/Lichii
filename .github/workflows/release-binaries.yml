@@ -209,7 +209,8 @@ jobs:
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$v main" |
             sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "clang-$v" "lld-$v"
+          # llvm-N brings llvm-ar and llvm-ranlib, which CMake's clang LTO rules archive with.
+          sudo apt-get install -y --no-install-recommends "clang-$v" "lld-$v" "llvm-$v"
           "clang-$v" --version
 
       # The profile is in the source tree, where both the Linux and MSYS2 configure steps read it.
