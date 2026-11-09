@@ -187,7 +187,14 @@ private:
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
-    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+    /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
+    /// pointers whatever they hold now.
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
+        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr);
+
+    /// Logs a kept pointer slot (an index of keep_pointers) that this translation would otherwise
+    /// have classified as no pointer: null, unmapped, or out of range right now.
+    void WarnKeptPointer(size_t program, u64 slot) const;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
@@ -247,6 +254,7 @@ private:
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+    VideoCommon::EvictedPointerSlots evicted_pointer_slots;
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
     /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with
