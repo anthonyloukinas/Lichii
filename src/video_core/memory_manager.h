@@ -153,6 +153,11 @@ public:
     void FlushRegion(GPUVAddr gpu_addr, size_t size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
+    /// FlushRegion with one rasterizer flush per run of contiguous device pages instead of one
+    /// per page, skipped for runs the caches in `which` hold nothing GPU-written for.
+    void FlushRegionCoalesced(GPUVAddr gpu_addr, size_t size,
+                              VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
+
     void InvalidateRegion(GPUVAddr gpu_addr, size_t size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 

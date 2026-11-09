@@ -600,6 +600,48 @@ void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
     MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
 }
 
+void MemoryManager::FlushRegionCoalesced(GPUVAddr gpu_addr, size_t size,
+                                         VideoCommon::CacheType which) const {
+    DAddr run_base = 0;
+    size_t run_size = 0;
+    const auto flush_run = [&] {
+        if (run_size == 0) {
+            return;
+        }
+        // The query cache writes reports it tracks; the buffer cache downloads GPU-written ranges.
+        if (rasterizer->MustFlushRegion(run_base, run_size, which) ||
+            (True(which & VideoCommon::CacheType::QueryCache) &&
+             rasterizer->HasCachedQueries(run_base, run_size))) {
+            rasterizer->FlushRegion(run_base, run_size, which);
+        }
+        run_size = 0;
+    };
+    const auto add = [&](DAddr dev_addr, size_t amount) {
+        if (run_size != 0 && run_base + run_size == dev_addr) {
+            run_size += amount;
+            return;
+        }
+        flush_run();
+        run_base = dev_addr;
+        run_size = amount;
+    };
+    auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
+                          [[maybe_unused]] std::size_t offset,
+                          [[maybe_unused]] std::size_t copy_amount) {};
+    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        add((DAddr(page_table[page_index]) << cpu_page_bits) + offset, copy_amount);
+    };
+    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        add((DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset, copy_amount);
+    };
+    auto flush_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        GPUVAddr base = (page_index << big_page_bits) + offset;
+        MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
+    };
+    MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
+    flush_run();
+}
+
 bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
                                   VideoCommon::CacheType which) const {
     bool result = false;
