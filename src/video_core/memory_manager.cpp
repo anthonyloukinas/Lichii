@@ -600,19 +600,23 @@ void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
     MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
 }
 
-void MemoryManager::FlushRegionCoalesced(GPUVAddr gpu_addr, size_t size,
-                                         VideoCommon::CacheType which) const {
+MemoryManager::CoalescedFlush MemoryManager::FlushRegionNoTextureCacheCoalesced(
+    GPUVAddr gpu_addr, size_t size) const {
+    constexpr auto which = VideoCommon::CacheType::NoTextureCache;
+    CoalescedFlush result{};
     DAddr run_base = 0;
     size_t run_size = 0;
     const auto flush_run = [&] {
         if (run_size == 0) {
             return;
         }
-        // The query cache writes reports it tracks; the buffer cache downloads GPU-written ranges.
-        if (rasterizer->MustFlushRegion(run_base, run_size, which) ||
-            (True(which & VideoCommon::CacheType::QueryCache) &&
-             rasterizer->HasCachedQueries(run_base, run_size))) {
+        ++result.runs;
+        // The query cache writes reports it tracks; the buffer cache downloads GPU-written ranges
+        // (FlushRegion applies pending CPU writes to them first).
+        if (rasterizer->MustFlushRegion(run_base, run_size, VideoCommon::CacheType::BufferCache) ||
+            rasterizer->HasCachedQueries(run_base, run_size)) {
             rasterizer->FlushRegion(run_base, run_size, which);
+            ++result.flushed;
         }
         run_size = 0;
     };
@@ -640,6 +644,7 @@ void MemoryManager::FlushRegionCoalesced(GPUVAddr gpu_addr, size_t size,
     };
     MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
     flush_run();
+    return result;
 }
 
 bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,

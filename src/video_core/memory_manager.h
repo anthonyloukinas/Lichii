@@ -153,10 +153,15 @@ public:
     void FlushRegion(GPUVAddr gpu_addr, size_t size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
-    /// FlushRegion with one rasterizer flush per run of contiguous device pages instead of one
-    /// per page, skipped for runs the caches in `which` hold nothing GPU-written for.
-    void FlushRegionCoalesced(GPUVAddr gpu_addr, size_t size,
-                              VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
+    struct CoalescedFlush {
+        u32 runs{};    ///< Runs of contiguous device pages in the range
+        u32 flushed{}; ///< Runs with something to write back, flushed
+    };
+    /// FlushRegion(NoTextureCache) with one rasterizer flush per run of contiguous device pages
+    /// instead of one per page, skipped for runs the buffer and query caches hold nothing
+    /// GPU-written in. Buffer and query caches only: MustFlushRegion's texture check depends on
+    /// the GPU accuracy setting, FlushRegion's does not.
+    CoalescedFlush FlushRegionNoTextureCacheCoalesced(GPUVAddr gpu_addr, size_t size) const;
 
     void InvalidateRegion(GPUVAddr gpu_addr, size_t size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
