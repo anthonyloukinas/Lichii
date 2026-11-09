@@ -25,6 +25,9 @@ permissions:
 # eglantine.profdata; bump it when a refreshed profile needs a newer LLVM.
 env:
   PGO_LLVM_VERSION: "23"
+  # The Linux release row: the clang the fork's benchmarked ThinLTO builds use. Ubuntu 24.04's
+  # clang 18 rejects the tree's -mtls-dialect=gnu2 (TLS descriptors need clang 19 or newer).
+  LINUX_LLVM_VERSION: "21"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
@@ -145,7 +148,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf clang cmake g++ gcc git glslang-tools libglu1-mesa-dev lld \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
             libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
             mesa-common-dev nasm ninja-build qt6-base-private-dev \
             qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
@@ -194,19 +197,20 @@ jobs:
       # apt repo. The versioned packages are named explicitly: that repo's unversioned clang/lld
       # metapackages can lag the binaries they depend on and then resolve to nothing. lld-23 only
       # ships ld.lld under /usr/lib/llvm-23/bin, so -B points the linker search there.
-      - name: Install clang for PGO
-        if: startsWith(matrix.platform, 'linux') && matrix.pgo
+      - name: Install clang
+        if: startsWith(matrix.platform, 'linux')
         shell: bash
         run: |
           set -euo pipefail
+          v="$LINUX_LLVM_VERSION"
+          [ '${{ matrix.pgo }}' != 'true' ] || v="$PGO_LLVM_VERSION"
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
             sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$PGO_LLVM_VERSION main" |
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$v main" |
             sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            "clang-$PGO_LLVM_VERSION" "lld-$PGO_LLVM_VERSION"
-          "clang-$PGO_LLVM_VERSION" --version
+          sudo apt-get install -y --no-install-recommends "clang-$v" "lld-$v"
+          "clang-$v" --version
 
       # The profile is in the source tree, where both the Linux and MSYS2 configure steps read it.
       - name: Check PGO profile
@@ -333,9 +337,9 @@ jobs:
             # clang ThinLTO with lld, as the fork's benchmarked builds: 0.7 ms a frame faster than
             # the plain GCC Release build on the Ocarina of Time routes, same pictures.
             flags+=(
-              -DCMAKE_C_COMPILER=clang
-              -DCMAKE_CXX_COMPILER=clang++
-              -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld
+              "-DCMAKE_C_COMPILER=clang-$LINUX_LLVM_VERSION"
+              "-DCMAKE_CXX_COMPILER=clang++-$LINUX_LLVM_VERSION"
+              "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-$LINUX_LLVM_VERSION/bin -fuse-ld=lld"
               -DENABLE_LTO=ON
             )
           fi
