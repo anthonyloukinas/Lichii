@@ -647,6 +647,62 @@ MemoryManager::CoalescedFlush MemoryManager::FlushRegionNoTextureCacheCoalesced(
     return result;
 }
 
+void MemoryManager::VisitBlockUnsafe(
+    GPUVAddr gpu_addr, size_t size, Common::ScratchBuffer<u8>& scratch,
+    const std::function<bool(std::span<const u8>)>& visit) const {
+    bool stopped = false;
+    const auto zeros = [&](std::size_t amount) {
+        scratch.resize_destructive(amount);
+        std::memset(scratch.data(), 0, amount);
+        stopped = !visit({scratch.data(), amount});
+    };
+    if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
+        zeros(size);
+        return;
+    }
+    auto set_to_zero = [&]([[maybe_unused]] std::size_t page_index,
+                           [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
+        if (!stopped) {
+            zeros(copy_amount);
+        }
+    };
+    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        if (stopped) {
+            return;
+        }
+        const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+        if (const u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+            stopped = !visit({physical, copy_amount});
+        } else {
+            zeros(copy_amount);
+        }
+    };
+    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        if (stopped) {
+            return;
+        }
+        const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+        const u8* const physical = IsBigPageContinuous(page_index)
+                                       ? memory.GetPointer<u8>(dev_addr_base)
+                                       : nullptr;
+        if (physical != nullptr) [[likely]] {
+            stopped = !visit({physical, copy_amount});
+        } else {
+            scratch.resize_destructive(copy_amount);
+            memory.ReadBlockUnsafe(dev_addr_base, scratch.data(), copy_amount);
+            stopped = !visit({scratch.data(), copy_amount});
+        }
+    };
+    auto read_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        if (stopped) {
+            return;
+        }
+        GPUVAddr base = (page_index << big_page_bits) + offset;
+        MemoryOperation(base, copy_amount, false, mapped_normal, set_to_zero, set_to_zero);
+    };
+    MemoryOperation(gpu_addr, size, true, mapped_big, set_to_zero, read_short_pages);
+}
+
 bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
                                   VideoCommon::CacheType which) const {
     bool result = false;

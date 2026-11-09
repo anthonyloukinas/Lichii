@@ -146,18 +146,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
-    /// EDEN_NX2_ASTC_FAST_READ: the guest range astc_scan_buffer holds, flushed then copied by
-    /// the opaque scan, for the upload of the image JoinImages is making (empty otherwise).
-    GPUVAddr astc_scan_copy_addr{};
-    size_t astc_scan_copy_size{};
     /// EDEN_NX2_ASTC_FAST_READ counters (TC_LOG summary)
     u64 fast_read_reads{};
     u64 fast_read_bytes{};
-    u64 fast_read_reuse_hits{};
+    u64 fast_read_scans{};
+    u64 fast_read_split_scans{};
     u64 fast_read_runs{};
     u64 fast_read_flushes{};
     u64 fast_read_verified{};
     u64 fast_read_mismatches{};
+    u64 fast_read_scans_verified{};
+    u64 fast_read_scan_mismatches{};
     Common::ScratchBuffer<u8> fast_read_verify_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
@@ -472,6 +471,8 @@ private:
 
     /// EDEN_NX2_ASTC_FAST_READ's flush of a guest range before an unsafe read (counted).
     void FastReadFlush(GPUVAddr gpu_addr, size_t size);
+    /// EDEN_NX2_ASTC_FAST_READ opaque scan of guest memory in place (no copy of a split range)
+    bool AstcScanInPlace(GPUVAddr gpu_addr, size_t size);
 
     /// Create a new image view from a guest descriptor
     [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);
