@@ -334,6 +334,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     const VkExtent2D render_area = framebuffer->RenderArea();
     ++render_pass_serial;
     state.renderpass = renderpass;
+    state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
 
@@ -411,6 +412,9 @@ void Scheduler::RealizeDeferredClear() {
         dc.color_clear_mask, dc.depth_stencil, color_discard_mask, depth_stencil_discard);
     EndRenderPass();
     BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count);
+    // Without discards, the variant only clears instead of loading: its store ops, layouts and
+    // attachments are the framebuffer's own.
+    state.clear_variant = color_discard_mask == 0 && !depth_stencil_discard;
 }
 
 bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
@@ -458,8 +462,12 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
-        render_area.width == state.render_area.width &&
+    // A deferred clear's pass serves the draws after its first one too: ending it there and
+    // beginning the framebuffer's own pass stored the attachments only to load them back (about
+    // 9 render passes a frame in Ocarina of Time).
+    if (state.renderpass != VK_NULL_HANDLE &&
+        (renderpass == state.renderpass || state.clear_variant) &&
+        framebuffer_handle == state.framebuffer && render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         return;
     }
@@ -980,6 +988,7 @@ void Scheduler::EndRenderPass()
         });
 
         state.renderpass = VkRenderPass{};
+        state.clear_variant = false;
         num_renderpass_images = 0;
     }
 

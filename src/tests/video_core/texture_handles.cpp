@@ -9,6 +9,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "video_core/shader_handle_program.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -303,4 +304,28 @@ TEST_CASE("Failed Phi handle subtrees discard their cached values",
                   0x5678U + 7U + (nested ? 0x90U : 0U) + (retained_slot ? 2U * 0x90U : 0U));
         }
     }
+}
+
+TEST_CASE("A texture handle word that holds a storage buffer address is not a handle",
+          "[video_core][texture_handles]") {
+    Shader::Info info;
+    info.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x520, .count = 1, .is_written = false});
+    Shader::TextureDescriptor desc{};
+    desc.cbuf_index = 0;
+    desc.cbuf_offset = 0x520;
+    desc.count = 1;
+    desc.size_shift = 3;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x524; // the address's upper word
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x528;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x518;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 1)); // the second element
+    desc.cbuf_offset = 0x520;
+    desc.cbuf_index = 2;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_index = 0;
+    desc.handle_program = 0; // computed for each draw: a real handle
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
 }

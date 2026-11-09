@@ -223,9 +223,20 @@ public:
         PauseCounter();
         // A title that counts without resetting or reporting grows the query by a slot at every
         // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
-        // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
-        // windows span at most 36 slots). Past a bank, drop the count as a reset would.
-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
+        // Time's title screen and file select reached 16,384 slots over 64 banks, while gameplay
+        // windows in Hyrule Field, Kakariko Village, and the Shooting Gallery reach up to 346
+        // slots across two banks. Past 4 banks (1,024 slots), drop the count as a reset would.
+        static constexpr size_t MaxRunningQuerySlots = 4 * SamplesQueryBank::BANK_SIZE;
+        if (current_query && current_query->size_slots > MaxRunningQuerySlots) {
+            // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
+            // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
+            ++bank_bound_resets;
+            if ((bank_bound_resets & (bank_bound_resets - 1)) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Samples query ran {} slots with no reset or report, dropped its "
+                            "count (drop {})",
+                            current_query->size_slots, bank_bound_resets);
+            }
             ResetCounter();
         }
     }
@@ -640,6 +651,7 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
+    u64 bank_bound_resets{}; ///< Counts CloseCounter dropped once a query outgrew the bank bound.
     std::mutex flush_guard;
     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
 };
@@ -1390,6 +1402,9 @@ struct QueryCacheRuntimeImpl {
     VkConditionalRenderingBeginInfoEXT hcr_setup;
     VkBuffer hcr_buffer;
     size_t hcr_offset;
+    /// The guest bytes hcr_setup reads when they are a guest buffer's, 0 when it reads the
+    /// resolve buffer. Each resume reads them again, in the submission it is recorded in.
+    DAddr hcr_guest_address{};
     bool hcr_is_set;
     bool is_hcr_running;
 
@@ -1420,6 +1435,7 @@ void QueryCacheRuntime::EndHostConditionalRendering() {
     impl->is_hcr_running = false;
     impl->hcr_buffer = VkBuffer{};
     impl->hcr_offset = 0;
+    impl->hcr_guest_address = 0;
 }
 
 void QueryCacheRuntime::PauseHostConditionalRendering() {
@@ -1438,6 +1454,11 @@ void QueryCacheRuntime::ResumeHostConditionalRendering() {
         return;
     }
     if (!impl->is_hcr_running) {
+        if (impl->hcr_guest_address != 0) {
+            // An upload of the predicate later in this submission must run after this read.
+            std::scoped_lock lk(impl->buffer_cache.mutex);
+            impl->buffer_cache.MarkUsed(impl->hcr_guest_address, 8);
+        }
         impl->scheduler.Record([hcr_setup = impl->hcr_setup](vk::CommandBuffer cmdbuf) {
             cmdbuf.BeginConditionalRenderingEXT(hcr_setup);
         });
@@ -1468,6 +1489,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
     }
     impl->hcr_setup.buffer = impl->hcr_buffer;
     impl->hcr_setup.offset = impl->hcr_offset;
+    impl->hcr_guest_address = object.address;
     impl->hcr_setup.flags = is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
     impl->hcr_is_set = true;
     impl->is_hcr_running = false;
@@ -1497,6 +1519,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
     impl->conditional_resolve_pass->Resolve(*impl->hcr_resolve_buffer, to_resolve,
                                             to_resolve_offset, compare_to_zero);
     impl->hcr_setup.buffer = *impl->hcr_resolve_buffer;
+    impl->hcr_guest_address = 0;
     impl->hcr_setup.offset = 0;
     impl->hcr_setup.flags = is_equal ? 0 : VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
     impl->hcr_is_set = true;

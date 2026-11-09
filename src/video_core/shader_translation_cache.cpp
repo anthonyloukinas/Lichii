@@ -38,7 +38,8 @@ namespace {
 // 7: stored SPIR-V changed: upstream nx2 #410 binds loaded pointers that compete with a paired
 //    constant buffer pointer, #398 lowers second-descriptor gathers to TLD4.B.
 // 8: native programs bind up to 64 storage buffers (upstream #421/#434 part).
-constexpr u32 FormatVersion = 8;
+// 9: RuntimeInfo gains noperspective_outputs / scaled_noperspective_inputs (upstream #820).
+constexpr u32 FormatVersion = 9;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -138,7 +139,7 @@ constexpr size_t InfoFields = 88;
 constexpr size_t ProfileFields = 76;
 
 constexpr size_t HostFields = 23;
-constexpr size_t RuntimeInfoFields = 19;
+constexpr size_t RuntimeInfoFields = 21;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
 
@@ -566,6 +567,8 @@ Digest DigestRuntimeInfo(const Shader::RuntimeInfo& info) {
     hasher.Add(info.generic_input_types);
     hasher.Add(info.previous_stage_stores.mask);
     hasher.Add(info.per_primitive_generics.to_ullong());
+    hasher.Add(info.noperspective_outputs.to_ullong());
+    hasher.Add(info.scaled_noperspective_inputs);
     hasher.Add(static_cast<u64>(info.previous_stage_legacy_stores_mapping.size()));
     for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
         hasher.Add(from);

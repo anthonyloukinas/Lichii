@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <barrier>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -626,4 +630,97 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(f.bytes[0x20ff7] == 0x34);
     REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
     REQUIRE(f.bytes[0x21008] == 0x34);
+}
+
+namespace {
+/// This frame's value of 16 bytes the guest CPU writes each frame.
+constexpr std::array<u8, 16> NewGuestValue{0xcd, 0x9a, 0x15, 0x3f, 0x95, 0x02, 0x49, 0xbe,
+                                           0x4b, 0x13, 0x22, 0x41, 0x54, 0xe6, 0x40, 0x3f};
+
+/// Guest CPU writes into GPU-written memory, as Core::Memory's HandleRasterizerWrite makes them
+/// on any core: collected (GPUDirtyMemoryManager::Collect, in 64-byte blocks), then stored once
+/// no download landing under them looked at the collected writes before.
+class GuestCpuWrites {
+public:
+    explicit GuestCpuWrites(Cache& cache_) : cache{cache_} {
+        cache.SetPendingCpuWrites([this](const std::function<void(DAddr, size_t)>& callback) {
+            {
+                std::scoped_lock lock{mutex};
+                for (const auto& [address, size] : collected) {
+                    callback(address, size);
+                }
+            }
+            if (on_look) {
+                on_look(++looks);
+            }
+        });
+    }
+    ~GuestCpuWrites() {
+        cache.SetPendingCpuWrites({});
+    }
+
+    void Write(u8* guest, DAddr address, std::span<const u8> value) {
+        const DAddr first = Common::AlignDown(address, 64);
+        {
+            std::scoped_lock lock{mutex};
+            collected.emplace_back(first, Common::AlignUp(address + value.size(), 64) - first);
+        }
+        VideoCore::DownloadLanding::Await(address, value.size());
+        std::memcpy(guest, value.data(), value.size());
+    }
+
+    /// GPU::InvalidateGPUCache: the collected writes are applied.
+    void Apply() {
+        std::vector<std::pair<DAddr, u64>> applied;
+        {
+            std::scoped_lock lock{mutex};
+            applied.swap(collected);
+        }
+        cache.ClaimCpuWrites(applied);
+    }
+
+    /// Called after the buffer cache's n-th look at the collected writes.
+    std::function<void(int)> on_look;
+    int looks{};
+
+private:
+    Cache& cache;
+    std::mutex mutex;
+    std::vector<std::pair<DAddr, u64>> collected;
+};
+
+bool GuestHolds(const Fixture& f, DAddr address, std::span<const u8> value) {
+    return std::equal(value.begin(), value.end(), f.bytes + (address - 0x10000));
+}
+} // namespace
+
+TEST_CASE("Synchronous downloads keep guest writes collected while they wait for the host GPU",
+          "[buffer_ports]") {
+    Fixture f;
+    const bool mapped = GENERATE(false, true);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000, mapped);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x12);
+    GuestCpuWrites writes{*f.cache};
+    // Collected and stored while the GPU thread waits for the host GPU's copies.
+    f.runtime.before_completion = [&] {
+        f.runtime.before_completion = {};
+        writes.Write(f.bytes + 0x10100, 0x20100, NewGuestValue);
+    };
+    Access::Dirty(*f.cache, 0x20000, 0x2000);
+    const std::array<std::pair<DAddr, u64>, 1> ranges{{{0x20000, 0x2000}}};
+    Access::Download(*f.cache, ranges);
+    REQUIRE(GuestHolds(f, 0x20100, NewGuestValue));
+    REQUIRE(f.bytes[0x100ff] == 0x12);
+    REQUIRE(f.bytes[0x10140] == 0x12);
+    // The same through DownloadMemory, one buffer at a time.
+    writes.Apply();
+    f.runtime.before_completion = [&] {
+        f.runtime.before_completion = {};
+        writes.Write(f.bytes + 0x10200, 0x20200, NewGuestValue);
+    };
+    Access::Dirty(*f.cache, 0x20000, 0x2000);
+    f.cache->DownloadMemory(0x20000, 0x2000);
+    REQUIRE(GuestHolds(f, 0x20200, NewGuestValue));
+    REQUIRE(f.bytes[0x101ff] == 0x12);
+    REQUIRE(f.bytes[0x10240] == 0x12);
 }

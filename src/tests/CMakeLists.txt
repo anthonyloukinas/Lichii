@@ -8,6 +8,7 @@ add_executable(tests
     common/addon_config.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
+    video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
     video_core/gpu_timestamp.cpp
@@ -27,6 +28,7 @@ add_executable(tests
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
+    video_core/join_whole_copy.cpp
     audio_core/batch_decoder.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
@@ -138,6 +140,7 @@ add_executable(tests
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
     video_core/hot_epoch_order.cpp
+    video_core/invalidation_accumulator.cpp
     video_core/memory_manager_runs.cpp
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
@@ -154,6 +157,7 @@ add_executable(tests
     video_core/ampere_bindless_surfaces.cpp
     video_core/native_macro_fifo.cpp
     video_core/uniform_stream_reuse.cpp
+    video_core/usage_tracker.cpp
     video_core/shader_invalidation.cpp
     video_core/descriptor_table.cpp
     video_core/global_address_tracking.cpp
@@ -164,6 +168,7 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/shader_translation_cache.cpp
+    video_core/stale_pages.cpp
     input_common/calibration_configuration_job.cpp
 )
 
