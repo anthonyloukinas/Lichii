@@ -50,14 +50,14 @@ namespace VideoCommon {
 }
 
 /// EDEN_NX2_ASTC_FAST_READ=1 (experiment, default off): accelerated uploads flush their guest
-/// range once instead of page by page, and reuse the ASTC opaque scan's copy of it.
+/// range once instead of page by page, and the ASTC opaque scan reads guest memory in place.
 [[nodiscard]] inline bool AstcFastRead() {
     static const bool enabled = Nx2EnvSwitch("EDEN_NX2_ASTC_FAST_READ", false);
     return enabled;
 }
 
-/// EDEN_NX2_ASTC_FAST_READ_VERIFY=1 (diagnostic, not for timing): each fast read is compared
-/// with a safe ReadBlock of the same range made after it.
+/// EDEN_NX2_ASTC_FAST_READ_VERIFY=1 (diagnostic, not for timing): each fast read, and each
+/// in-place scan's verdict, is compared with a safe ReadBlock of the same range made after it.
 [[nodiscard]] inline bool AstcFastReadVerify() {
     static const bool enabled = Nx2EnvSwitch("EDEN_NX2_ASTC_FAST_READ_VERIFY", false);
     return enabled;
