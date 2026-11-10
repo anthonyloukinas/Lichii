@@ -39,7 +39,9 @@ namespace {
 //    constant buffer pointer, #398 lowers second-descriptor gathers to TLD4.B.
 // 8: native programs bind up to 64 storage buffers (upstream #421/#434 part).
 // 9: RuntimeInfo gains noperspective_outputs / scaled_noperspective_inputs (upstream #820).
-constexpr u32 FormatVersion = 9;
+// 11: stored SPIR-V changed: upstream #1051 saturates signed F32 to S32 F2I before the conversion
+//     (10 is taken by the #353 frag_color_components port).
+constexpr u32 FormatVersion = 11;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
