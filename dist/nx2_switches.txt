@@ -59,6 +59,14 @@ EDEN_NX2_FENCE_BATCH=1
 # and the older alias copies are skipped (Ocarina's resized shadow map). =0 makes them all again.
 #EDEN_NX2_JOIN_UPLOAD_SKIP=0
 
+# Experiment: ASTC/BCn images decoded on the GPU (cards without native ASTC) read their guest
+# data after one flush of the whole range instead of one per page, and the BC1/BC3 scan of an ASTC
+# image reads guest memory in place instead of copying it. =1 turns it on.
+#EDEN_NX2_ASTC_FAST_READ=1
+# Diagnostic for the above (slow, not for timing): compare each such read with the safe read and
+# log differences; EDEN_NX2_TC_LOG=1 adds the counts to its 600-frame summary.
+#EDEN_NX2_ASTC_FAST_READ_VERIFY=1
+
 # Diagnostic (#210): build these compute shaders unoptimized on any driver (comma-separated
 # hexadecimal hashes, or all). Shorter driver compiles, slower shaders.
 #EDEN_NX2_NOOPT_SHADERS=74ab167d83c54073,f12162b84e9cc190

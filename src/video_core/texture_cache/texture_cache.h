@@ -27,6 +27,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/clear_coverage.h"
@@ -45,6 +46,20 @@ namespace VideoCommon {
 /// EDEN_NATIVE_DRAW_DIAGNOSTICS is read once: getenv scans the whole environment block on Windows.
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
+
+/// EDEN_NX2_ASTC_FAST_READ=1 (experiment, default off): accelerated uploads flush their guest
+/// range once instead of page by page, and the ASTC opaque scan reads guest memory in place.
+[[nodiscard]] inline bool AstcFastRead() {
+    static const bool enabled = Nx2EnvSwitch("EDEN_NX2_ASTC_FAST_READ", false);
+    return enabled;
+}
+
+/// EDEN_NX2_ASTC_FAST_READ_VERIFY=1 (diagnostic, not for timing): each fast read, and each
+/// in-place scan's verdict, is compared with a safe ReadBlock of the same range made after it.
+[[nodiscard]] inline bool AstcFastReadVerify() {
+    static const bool enabled = Nx2EnvSwitch("EDEN_NX2_ASTC_FAST_READ_VERIFY", false);
     return enabled;
 }
 
@@ -509,6 +524,18 @@ void TextureCache<P>::TickFrame() {
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
+        if (AstcFastRead()) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: ASTC fast read {} reads ({} MiB); {} scans "
+                     "in place ({} split); {} device runs, {} flushed; verified {} reads, {} "
+                     "mismatched, {} scans, {} mismatched",
+                     fast_read_reads, fast_read_bytes >> 20, fast_read_scans,
+                     fast_read_split_scans, fast_read_runs, fast_read_flushes, fast_read_verified,
+                     fast_read_mismatches, fast_read_scans_verified, fast_read_scan_mismatches);
+            fast_read_reads = fast_read_bytes = fast_read_scans = fast_read_split_scans = 0;
+            fast_read_runs = fast_read_flushes = fast_read_verified = fast_read_mismatches = 0;
+            fast_read_scans_verified = fast_read_scan_mismatches = 0;
+        }
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
@@ -2234,9 +2261,9 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
         for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
-            gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
-                                  mapped_span.data() + layer * tail, tail,
-                                  VideoCommon::CacheType::NoTextureCache);
+            ReadAcceleratedUpload(image, u64{static_cast<u32>(layer)} * image.info.layer_stride +
+                                             level_offset,
+                                  mapped_span.data() + layer * tail, tail);
         }
         uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
         for (auto& upload : uploads) {
@@ -2246,8 +2273,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
-        gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
-                              VideoCommon::CacheType::NoTextureCache);
+        ReadAcceleratedUpload(image, 0, mapped_span.data(), mapped_span.size_bytes());
         const auto uploads = FullUploadSwizzles(image.info);
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;
@@ -2265,6 +2291,98 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
                                           mapped_span, &unswizzle_worker);
         image.UploadMemory(staging, copies);
+    }
+}
+
+template <class P>
+void TextureCache<P>::FastReadFlush(GPUVAddr gpu_addr, size_t size) {
+    const auto flush = gpu_memory->FlushRegionNoTextureCacheCoalesced(gpu_addr, size);
+    fast_read_runs += flush.runs;
+    fast_read_flushes += flush.flushed;
+}
+
+template <class P>
+bool TextureCache<P>::AstcScanInPlace(GPUVAddr gpu_addr, size_t size) {
+    ++fast_read_scans;
+    bool opaque = true;
+    if (const u8* const span = gpu_memory->GetSpan(gpu_addr, size)) {
+        opaque = AstcDataLooksOpaque({span, size});
+    } else {
+        // Split range: the pieces as they lie in guest memory. A 16-byte block across two pieces
+        // is put together in carry; a partial block at the end is ignored, as in a whole scan.
+        ++fast_read_split_scans;
+        std::array<u8, 16> carry;
+        size_t carry_size = 0;
+        gpu_memory->VisitBlockUnsafe(
+            gpu_addr, size, astc_scan_buffer, [&](std::span<const u8> piece) {
+                if (carry_size != 0) {
+                    const size_t take = std::min(carry.size() - carry_size, piece.size());
+                    std::memcpy(carry.data() + carry_size, piece.data(), take);
+                    carry_size += take;
+                    piece = piece.subspan(take);
+                    if (carry_size < carry.size()) {
+                        return true;
+                    }
+                    carry_size = 0;
+                    if (!AstcDataLooksOpaque(carry)) {
+                        opaque = false;
+                        return false;
+                    }
+                }
+                const size_t whole = piece.size() & ~size_t{15};
+                if (!AstcDataLooksOpaque(piece.first(whole))) {
+                    opaque = false;
+                    return false;
+                }
+                carry_size = piece.size() - whole;
+                std::memcpy(carry.data(), piece.data() + whole, carry_size);
+                return true;
+            });
+    }
+    if (AstcFastReadVerify()) {
+        fast_read_verify_buffer.resize_destructive(size);
+        gpu_memory->ReadBlock(gpu_addr, fast_read_verify_buffer.data(), size,
+                              VideoCommon::CacheType::NoTextureCache);
+        ++fast_read_scans_verified;
+        const bool safe_opaque =
+            AstcDataLooksOpaque({fast_read_verify_buffer.data(), fast_read_verify_buffer.size()});
+        if (safe_opaque != opaque && fast_read_scan_mismatches++ < 32) {
+            LOG_WARNING(HW_GPU,
+                        "ASTC in-place scan differs from the safe read: {:#x} ({} bytes), "
+                        "opaque {} in place, {} safe",
+                        gpu_addr, size, opaque, safe_opaque);
+        }
+    }
+    return opaque;
+}
+
+template <class P>
+void TextureCache<P>::ReadAcceleratedUpload(const Image& image, u64 offset, u8* dest,
+                                            size_t size) {
+    const GPUVAddr addr = image.gpu_addr + offset;
+    if (!AstcFastRead()) {
+        gpu_memory->ReadBlock(addr, dest, size, VideoCommon::CacheType::NoTextureCache);
+        return;
+    }
+    ++fast_read_reads;
+    fast_read_bytes += size;
+    FastReadFlush(addr, size);
+    gpu_memory->ReadBlockUnsafe(addr, dest, size);
+    if (AstcFastReadVerify()) {
+        fast_read_verify_buffer.resize_destructive(size);
+        gpu_memory->ReadBlock(addr, fast_read_verify_buffer.data(), size,
+                              VideoCommon::CacheType::NoTextureCache);
+        ++fast_read_verified;
+        if (std::memcmp(dest, fast_read_verify_buffer.data(), size) != 0) {
+            const size_t first = static_cast<size_t>(
+                std::mismatch(dest, dest + size, fast_read_verify_buffer.data()).first - dest);
+            if (fast_read_mismatches++ < 32) {
+                LOG_WARNING(HW_GPU,
+                            "ASTC fast read differs from the safe read: {:#x}+{:#x} ({} bytes), "
+                            "first difference at +{:#x}",
+                            image.gpu_addr, offset, size, first);
+            }
+        }
     }
 }
 
@@ -2826,7 +2944,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         constexpr size_t MaxScanBytes = 64_MiB;
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
-            if (scan_bytes <= MaxScanBytes) {
+            if (scan_bytes <= MaxScanBytes && AstcFastRead() &&
+                Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu) {
+                // Pending buffer and query writes land first, so the scan sees what the upload
+                // will (the scan without the switch reads before any flush).
+                FastReadFlush(gpu_addr, scan_bytes);
+                new_info.astc_opaque = AstcScanInPlace(gpu_addr, scan_bytes);
+                ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+            } else if (scan_bytes <= MaxScanBytes) {
                 // Scanned where it is when it is in one piece; only copied (into the scratch
                 // buffer) when the range is split.
                 Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>

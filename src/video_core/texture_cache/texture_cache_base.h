@@ -146,6 +146,18 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
+    /// EDEN_NX2_ASTC_FAST_READ counters (TC_LOG summary)
+    u64 fast_read_reads{};
+    u64 fast_read_bytes{};
+    u64 fast_read_scans{};
+    u64 fast_read_split_scans{};
+    u64 fast_read_runs{};
+    u64 fast_read_flushes{};
+    u64 fast_read_verified{};
+    u64 fast_read_mismatches{};
+    u64 fast_read_scans_verified{};
+    u64 fast_read_scan_mismatches{};
+    Common::ScratchBuffer<u8> fast_read_verify_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
@@ -452,6 +464,15 @@ private:
     /// Upload data from guest to an image
     template <typename StagingBuffer>
     void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
+
+    /// Guest data of an accelerated upload: ReadBlock, or with EDEN_NX2_ASTC_FAST_READ one
+    /// coalesced flush and an unsafe read (or the opaque scan's copy of it).
+    void ReadAcceleratedUpload(const Image& image, u64 offset, u8* dest, size_t size);
+
+    /// EDEN_NX2_ASTC_FAST_READ's flush of a guest range before an unsafe read (counted).
+    void FastReadFlush(GPUVAddr gpu_addr, size_t size);
+    /// EDEN_NX2_ASTC_FAST_READ opaque scan of guest memory in place (no copy of a split range)
+    bool AstcScanInPlace(GPUVAddr gpu_addr, size_t size);
 
     /// Create a new image view from a guest descriptor
     [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);

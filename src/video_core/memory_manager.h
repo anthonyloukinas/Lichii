@@ -7,10 +7,12 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -152,6 +154,22 @@ public:
 
     void FlushRegion(GPUVAddr gpu_addr, size_t size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
+
+    struct CoalescedFlush {
+        u32 runs{};    ///< Runs of contiguous device pages in the range
+        u32 flushed{}; ///< Runs with something to write back, flushed
+    };
+    /// FlushRegion(NoTextureCache) with one rasterizer flush per run of contiguous device pages
+    /// instead of one per page, skipped for runs the buffer and query caches hold nothing
+    /// GPU-written in. Buffer and query caches only: MustFlushRegion's texture check depends on
+    /// the GPU accuracy setting, FlushRegion's does not.
+    CoalescedFlush FlushRegionNoTextureCacheCoalesced(GPUVAddr gpu_addr, size_t size) const;
+
+    /// Hands the range to visit piece by piece, in order and without a flush: guest memory in
+    /// place where the pages have a host pointer, otherwise the piece read (or zeroed) into
+    /// scratch as ReadBlockUnsafe would. Stops when visit returns false.
+    void VisitBlockUnsafe(GPUVAddr gpu_addr, size_t size, Common::ScratchBuffer<u8>& scratch,
+                          const std::function<bool(std::span<const u8>)>& visit) const;
 
     void InvalidateRegion(GPUVAddr gpu_addr, size_t size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
