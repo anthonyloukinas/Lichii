@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include "common/address_space.h"
 #include "common/assert.h"
 
@@ -291,7 +293,8 @@ MAP_MEMBER(void)::UnmapLocked(VaType virt, VaType size) {
 }
 
 ALLOC_MEMBER_CONST()::FlatAllocator(VaType virt_start_, VaType va_limit_)
-    : Base{va_limit_}, virt_start{virt_start_}, current_linear_alloc_end{virt_start_} {}
+    : Base{va_limit_}, virt_start{virt_start_}, current_linear_alloc_end{virt_start_},
+      gap_search_start{virt_start_} {}
 
 ALLOC_MEMBER(VaType)::Allocate(VaType size) {
     std::scoped_lock lock(this->block_mutex);
@@ -337,23 +340,45 @@ ALLOC_MEMBER(VaType)::Allocate(VaType size) {
     if (alloc_start != UnmappedVa) {
         current_linear_alloc_end = alloc_start + size;
     } else { // If linear allocation overflows the AS then find a gap
-        if (this->blocks.size() <= 2) {
-            ASSERT_MSG(false, "Unexpected allocator state!");
+        // Every free span counts: the one before the first allocation (from virt_start), the
+        // gaps, and the one after the last allocation (up to the VA limit). The search goes on
+        // from where the last one ended and wraps once, so a freed range is not handed out
+        // again straight away.
+        const auto find_gap{[&](VaType from) -> VaType {
+            auto block{std::lower_bound(this->blocks.begin(), this->blocks.end(), from)};
+            if (block == this->blocks.end() ||
+                (block->virt > from && block != this->blocks.begin())) {
+                --block; // The block that holds `from`
+            }
+            for (; block != this->blocks.end(); ++block) {
+                if (block->Mapped()) {
+                    continue;
+                }
+                auto next{std::next(block)};
+                while (next != this->blocks.end() && next->Unmapped()) {
+                    ++next;
+                }
+                const VaType span_start{std::max({block->virt, from, virt_start})};
+                const VaType span_end{next != this->blocks.end() ? next->virt : this->va_limit};
+                if (span_end > span_start && span_end - span_start >= size) {
+                    return span_start;
+                }
+            }
+            return UnmappedVa;
+        }};
+
+        alloc_start = find_gap(gap_search_start);
+        if (alloc_start == UnmappedVa) {
+            alloc_start = find_gap(virt_start);
         }
-
-        auto search_predecessor{std::next(this->blocks.begin())};
-        auto search_successor{std::next(search_predecessor)};
-
-        while (search_successor != this->blocks.end() &&
-               (search_successor->virt - search_predecessor->virt < size ||
-                search_predecessor->Mapped())) {
-            search_predecessor = search_successor++;
-        }
-
-        if (search_successor != this->blocks.end()) {
-            alloc_start = search_predecessor->virt;
-        } else {
+        if (alloc_start == UnmappedVa) {
             return {}; // AS is full
+        }
+
+        gap_search_start = alloc_start + size;
+        // The linear pass takes everything from its end on to be free
+        if (gap_search_start > current_linear_alloc_end) {
+            current_linear_alloc_end = gap_search_start;
         }
     }
 

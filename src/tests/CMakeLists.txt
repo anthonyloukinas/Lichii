@@ -6,6 +6,7 @@
 
 add_executable(tests
     common/addon_config.cpp
+    common/address_space.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp

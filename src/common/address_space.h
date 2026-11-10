@@ -147,5 +147,8 @@ private:
      * Once this reaches the AS limit the slower allocation path will be used
      */
     VaType current_linear_alloc_end;
+
+    /// Where the slower allocation path goes on searching for a gap
+    VaType gap_search_start;
 };
 } // namespace Common
