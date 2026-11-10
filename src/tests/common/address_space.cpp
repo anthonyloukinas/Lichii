@@ -31,6 +31,77 @@ struct Full {
     u64 d{allocator.Allocate(Page)};
 };
 
+/// Random allocations, fixed mappings and frees, checked against the live ranges: an allocation
+/// stays inside the address space and off every live range, and only fails when nothing fits.
+template <typename Va, size_t Bits>
+void CheckAtRandom(u64 start, u64 limit, u64 unit) {
+    Common::FlatAllocator<Va, 0, Bits> allocator{static_cast<Va>(start), static_cast<Va>(limit)};
+    std::map<u64, u64> live;
+    u64 state{0x9E3779B97F4A7C15ULL};
+    const auto next{[&state] {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    }};
+    const auto largest_gap{[&] {
+        u64 best{}, cursor{start};
+        for (const auto& [address, size] : live) {
+            best = std::max(best, address - cursor);
+            cursor = address + size;
+        }
+        return std::max(best, limit - cursor);
+    }};
+    // A free range picked at random, or {0, 0} when everything is taken
+    const auto free_range{[&]() -> std::pair<u64, u64> {
+        std::vector<std::pair<u64, u64>> gaps;
+        u64 cursor{start};
+        for (const auto& [address, size] : live) {
+            if (address > cursor) {
+                gaps.emplace_back(cursor, address - cursor);
+            }
+            cursor = address + size;
+        }
+        if (limit > cursor) {
+            gaps.emplace_back(cursor, limit - cursor);
+        }
+        if (gaps.empty()) {
+            return {};
+        }
+        const auto [address, size]{gaps[next() % gaps.size()]};
+        const u64 units{size / unit};
+        const u64 skipped{next() % units};
+        return {address + skipped * unit, (1 + next() % std::min<u64>(units - skipped, 8)) * unit};
+    }};
+    for (int op = 0; op < 20000; ++op) {
+        if (const auto [address, size]{free_range()}; size != 0 && next() % 100 < 10) {
+            allocator.AllocateFixed(static_cast<Va>(address), static_cast<Va>(size));
+            live.emplace(address, size);
+        } else if (live.empty() || next() % 100 < 50) {
+            const u64 size{(1 + next() % 8) * unit};
+            const u64 address{allocator.Allocate(static_cast<Va>(size))};
+            if (address == 0) {
+                REQUIRE(largest_gap() < size);
+                continue;
+            }
+            REQUIRE(address >= start);
+            REQUIRE(address + size <= limit);
+            auto after{live.lower_bound(address)};
+            REQUIRE((after == live.end() || after->first >= address + size));
+            if (after != live.begin()) {
+                const auto before{std::prev(after)};
+                REQUIRE(before->first + before->second <= address);
+            }
+            live.emplace(address, size);
+        } else {
+            auto victim{live.begin()};
+            std::advance(victim, next() % live.size());
+            allocator.Free(static_cast<Va>(victim->first), static_cast<Va>(victim->second));
+            live.erase(victim);
+        }
+    }
+}
+
 } // namespace
 
 TEST_CASE("FlatAllocator: the linear pass fills the address space", "[common]") {
@@ -90,72 +161,10 @@ TEST_CASE("FlatAllocator: a freed range is not handed out again straight away", 
 
 TEST_CASE("FlatAllocator: allocations never overlap and space is only lost to fragmentation",
           "[common]") {
-    constexpr u64 limit{Start + 256 * Page};
-    Allocator allocator{Start, limit};
-    std::map<u64, u64> live;
-    u64 state{0x9E3779B97F4A7C15ULL};
-    const auto next{[&state] {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        return state;
-    }};
-    const auto largest_gap{[&] {
-        u64 best{}, cursor{Start};
-        for (const auto& [address, size] : live) {
-            best = std::max(best, address - cursor);
-            cursor = address + size;
-        }
-        return std::max(best, limit - cursor);
-    }};
-    // A free range picked at random, or {0, 0} when everything is taken
-    const auto free_range{[&]() -> std::pair<u64, u64> {
-        std::vector<std::pair<u64, u64>> gaps;
-        u64 cursor{Start};
-        for (const auto& [address, size] : live) {
-            if (address > cursor) {
-                gaps.emplace_back(cursor, address - cursor);
-            }
-            cursor = address + size;
-        }
-        if (limit > cursor) {
-            gaps.emplace_back(cursor, limit - cursor);
-        }
-        if (gaps.empty()) {
-            return {};
-        }
-        const auto [address, size]{gaps[next() % gaps.size()]};
-        const u64 pages{size / Page};
-        const u64 skipped{next() % pages};
-        return {address + skipped * Page, (1 + next() % std::min<u64>(pages - skipped, 8)) * Page};
-    }};
-    for (int op = 0; op < 20000; ++op) {
-        if (const auto [address, size]{free_range()}; size != 0 && next() % 100 < 10) {
-            allocator.AllocateFixed(address, size);
-            live.emplace(address, size);
-        } else if (live.empty() || next() % 100 < 50) {
-            const u64 size{(1 + next() % 8) * Page};
-            const u64 address{allocator.Allocate(size)};
-            if (address == 0) {
-                REQUIRE(largest_gap() < size);
-                continue;
-            }
-            REQUIRE(address >= Start);
-            REQUIRE(address + size <= limit);
-            auto after{live.lower_bound(address)};
-            REQUIRE((after == live.end() || after->first >= address + size));
-            if (after != live.begin()) {
-                const auto before{std::prev(after)};
-                REQUIRE(before->first + before->second <= address);
-            }
-            live.emplace(address, size);
-        } else {
-            auto victim{live.begin()};
-            std::advance(victim, next() % live.size());
-            allocator.Free(victim->first, victim->second);
-            live.erase(victim);
-        }
-    }
+    CheckAtRandom<u64, 36>(Start, Start + 256 * Page, Page);
+    // In units of pages, as the GPU address spaces use it
+    CheckAtRandom<u32, 32>(0x10, 0x110, 1);
+    CheckAtRandom<u32, 32>(0xFFFFFE00, 0xFFFFFFFF, 1);
 }
 
 TEST_CASE("FlatAllocator: a failed allocation works after a free", "[common]") {
@@ -263,4 +272,32 @@ TEST_CASE("FlatAllocator: a 32-bit address space is usable up to its limit", "[c
     REQUIRE(allocator.Allocate(3) == 0);
     REQUIRE(allocator.Allocate(2) == start);
     REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: the start of a mapped block can be freed after a free range",
+          "[common]") {
+    Allocator allocator{1, 5};
+    REQUIRE(allocator.Allocate(1) == 1);
+    REQUIRE(allocator.Allocate(2) == 2);
+    // Frees the first allocation and half of the second; its other half stays mapped
+    allocator.Free(1, 2);
+    REQUIRE(allocator.Allocate(1) == 4);
+    REQUIRE(allocator.Allocate(2) == 1);
+    REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: a free can span mapped and free ranges", "[common]") {
+    Allocator allocator{1, 11};
+    for (u64 address = 1; address < 11; address += 2) {
+        REQUIRE(allocator.Allocate(2) == address);
+    }
+    allocator.Free(3, 2);
+    allocator.Free(7, 2);
+    // From inside the first allocation to inside the last one
+    allocator.Free(2, 8);
+    REQUIRE(allocator.Allocate(9) == 0);
+    REQUIRE(allocator.Allocate(8) == 2);
+    REQUIRE(allocator.Allocate(1) == 0);
+    allocator.Free(1, 10);
+    REQUIRE(allocator.Allocate(10) == 1);
 }
