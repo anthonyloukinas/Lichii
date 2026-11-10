@@ -118,9 +118,13 @@ u64 ShaderCache::MeshStateHash() const {
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
-    if (!dirty[VideoCommon::Dirty::Shaders]) {
+    // A removal frees the programs shader_infos points at without the game touching its shader
+    // registers (an unmap or a remap of the memory under them): look the stages up again.
+    const u64 removals{removal_serial.load(std::memory_order_acquire)};
+    if (!dirty[VideoCommon::Dirty::Shaders] && removals == seen_removal_serial) {
         return last_shaders_valid;
     }
+    seen_removal_serial = removals;
     dirty[VideoCommon::Dirty::Shaders] = false;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
@@ -450,6 +454,7 @@ void ShaderCache::RemovePendingShaders() {
 
     if (!removed_shaders.empty()) {
         Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
+        removal_serial.fetch_add(1, std::memory_order_release);
         if (removed_shaders.size() > 16) {
             std::ranges::sort(removed_shaders, std::less<ShaderInfo*>{});
             std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
