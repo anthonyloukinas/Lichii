@@ -388,6 +388,120 @@ bool AlphaToCoverageRefresh() {
     static const bool refresh{std::getenv("EDEN_NX2_A2C_REFRESH") != nullptr};
     return refresh;
 }
+
+// EDEN_NX2_INDEX_CHECK: an indexed draw whose indices reach past a vertex buffer it reads, or,
+// when no vertex buffer bounds it (shaders that fetch vertices themselves), a short index buffer
+// whose indices reach near 65535. Logs where the index and vertex buffers came from. Reads the
+// indices from guest memory, so indices the GPU wrote and hasn't flushed are not seen.
+void CheckIndexBuffer(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
+                      const GraphicsPipeline& pipeline) {
+    using Clock = std::chrono::steady_clock;
+    const auto& regs = maxwell3d.regs;
+    const auto& draw_state = maxwell3d.draw_manager.draw_state;
+    const auto& index_buffer = draw_state.index_buffer;
+    if (draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::InlineIndex ||
+        index_buffer.count == 0 || static_cast<u32>(index_buffer.format) > 2) {
+        return;
+    }
+    const GPUVAddr address = index_buffer.IndexStart();
+    {
+        // Each index buffer and count at most once a second.
+        static std::mutex mutex;
+        static std::unordered_map<u64, Clock::time_point> checked;
+        const auto now = Clock::now();
+        std::scoped_lock lock{mutex};
+        if (checked.size() > 65536) {
+            checked.clear();
+        }
+        const auto [it, inserted] = checked.try_emplace(address ^ (u64{index_buffer.count} << 44), now);
+        if (!inserted) {
+            if (now - it->second < std::chrono::seconds{1}) {
+                return;
+            }
+            it->second = now;
+        }
+    }
+    const size_t index_size = index_buffer.FormatSizeInBytes();
+    const u32 count = (std::min)(index_buffer.count, 1u << 20);
+    std::vector<u8> bytes(count * index_size);
+    memory.ReadBlockUnsafe(address, bytes.data(), bytes.size());
+    const u32 all_ones = index_size == 4 ? ~0u : (1u << (index_size * 8)) - 1;
+    const bool restart = regs.primitive_restart.enabled != 0;
+    u32 max_index = 0;
+    for (u32 i = 0; i < count; ++i) {
+        u32 index = 0;
+        std::memcpy(&index, bytes.data() + i * index_size, index_size);
+        if (restart && (index == regs.primitive_restart.index || index == all_ones)) {
+            continue;
+        }
+        max_index = (std::max)(max_index, index);
+    }
+    const s64 base_vertex = static_cast<s32>(draw_state.base_index);
+    const s64 max_vertex = s64{max_index} + base_vertex;
+    std::array<bool, Maxwell::NumVertexArrays> used{};
+    for (size_t index = 0; index < regs.vertex_attrib_format.size(); ++index) {
+        const auto& attribute = regs.vertex_attrib_format[index];
+        if (attribute.constant == 0 && attribute.size != Maxwell::VertexAttribute::Size::Invalid &&
+            attribute.buffer < used.size() && pipeline.LoadsGenericAttribute(index)) {
+            used[attribute.buffer] = true;
+        }
+    }
+    const bool native = maxwell3d.GetNativeMacroEngine().native_turing;
+    bool bounded = false;
+    std::optional<size_t> short_stream;
+    u64 short_vertices = 0;
+    for (size_t i = 0; i < used.size(); ++i) {
+        const auto& stream = regs.vertex_streams[i];
+        const GPUVAddr begin = stream.Address();
+        const GPUVAddr limit = regs.vertex_stream_limits[i].Address();
+        // Native (Turing) streams take byte counts at 0x600, as in BufferCache::UpdateVertexBuffer.
+        const u64 size = native ? regs.NativeVertexStreamSize(i) : limit >= begin ? limit - begin + 1 : 0;
+        if (!used[i] || !stream.IsEnabled() || stream.stride == 0 || size == 0 ||
+            regs.vertex_stream_instances.IsInstancingEnabled(i)) {
+            continue;
+        }
+        bounded = true;
+        const u64 vertices = size / stream.stride;
+        if (max_vertex >= static_cast<s64>(vertices) && (!short_stream || vertices < short_vertices)) {
+            short_stream = i;
+            short_vertices = vertices;
+        }
+    }
+    if (bounded ? !short_stream : (max_index < 0xF000 || index_buffer.count >= 4096)) {
+        return;
+    }
+    {
+        // Once per index buffer address: the first 64, then every 1000th.
+        static std::mutex mutex;
+        static std::unordered_set<GPUVAddr> warned;
+        std::scoped_lock lock{mutex};
+        if (!warned.insert(index_buffer.StartAddress()).second ||
+            (warned.size() > 64 && warned.size() % 1000 != 0)) {
+            return;
+        }
+    }
+    auto& registry = Service::Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+    const u64 index_bytes = u64{index_buffer.count} * index_size;
+    if (!short_stream) {
+        LOG_WARNING(HW_GPU,
+                    "Index check: short index buffer reaches near 65535 (no vertex buffer bounds "
+                    "it): index buffer [{:#x}, +{:#x}] {} indices, max index {} + base vertex {}. "
+                    "Index buffer: {}",
+                    address, index_bytes, index_buffer.count, max_index, base_vertex,
+                    registry.Describe(address, index_bytes));
+        return;
+    }
+    const auto& stream = regs.vertex_streams[*short_stream];
+    const u64 vertex_bytes = short_vertices * stream.stride;
+    LOG_WARNING(HW_GPU,
+                "Index check: indices reach past the vertex buffer: index buffer [{:#x}, +{:#x}] {} "
+                "indices, max index {} + base vertex {}, vertex buffer {} [{:#x}, +{:#x}] stride {} "
+                "holds {} vertices. Index buffer: {}. Vertex buffer: {}",
+                address, index_bytes, index_buffer.count, max_index, base_vertex, *short_stream,
+                stream.Address(), vertex_bytes, u32{stream.stride}, short_vertices,
+                registry.Describe(address, index_bytes),
+                registry.Describe(stream.Address(), vertex_bytes));
+}
 } // Anonymous namespace
 
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
@@ -1016,6 +1130,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
+    if (is_indexed && !is_indirect && !mesh_draw &&
+        Service::Nvidia::Devices::Nx2IndexCheckEnabled()) {
+        CheckIndexBuffer(*maxwell3d, *gpu_memory, *pipeline);
+    }
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
     // to compare the same scene with and without them in one run.
@@ -1378,115 +1496,6 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
         }
     }
 }
-
-// EDEN_NX2_INDEX_CHECK: an indexed draw whose indices reach past a vertex buffer it reads, or,
-// when no vertex buffer bounds it (shaders that fetch vertices themselves), a short index buffer
-// whose indices reach near 65535. Logs where the index and vertex buffers came from. Reads the
-// indices from guest memory, so indices the GPU wrote and hasn't flushed are not seen.
-void CheckIndexBuffer(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory) {
-    using Clock = std::chrono::steady_clock;
-    const auto& regs = maxwell3d.regs;
-    const auto& draw_state = maxwell3d.draw_manager.draw_state;
-    const auto& index_buffer = draw_state.index_buffer;
-    if (draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::InlineIndex ||
-        index_buffer.count == 0 || static_cast<u32>(index_buffer.format) > 2) {
-        return;
-    }
-    const GPUVAddr address = index_buffer.IndexStart();
-    {
-        // Each index buffer and count at most once a second.
-        static std::mutex mutex;
-        static std::unordered_map<u64, Clock::time_point> checked;
-        const auto now = Clock::now();
-        std::scoped_lock lock{mutex};
-        if (checked.size() > 65536) {
-            checked.clear();
-        }
-        const auto [it, inserted] = checked.try_emplace(address ^ (u64{index_buffer.count} << 44), now);
-        if (!inserted) {
-            if (now - it->second < std::chrono::seconds{1}) {
-                return;
-            }
-            it->second = now;
-        }
-    }
-    const size_t index_size = index_buffer.FormatSizeInBytes();
-    const u32 count = (std::min)(index_buffer.count, 1u << 20);
-    std::vector<u8> bytes(count * index_size);
-    memory.ReadBlockUnsafe(address, bytes.data(), bytes.size());
-    const u32 all_ones = index_size == 4 ? ~0u : (1u << (index_size * 8)) - 1;
-    const bool restart = regs.primitive_restart.enabled != 0;
-    u32 max_index = 0;
-    for (u32 i = 0; i < count; ++i) {
-        u32 index = 0;
-        std::memcpy(&index, bytes.data() + i * index_size, index_size);
-        if (restart && (index == regs.primitive_restart.index || index == all_ones)) {
-            continue;
-        }
-        max_index = (std::max)(max_index, index);
-    }
-    const s64 base_vertex = static_cast<s32>(draw_state.base_index);
-    const s64 max_vertex = s64{max_index} + base_vertex;
-    std::array<bool, Maxwell::NumVertexArrays> used{};
-    for (const auto& attribute : regs.vertex_attrib_format) {
-        if (attribute.constant == 0 && attribute.size != Maxwell::VertexAttribute::Size::Invalid &&
-            attribute.buffer < used.size()) {
-            used[attribute.buffer] = true;
-        }
-    }
-    bool bounded = false;
-    std::optional<size_t> short_stream;
-    u64 short_vertices = 0;
-    for (size_t i = 0; i < used.size(); ++i) {
-        const auto& stream = regs.vertex_streams[i];
-        const GPUVAddr begin = stream.Address();
-        const GPUVAddr limit = regs.vertex_stream_limits[i].Address();
-        if (!used[i] || !stream.IsEnabled() || stream.stride == 0 || limit < begin ||
-            regs.vertex_stream_instances.IsInstancingEnabled(i)) {
-            continue;
-        }
-        bounded = true;
-        const u64 vertices = (limit - begin + 1) / stream.stride;
-        if (max_vertex >= static_cast<s64>(vertices) && (!short_stream || vertices < short_vertices)) {
-            short_stream = i;
-            short_vertices = vertices;
-        }
-    }
-    if (bounded ? !short_stream : (max_index < 0xF000 || index_buffer.count >= 4096)) {
-        return;
-    }
-    {
-        // Once per index buffer address: the first 64, then every 1000th.
-        static std::mutex mutex;
-        static std::unordered_set<GPUVAddr> warned;
-        std::scoped_lock lock{mutex};
-        if (!warned.insert(index_buffer.StartAddress()).second ||
-            (warned.size() > 64 && warned.size() % 1000 != 0)) {
-            return;
-        }
-    }
-    auto& registry = Service::Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
-    const u64 index_bytes = u64{index_buffer.count} * index_size;
-    if (!short_stream) {
-        LOG_WARNING(HW_GPU,
-                    "Index check: short index buffer reaches near 65535 (no vertex buffer bounds "
-                    "it): index buffer [{:#x}, +{:#x}] {} indices, max index {} + base vertex {}. "
-                    "Index buffer: {}",
-                    address, index_bytes, index_buffer.count, max_index, base_vertex,
-                    registry.Describe(address, index_bytes));
-        return;
-    }
-    const auto& stream = regs.vertex_streams[*short_stream];
-    const u64 vertex_bytes = short_vertices * stream.stride;
-    LOG_WARNING(HW_GPU,
-                "Index check: indices reach past the vertex buffer: index buffer [{:#x}, +{:#x}] {} "
-                "indices, max index {} + base vertex {}, vertex buffer {} [{:#x}, +{:#x}] stride {} "
-                "holds {} vertices. Index buffer: {}. Vertex buffer: {}",
-                address, index_bytes, index_buffer.count, max_index, base_vertex, *short_stream,
-                stream.Address(), vertex_bytes, u32{stream.stride}, short_vertices,
-                registry.Describe(address, index_bytes),
-                registry.Describe(stream.Address(), vertex_bytes));
-}
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
@@ -1509,9 +1518,6 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             TargetTraceEarlyDrop(is_indexed, "count past 16M");
             return;
         }
-    }
-    if (is_indexed && Service::Nvidia::Devices::Nx2IndexCheckEnabled()) {
-        CheckIndexBuffer(*maxwell3d, *gpu_memory);
     }
     if (TryNx2IndirectReset(is_indexed, instance_count)) {
         TargetTraceEarlyDrop(is_indexed, "taken as an indirect reset");

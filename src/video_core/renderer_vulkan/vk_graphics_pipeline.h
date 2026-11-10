@@ -140,6 +140,11 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+
+    [[nodiscard]] bool LoadsGenericAttribute(size_t index) const noexcept {
+        return stage_infos[0].loads.Generic(index);
+    }
+
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
