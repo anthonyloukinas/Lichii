@@ -139,6 +139,7 @@ add_executable(tests
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
     video_core/fsr4_support.cpp
+    common/address_space.cpp
     common/bit_field.cpp
     common/bit_util.cpp
     common/cityhash.cpp

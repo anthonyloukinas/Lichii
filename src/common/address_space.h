@@ -143,8 +143,8 @@ private:
     VaType virt_start;
 
     /**
-     * The end address for the initial linear allocation pass
-     * Once this reaches the AS limit the slower allocation path will be used
+     * The end address of the last allocation, where the search for the next one starts
+     * Allocations are linear until this reaches the AS limit, then the search wraps
      */
     VaType current_linear_alloc_end;
 };
