@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/pipeline_creation_stats.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -1698,9 +1699,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
-    build_create_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                                create_start)
-                          .count();
+    const auto create_time = std::chrono::steady_clock::now() - create_start;
+    DriverBuildReport::Record(DriverBuildReport::Kind::Graphics, create_time);
+    build_create_ms = std::chrono::duration<double, std::milli>(create_time).count();
     if (log_stats) {
         const double create_ms = build_create_ms;
         PipelineCreationStats::Report(

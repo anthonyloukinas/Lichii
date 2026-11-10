@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -304,9 +305,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         const auto create_start = std::chrono::steady_clock::now();
         try {
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
-            const double create_ms = std::chrono::duration<double, std::milli>(
-                                         std::chrono::steady_clock::now() - create_start)
-                                         .count();
+            const auto create_time = std::chrono::steady_clock::now() - create_start;
+            DriverBuildReport::Record(DriverBuildReport::Kind::Compute, create_time);
+            const double create_ms =
+                std::chrono::duration<double, std::milli>(create_time).count();
             // The driver's compile (or its cache lookup), to time freezes after live builds.
             LOG_INFO(Render_Vulkan, "Compute pipeline {:016x}: driver create {:.1f} ms on the {}{}",
                      shader_hash, create_ms, build_thread,
