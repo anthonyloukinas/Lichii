@@ -302,6 +302,16 @@ bool TextureMemoVerify() {
     return verify;
 }
 
+// Diagnostic, not for merging: EDEN_NX2_TEXTURE_MEMO=0 resolves every draw's textures in full, to
+// measure what the memo saves.
+bool TextureMemoEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEXTURE_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_DELTA_DESCRIPTORS_VERIFY=1: delta draws resolve their image descriptors as before and
 // compare them with the kept ones.
 const bool delta_descriptors_verify = [] {
@@ -669,7 +679,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
 
-    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures()};
+    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures() &&
+                        TextureMemoEnabled()};
     const bool verify_memo{use_memo && TextureMemoVerify()};
     boost::container::small_vector<GPUVAddr, 32> handle_addresses;
     boost::container::small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
