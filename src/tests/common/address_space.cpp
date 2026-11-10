@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <iterator>
 #include <map>
+#include <utility>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -106,8 +108,32 @@ TEST_CASE("FlatAllocator: allocations never overlap and space is only lost to fr
         }
         return std::max(best, limit - cursor);
     }};
+    // A free range picked at random, or {0, 0} when everything is taken
+    const auto free_range{[&]() -> std::pair<u64, u64> {
+        std::vector<std::pair<u64, u64>> gaps;
+        u64 cursor{Start};
+        for (const auto& [address, size] : live) {
+            if (address > cursor) {
+                gaps.emplace_back(cursor, address - cursor);
+            }
+            cursor = address + size;
+        }
+        if (limit > cursor) {
+            gaps.emplace_back(cursor, limit - cursor);
+        }
+        if (gaps.empty()) {
+            return {};
+        }
+        const auto [address, size]{gaps[next() % gaps.size()]};
+        const u64 pages{size / Page};
+        const u64 skipped{next() % pages};
+        return {address + skipped * Page, (1 + next() % std::min<u64>(pages - skipped, 8)) * Page};
+    }};
     for (int op = 0; op < 20000; ++op) {
-        if (live.empty() || next() % 100 < 55) {
+        if (const auto [address, size]{free_range()}; size != 0 && next() % 100 < 10) {
+            allocator.AllocateFixed(address, size);
+            live.emplace(address, size);
+        } else if (live.empty() || next() % 100 < 50) {
             const u64 size{(1 + next() % 8) * Page};
             const u64 address{allocator.Allocate(size)};
             if (address == 0) {
@@ -130,4 +156,111 @@ TEST_CASE("FlatAllocator: allocations never overlap and space is only lost to fr
             live.erase(victim);
         }
     }
+}
+
+TEST_CASE("FlatAllocator: a failed allocation works after a free", "[common]") {
+    Full full;
+    REQUIRE(full.allocator.Allocate(Page) == 0);
+    full.allocator.Free(full.b, Page);
+    REQUIRE(full.allocator.Allocate(2 * Page) == 0);
+    REQUIRE(full.allocator.Allocate(Page) == full.b);
+}
+
+TEST_CASE("FlatAllocator: the search goes on after an allocation from a gap", "[common]") {
+    Allocator allocator{1, 11};
+    REQUIRE(allocator.Allocate(4) == 1);
+    allocator.Free(1, 4);
+    // Six units are left after the first allocation, so this one wraps
+    REQUIRE(allocator.Allocate(7) == 1);
+    REQUIRE(allocator.Allocate(1) == 8);
+    REQUIRE(allocator.Allocate(2) == 9);
+    REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: the search goes on inside a span that was freed around it", "[common]") {
+    Allocator allocator{1, 11};
+    REQUIRE(allocator.Allocate(3) == 1);
+    REQUIRE(allocator.Allocate(3) == 4);
+    allocator.Free(4, 3);
+    allocator.Free(1, 3);
+    REQUIRE(allocator.Allocate(2) == 7);
+    REQUIRE(allocator.Allocate(2) == 9);
+    REQUIRE(allocator.Allocate(6) == 1);
+    REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: parts of allocations can be freed", "[common]") {
+    Allocator allocator{1, 9};
+    REQUIRE(allocator.Allocate(4) == 1);
+    REQUIRE(allocator.Allocate(4) == 5);
+    // The end of the first allocation and the start of the second
+    allocator.Free(4, 2);
+    REQUIRE(allocator.Allocate(3) == 0);
+    REQUIRE(allocator.Allocate(2) == 4);
+    // The middle of the first allocation
+    allocator.Free(2, 1);
+    REQUIRE(allocator.Allocate(1) == 2);
+    REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: a fixed mapping where the search starts is skipped", "[common]") {
+    Allocator allocator{1, 16};
+    REQUIRE(allocator.Allocate(2) == 1);
+    allocator.AllocateFixed(3, 2);
+    REQUIRE(allocator.Allocate(1) == 5);
+}
+
+TEST_CASE("FlatAllocator: an allocation does not run into a fixed mapping", "[common]") {
+    Allocator allocator{1, 9};
+    REQUIRE(allocator.Allocate(2) == 1);
+    allocator.AllocateFixed(4, 1);
+    // One unit is free in front of the fixed mapping
+    REQUIRE(allocator.Allocate(2) == 5);
+    REQUIRE(allocator.Allocate(2) == 7);
+    REQUIRE(allocator.Allocate(2) == 0);
+    REQUIRE(allocator.Allocate(1) == 3);
+    REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: a gap between fixed mappings is only used when it fits", "[common]") {
+    Allocator allocator{1, 12};
+    REQUIRE(allocator.Allocate(2) == 1);
+    allocator.AllocateFixed(5, 1);
+    allocator.AllocateFixed(6, 1);
+    allocator.Free(5, 1);
+    REQUIRE(allocator.Allocate(3) == 3);
+    REQUIRE(allocator.Allocate(2) == 7);
+    REQUIRE(allocator.Allocate(4) == 0);
+    REQUIRE(allocator.Allocate(3) == 9);
+}
+
+TEST_CASE("FlatAllocator: an allocation after a wrap does not land on a fixed mapping",
+          "[common]") {
+    Allocator allocator{1, 16};
+    allocator.AllocateFixed(10, 1);
+    REQUIRE(allocator.Allocate(8) == 1);
+    allocator.Free(1, 8);
+    // Neither side of the fixed mapping has nine units from here on, so this one wraps
+    REQUIRE(allocator.Allocate(9) == 1);
+    REQUIRE(allocator.Allocate(1) == 11);
+    REQUIRE(allocator.Allocate(4) == 12);
+    REQUIRE(allocator.Allocate(1) == 0);
+}
+
+TEST_CASE("FlatAllocator: a 32-bit address space is usable up to its limit", "[common]") {
+    constexpr u32 start{0xFFFFFFF0};
+    Common::FlatAllocator<u32, 0, 32> allocator{start};
+    // The limit is the last address, so fifteen units are left
+    REQUIRE(allocator.Allocate(16) == 0);
+    REQUIRE(allocator.Allocate(0xFFFFFFFF) == 0);
+    REQUIRE(allocator.Allocate(8) == start);
+    REQUIRE(allocator.Allocate(8) == 0);
+    REQUIRE(allocator.Allocate(7) == start + 8);
+    REQUIRE(allocator.Allocate(1) == 0);
+    allocator.Free(start, 8);
+    allocator.AllocateFixed(start + 2, 2);
+    REQUIRE(allocator.Allocate(4) == start + 4);
+    REQUIRE(allocator.Allocate(3) == 0);
+    REQUIRE(allocator.Allocate(2) == start);
+    REQUIRE(allocator.Allocate(1) == 0);
 }
