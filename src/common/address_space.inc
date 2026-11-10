@@ -270,8 +270,10 @@ MAP_MEMBER(void)::UnmapLocked(VaType virt, VaType size) {
             blocks.insert(block_start_successor, Block(virt, UnmappedPa, {}));
         }
     } else if (block_start_predecessor->Unmapped()) {
-        // If the previous block is unmapped
-        blocks.erase(block_start_successor, block_end_predecessor);
+        // If the previous block is unmapped then every block of the range joins it. Stopping at
+        // block_end_predecessor kept the last one, so a range between a free and a mapped
+        // neighbour was never freed.
+        blocks.erase(block_start_successor, block_end_successor);
     } else {
         // Erase overwritten blocks, skipping the first one as we have written the unmapped start
         // block there
