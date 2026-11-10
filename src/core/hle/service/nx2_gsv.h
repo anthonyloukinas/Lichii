@@ -584,7 +584,7 @@ private:
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 213 unmap [{:#x}, {:#x}] slot={}", first, last, w[8]);
         if (last > first) {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1, 213);
         }
         SignalAfterGpu(w[8]);
         IPC::ResponseBuilder rb{ctx, 2};
@@ -625,7 +625,7 @@ private:
                 for (const auto& [gpu_address, range_size] : leftovers) {
                     // Only what still reached this memory: a later map of the range is kept.
                     if (const auto backing = OwnBackingOf(gpu_address, range_size)) {
-                        registry.MapAt(gpu_address, *backing, range_size);
+                        registry.MapAt(gpu_address, *backing, range_size, 102);
                     }
                     // The first 32, then every 1000th.
                     if (++m_destroy_leftovers <= 32 || m_destroy_leftovers % 1000 == 0) {
@@ -699,7 +699,7 @@ private:
                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed as it is written",
                          start, last);
             } else if (const auto address = BackGpuOnlyRegion(start, size)) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, *address, size);
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, *address, size, 214);
                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
                                   "({} MiB of GPU-only memory in use, peak {} MiB)",
                          start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
@@ -738,7 +738,7 @@ private:
                 Tegra::Nx2SparseRegionDestroyed(first);
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DestroySparse(first, last - first + 1);
             } else {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1, 215);
             }
             // The region's backing: all of it, or the blocks a sparse region got as it was written.
             std::shared_ptr<std::atomic<bool>> done;
@@ -917,7 +917,7 @@ private:
         // total grew without bound (250 MiB -> 6.5 GiB in one session) until the process died.
         // Release the old backing the same way 215 does, i.e. only once the GPU thread is past it.
         if (const auto it = m_gpu_only_regions.find(gpu_address); it != m_gpu_only_regions.end()) {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size);
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size, 214);
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
                                                                         it->second.size);
             auto done = std::make_shared<std::atomic<bool>>(false);
@@ -1183,7 +1183,7 @@ private:
                 registry.MapSparseTile(gpu_address, 0, size);
                 MarkTiles(*region, gpu_address - start, size, false);
             } else {
-                registry.Unmap(gpu_address, size);
+                registry.Unmap(gpu_address, size, 216);
             }
             return;
         }
@@ -1198,7 +1198,7 @@ private:
         LOG_DEBUG(Service, "nx2:gpu 216 map [{:#x}, +{:#x}] -> memory {} offset {:#x} kind {:#x}",
                   gpu_address, size, request.memory_handle, request.offset, request.kind);
         if (region == nullptr) {
-            registry.MapAt(gpu_address, cpu_address, size);
+            registry.MapAt(gpu_address, cpu_address, size, 216);
             return;
         }
         if (!region->tiles) {
@@ -1288,7 +1288,7 @@ private:
             return;
         }
         DropGpuOnlyTiles(gpu_address, size, false);
-        registry.MapAt(gpu_address, memory->second.address + request.offset, size);
+        registry.MapAt(gpu_address, memory->second.address + request.offset, size, 216);
         m_gpu_only_tiles[gpu_address] = {size, region, request.memory_handle, request.offset};
         m_gpu_only_memory[{request.memory_handle, request.offset}] = {request.offset + size, region};
         m_gpu_only_tile_max = (std::max)(m_gpu_only_tile_max, size);
@@ -1345,7 +1345,7 @@ private:
             const auto& [tile_address, tile] = *it;
             if (restore) {
                 if (const auto backing = OwnBackingOf(tile_address, tile.size)) {
-                    registry.MapAt(tile_address, *backing, tile.size);
+                    registry.MapAt(tile_address, *backing, tile.size, 216);
                 } else {
                     registry.Unmap(tile_address, tile.size);
                 }

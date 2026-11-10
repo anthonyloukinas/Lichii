@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <map>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -110,4 +111,40 @@ TEST_CASE("NX2 destroyed memory gets a new device range when registered again",
     const u64 second = ranges.at({0x10000, 0x4000});
     REQUIRE(second != first);
     REQUIRE(registry.DeviceAddressOf(0x10000) == second);
+}
+
+TEST_CASE("NX2 index check describes mappings and their history", "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry{true};
+    registry.MapAt(7, 0x1000, 0x8000, 0x4000, 0x3000);
+    registry.Register(0x20000, 0x1000);
+    REQUIRE(registry.Describe(0x8800, 0x100).starts_with(
+        "[0x8000, +0x3000] mapped by sub 211 handle 7 offset 0x1000 cpu 0x4000"));
+    REQUIRE(registry.Describe(0x20000, 0x10).starts_with("[0x20000, +0x1000] mapped by sub 101"));
+
+    registry.Unmap(0x9000, 0x1000, 213);
+    registry.MapAt(0xa000, 0x30000, 0x1000, 216);
+    registry.UnmapMemory(0x20000, 0x1000);
+    const std::string unmapped = registry.Describe(0x9000, 0x1000);
+    REQUIRE(unmapped.starts_with("not mapped; [0x9000, +0x1000] unmapped by sub 213"));
+    REQUIRE(unmapped.find("(was sub 211 handle 7 cpu 0x5000)") != std::string::npos);
+    const std::string remapped = registry.Describe(0xa000, 0x1000);
+    REQUIRE(remapped.starts_with("[0xa000, +0x1000] mapped by sub 216 handle 0 offset 0x0 cpu 0x30000"));
+    REQUIRE(remapped.find("remapped by sub 216") != std::string::npos);
+    REQUIRE(remapped.find("(was sub 211 handle 7 cpu 0x6000)") != std::string::npos);
+    REQUIRE(registry.Describe(0x20000, 0x1000).starts_with(
+        "not mapped; [0x20000, +0x1000] destroyed by sub 102"));
+
+    for (u64 i = 0; i < 5000; ++i) {
+        registry.MapSparseTile(0x100000 + i * 0x1000, 0, 0x1000);
+    }
+    REQUIRE(registry.Describe(0x9000, 0x1000) == "not mapped");
+    REQUIRE(registry.Describe(0x100000 + 4999 * 0x1000, 0x1000).starts_with(
+        "not mapped; [0x1487000, +0x1000] tile unmapped by sub 216"));
+}
+
+TEST_CASE("NX2 registry keeps no history unless the index check is on", "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry{false};
+    registry.MapAt(7, 0, 0x8000, 0x4000, 0x1000);
+    registry.Unmap(0x8000, 0x1000, 213);
+    REQUIRE(registry.Describe(0x8000, 0x1000) == "not mapped");
 }
