@@ -120,11 +120,15 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
     // A removal frees the programs shader_infos points at without the game touching its shader
     // registers (an unmap or a remap of the memory under them): look the stages up again.
+    // A failed lookup is tried again once the address space is mapped differently: the programs
+    // may have been read between the unmap of their memory and the map that brings them back.
     const u64 removals{removal_serial.load(std::memory_order_acquire)};
-    if (!dirty[VideoCommon::Dirty::Shaders] && removals == seen_removal_serial) {
+    if (!dirty[VideoCommon::Dirty::Shaders] && removals == seen_removal_serial &&
+        (last_shaders_valid || gpu_memory->MapSerial() == resolved_map_serial)) {
         return last_shaders_valid;
     }
     seen_removal_serial = removals;
+    resolved_map_serial = gpu_memory->MapSerial();
     dirty[VideoCommon::Dirty::Shaders] = false;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
@@ -418,9 +422,13 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
     if (addr_end > rejected_lowest.load(std::memory_order_relaxed) &&
         addr <= rejected_highest.load(std::memory_order_relaxed)) {
         std::scoped_lock lock{rejected_mutex};
-        boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
+        const auto forgotten = boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
             return rejected.first >= addr && rejected.first < addr_end;
         });
+        if (forgotten != 0) {
+            // A stage that failed on this program is looked up again while it stays bound.
+            removal_serial.fetch_add(1, std::memory_order_release);
+        }
     }
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {

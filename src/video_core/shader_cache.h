@@ -202,10 +202,13 @@ private:
     std::atomic<VAddr> rejected_highest{};
     std::atomic<u64> page_serial{1};
     std::atomic<bool> removal_pending{};
-    /// Counts the removals that freed programs; RefreshStages looks the stages up again when it
-    /// has not seen the latest one (shader_infos may point at a freed program).
+    /// Counts the removals that freed programs and the rejections that were forgotten;
+    /// RefreshStages looks the stages up again when it has not seen the latest one (shader_infos
+    /// may point at a freed program, or a failed stage may now work).
     std::atomic<u64> removal_serial{};
     u64 seen_removal_serial{};
+    /// The address space's map serial at the last lookup: a failed one is retried when it moves.
+    u64 resolved_map_serial{};
 };
 
 } // namespace VideoCommon
