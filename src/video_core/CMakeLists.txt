@@ -487,14 +487,77 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
 
-# Identity of the shader translation cache: a hash of the translator's sources, refreshed on every
-# build, so a build that changes nothing there keeps the translations an earlier build stored.
+# Identity of the shader translation cache: a hash of what decides a translation's result (the
+# translator's sources and the project headers they include, the code that runs it, the SPIR-V
+# emitter library, the build configuration), refreshed on every build, so a build that changes
+# none of it keeps the translations an earlier build stored.
+get_filename_component(TRANSLATOR_HASH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(TRANSLATOR_HASH_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/translator_source_hash.cpp)
-set(TRANSLATOR_HASH_COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${CMAKE_SOURCE_DIR}
-    -DOUTPUT=${TRANSLATOR_HASH_SOURCE} -P ${CMAKE_SOURCE_DIR}/CMakeModules/GenerateTranslatorHash.cmake)
-execute_process(COMMAND ${TRANSLATOR_HASH_COMMAND} COMMAND_ERROR_IS_FATAL ANY)
+set(TRANSLATOR_HASH_INPUTS ${CMAKE_CURRENT_BINARY_DIR}/translator_hash_inputs.cmake)
+
+# The emitter the build links: its sources when it is built here, else the installed library and
+# headers. Without either the hash stays empty and the cache is not kept on disk.
+set(TRANSLATOR_EMITTER_PATHS "")
+if (sirit_SOURCE_DIR AND IS_DIRECTORY "${sirit_SOURCE_DIR}")
+    set(TRANSLATOR_EMITTER_PATHS "${sirit_SOURCE_DIR}")
+else()
+    get_target_property(translator_emitter_imported sirit::sirit IMPORTED)
+    if (translator_emitter_imported)
+        foreach (property IN ITEMS IMPORTED_LOCATION IMPORTED_LOCATION_RELEASE
+                IMPORTED_LOCATION_RELWITHDEBINFO IMPORTED_LOCATION_MINSIZEREL
+                IMPORTED_LOCATION_DEBUG IMPORTED_LOCATION_NOCONFIG)
+            get_target_property(location sirit::sirit ${property})
+            if (location)
+                list(APPEND TRANSLATOR_EMITTER_PATHS "${location}")
+            endif()
+        endforeach()
+        get_target_property(include_dirs sirit::sirit INTERFACE_INCLUDE_DIRECTORIES)
+        foreach (include_dir IN LISTS include_dirs)
+            if (IS_DIRECTORY "${include_dir}/sirit")
+                list(APPEND TRANSLATOR_EMITTER_PATHS "${include_dir}/sirit")
+            endif()
+        endforeach()
+        list(REMOVE_DUPLICATES TRANSLATOR_EMITTER_PATHS)
+    endif()
+endif()
+# The SPIR-V headers the emitter is built against: the bundled copy, else what names the
+# installed package.
+set(TRANSLATOR_HEADER_PATHS "")
+if (SPIRV-Headers_SOURCE_DIR AND IS_DIRECTORY "${SPIRV-Headers_SOURCE_DIR}/include/spirv/unified1")
+    set(TRANSLATOR_HEADER_PATHS "${SPIRV-Headers_SOURCE_DIR}/include/spirv/unified1")
+elseif (SPIRV-Headers_DIR AND IS_DIRECTORY "${SPIRV-Headers_DIR}")
+    set(TRANSLATOR_HEADER_PATHS "${SPIRV-Headers_DIR}")
+endif()
+
+get_directory_property(translator_options COMPILE_OPTIONS)
+get_directory_property(translator_definitions COMPILE_DEFINITIONS)
+set(TRANSLATOR_BUILD_CONFIG "system ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}, compiler \
+${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_CXX_COMPILER_TARGET}, unity \
+${CMAKE_UNITY_BUILD}, flags ${CMAKE_CXX_FLAGS}, options ${translator_options}, definitions \
+${translator_definitions}")
+foreach (configuration IN LISTS CMAKE_CONFIGURATION_TYPES CMAKE_BUILD_TYPE)
+    string(TOUPPER "${configuration}" configuration_upper)
+    string(APPEND TRANSLATOR_BUILD_CONFIG
+        ", ${configuration} ${CMAKE_CXX_FLAGS_${configuration_upper}}")
+endforeach()
+# Not where the checkout or the build directory lives.
+string(REPLACE "${CMAKE_BINARY_DIR}" "<build>" TRANSLATOR_BUILD_CONFIG "${TRANSLATOR_BUILD_CONFIG}")
+string(REPLACE "${TRANSLATOR_HASH_ROOT}" "<source>" TRANSLATOR_BUILD_CONFIG
+    "${TRANSLATOR_BUILD_CONFIG}")
+file(CONFIGURE OUTPUT ${TRANSLATOR_HASH_INPUTS} CONTENT
+"set(TRANSLATOR_EMITTER_PATHS [==[@TRANSLATOR_EMITTER_PATHS@]==])
+set(TRANSLATOR_HEADER_PATHS [==[@TRANSLATOR_HEADER_PATHS@]==])
+set(TRANSLATOR_BUILD_CONFIG [==[@TRANSLATOR_BUILD_CONFIG@]==])
+" @ONLY)
+
+set(TRANSLATOR_HASH_COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${TRANSLATOR_HASH_ROOT}
+    -DOUTPUT=${TRANSLATOR_HASH_SOURCE} -DINPUTS=${TRANSLATOR_HASH_INPUTS})
+set(TRANSLATOR_HASH_SCRIPT ${TRANSLATOR_HASH_ROOT}/CMakeModules/GenerateTranslatorHash.cmake)
+execute_process(
+    COMMAND ${TRANSLATOR_HASH_COMMAND} -DCONFIG=${CMAKE_BUILD_TYPE} -P ${TRANSLATOR_HASH_SCRIPT}
+    COMMAND_ERROR_IS_FATAL ANY)
 add_custom_target(translator_source_hash
-    COMMAND ${TRANSLATOR_HASH_COMMAND}
+    COMMAND ${TRANSLATOR_HASH_COMMAND} -DCONFIG=$<CONFIG> -P ${TRANSLATOR_HASH_SCRIPT}
     BYPRODUCTS ${TRANSLATOR_HASH_SOURCE}
     VERBATIM)
 target_sources(video_core PRIVATE ${TRANSLATOR_HASH_SOURCE})

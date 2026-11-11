@@ -10,6 +10,7 @@
 #include <system_error>
 #include <type_traits>
 #include <utility>
+#include <version>
 
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
@@ -228,13 +229,30 @@ size_t CapacityOf(const T& container) {
     return std::min<size_t>(container.max_size(), MaxElements);
 }
 
-// Identity of the translator: the hash of its sources taken at build time, and the compiler. Only a
-// build with a changed translator discards the modules an earlier build wrote.
+// The standard library is compiled into the translator (it decides, for one, the order a sort
+// leaves equal keys in) and can change under the same compiler.
+std::string StandardLibraryIdentity() {
+#if defined(_LIBCPP_VERSION)
+    return fmt::format("libc++ {}", _LIBCPP_VERSION);
+#elif defined(__GLIBCXX__)
+    return fmt::format("libstdc++ {}", __GLIBCXX__);
+#elif defined(_MSVC_STL_UPDATE)
+    return fmt::format("msvc stl {}", _MSVC_STL_UPDATE);
+#else
+    return "unknown";
+#endif
+}
+
+// Identity of the translator: the hash the build takes of what decides a translation's result
+// (GenerateTranslatorHash.cmake), the compiler and the standard library. Only a build that
+// changes one of them discards the modules an earlier build wrote. Empty when the build could
+// not take the hash.
 std::string BuildIdentity() {
     if (g_translator_source_hash[0] == '\0') {
         return {};
     }
-    return fmt::format("{}|{}", g_translator_source_hash, Common::g_compiler_id);
+    return fmt::format("{}|{}|{}", g_translator_source_hash, Common::g_compiler_id,
+                       StandardLibraryIdentity());
 }
 
 void WriteQueries(Writer& writer, std::span<const Query> queries) {
