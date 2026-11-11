@@ -737,6 +737,16 @@ bool InfoEqual(const Shader::Info& lhs, const Shader::Info& rhs) {
     return true;
 }
 
+bool MetaEqual(const ProgramMeta& lhs, const ProgramMeta& rhs) {
+    return lhs.stage == rhs.stage && lhs.workgroup_size == rhs.workgroup_size &&
+           lhs.output_topology == rhs.output_topology &&
+           lhs.output_vertices == rhs.output_vertices && lhs.invocations == rhs.invocations &&
+           lhs.local_memory_size == rhs.local_memory_size &&
+           lhs.shared_memory_size == rhs.shared_memory_size &&
+           lhs.is_geometry_passthrough == rhs.is_geometry_passthrough &&
+           InfoEqual(lhs.info, rhs.info);
+}
+
 bool LayoutIsCovered() {
     return CountFields<Shader::Info>() == InfoFields &&
            CountFields<Shader::Profile>() == ProfileFields &&

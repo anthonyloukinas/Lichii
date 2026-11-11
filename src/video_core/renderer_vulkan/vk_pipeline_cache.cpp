@@ -1949,6 +1949,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
                 program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
                 from_cache[index] = false;
+                if (translation_cache_verify && cached_entries[index] &&
+                    !TC::MetaEqual(cached_entries[index]->meta, TC::ProgramMeta::From(program))) {
+                    ++translation_cache_mismatches;
+                    LOG_ERROR(Render_Vulkan,
+                              "Translation cache: the stored program data of stage {} of shader "
+                              "{:016x} differs from a fresh translation",
+                              index, key.unique_hashes[index]);
+                }
             }
             ConvertLegacyToGeneric(program, runtime_info);
             code = EmitSPIRV(profile, runtime_info, program, binding);
@@ -2502,6 +2510,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     if (recording && IsTranslationCacheable(env)) {
         entry = translation_cache.Insert(stage_key, recording->TakeQueries(),
                                          TC::ProgramMeta::From(program));
+    } else if (translation_cache_verify && entry &&
+               !TC::MetaEqual(entry->meta, TC::ProgramMeta::From(program))) {
+        ++translation_cache_mismatches;
+        LOG_ERROR(Render_Vulkan,
+                  "Translation cache: the stored program data of compute shader {:016x} differs "
+                  "from a fresh translation",
+                  key.unique_hash);
     }
     LogUntrackedGlobal(key.unique_hash, Shader::Stage::Compute, program.info);
     const VkDriverIdKHR driver_id = device.GetDriverID();
