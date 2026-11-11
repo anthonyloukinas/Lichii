@@ -369,6 +369,12 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 
 std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 
+// Native draws skipped for unbuilt pipelines (native_async_draws Bounded past its budget, Skip or
+// EDEN_NX2_ASYNC_DISCARD=1) and their distinct pipelines, taken by the "Runtime pipelines" line.
+std::atomic<u64> native_skipped_draws{};
+std::atomic<u64> native_skipped_pipelines{};
+std::atomic<u64> native_skip_window{};
+
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     runtime_spirv_ns[thread].fetch_add(
@@ -1776,10 +1782,13 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
             if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
                 LOG_INFO(Render_Vulkan,
                          "Bounded pipeline wait: {:.1f} ms spent in the last 10 s (budget {} ms "
-                         "per frame)",
+                         "per frame), {} native draws skipped ({} pipelines)",
                          static_cast<double>(native_wait_used_us) / 1000.0,
-                         Settings::values.native_pipeline_wait_ms.GetValue());
+                         Settings::values.native_pipeline_wait_ms.GetValue(),
+                         bounded_skipped_draws, bounded_skipped_pipelines.size());
                 native_wait_used_us = 0;
+                bounded_skipped_draws = 0;
+                bounded_skipped_pipelines.clear();
                 window = std::chrono::steady_clock::now();
             }
             if (built) {
@@ -1788,6 +1797,9 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
             discard = true;
             break;
         }
+        }
+        if (discard) {
+            CountNativeSkip(pipeline, mode == NativePendingMode::Bounded);
         }
     }
     if (discard) {
@@ -1800,6 +1812,22 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
         }
     }
     return discard ? nullptr : pipeline;
+}
+
+void PipelineCache::CountNativeSkip(const GraphicsPipeline* pipeline, bool bounded) {
+    if (bounded) {
+        ++bounded_skipped_draws;
+        bounded_skipped_pipelines.insert(pipeline);
+    }
+    const u64 window = native_skip_window.load(std::memory_order::relaxed);
+    if (window != runtime_skip_window) {
+        runtime_skip_window = window;
+        runtime_skipped_pipelines.clear();
+    }
+    native_skipped_draws.fetch_add(1, std::memory_order::relaxed);
+    if (runtime_skipped_pipelines.insert(pipeline).second) {
+        native_skipped_pipelines.fetch_add(1, std::memory_order::relaxed);
+    }
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
@@ -2190,9 +2218,13 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
         LOG_INFO(Render_Vulkan,
                  "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
-                 "{:.1f} ms of draws held for unbuilt pipelines",
+                 "{:.1f} ms of draws held for unbuilt pipelines, {} native draws skipped "
+                 "({} pipelines)",
                  count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
-                 ms(GraphicsPipeline::TakeHoldTime()));
+                 ms(GraphicsPipeline::TakeHoldTime()),
+                 native_skipped_draws.exchange(0, std::memory_order::relaxed),
+                 native_skipped_pipelines.exchange(0, std::memory_order::relaxed));
+        native_skip_window.fetch_add(1, std::memory_order::relaxed);
         total = {};
         count = 0;
         window = now;
