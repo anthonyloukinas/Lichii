@@ -274,6 +274,8 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
+// True on a thread while a draw waits for a pipeline build (it may run the build itself).
+thread_local bool draw_waiting = false;
 } // Anonymous namespace
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
@@ -295,7 +297,8 @@ GraphicsPipeline::GraphicsPipeline(
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
-      worker_only_build{worker_thread && static_cast<bool>(emit_stages)} {
+      worker_only_build{worker_thread && static_cast<bool>(emit_stages)},
+      runtime_build{worker_thread != nullptr} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -407,9 +410,15 @@ GraphicsPipeline::GraphicsPipeline(
                 shader_notify->MarkShaderComplete();
             }
         };
+        build_where = draw_waiting ? "waiting draw's thread"
+                      : runtime_build ? "pipeline worker"
+                                      : "creating thread";
         try {
             if (emit_stages) {
                 spv_modules = emit_stages();
+                build_emit_ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - begin)
+                                    .count();
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
@@ -434,6 +443,10 @@ GraphicsPipeline::GraphicsPipeline(
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
         }
+        if (runtime_build && build_create_ms >= 50.0 &&
+            !draw_waited.load(std::memory_order::acquire)) {
+            LogBuildTiming(-1.0);
+        }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
             static std::atomic<u32> logged{};
@@ -448,9 +461,36 @@ GraphicsPipeline::GraphicsPipeline(
     std::array<bool, NUM_STAGES> present_stages{};
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         present_stages[stage] = infos[stage] != nullptr;
+        stage_mask |= present_stages[stage] ? static_cast<u8>(1U << stage) : u8{0};
     }
     configure_func = ConfigureFunc(present_stages, stage_infos);
     build.emplace(worker_thread, std::move(func));
+}
+
+/// One line per pipeline built at run time whose driver create or first draw wait took 50 ms or
+/// more. hold_ms < 0: no draw waited for it.
+void GraphicsPipeline::LogBuildTiming(double hold_ms) {
+    if (timing_logged.exchange(true, std::memory_order::relaxed)) {
+        return;
+    }
+    std::string stages;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if ((stage_mask & (1U << stage)) == 0) {
+            continue;
+        }
+        static constexpr std::array<const char*, NUM_STAGES> names{
+            "vertex", "tess control", "tess eval", "geometry", "fragment"};
+        const Shader::Info& info = stage_infos[stage];
+        stages += stages.empty() ? "" : "+";
+        stages += info.is_task ? "task" : info.is_mesh ? "mesh" : names[stage];
+    }
+    const std::string waited =
+        hold_ms < 0.0 ? std::string{"no draw waited"}
+                      : fmt::format("draw waited {:.1f} ms", hold_ms);
+    LOG_INFO(Render_Vulkan,
+             "Runtime graphics pipeline {:016x} ({}): worker SPIR-V {:.1f} ms, driver create "
+             "{:.1f} ms on the {}, {}",
+             key.Hash(), stages, build_emit_ms, build_create_ms, build_where, waited);
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -1086,12 +1126,21 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (!IsBuilt()) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const bool first_wait = !draw_waited.exchange(true, std::memory_order::acq_rel);
             const auto begin = std::chrono::steady_clock::now();
+            draw_waiting = true;
             build->Wait(!worker_only_build);
-            hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now() - begin)
-                                       .count(),
-                                   std::memory_order::relaxed);
+            draw_waiting = false;
+            const auto held = std::chrono::steady_clock::now() - begin;
+            hold_time_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(held).count(),
+                std::memory_order::relaxed);
+            if (first_wait && runtime_build) {
+                const double hold_ms = std::chrono::duration<double, std::milli>(held).count();
+                if (hold_ms >= 50.0 || build_create_ms >= 50.0) {
+                    LogBuildTiming(hold_ms);
+                }
+            }
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
@@ -1649,10 +1698,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    build_create_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                create_start)
+                          .count();
     if (log_stats) {
-        const double create_ms = std::chrono::duration<double, std::milli>(
-                                     std::chrono::steady_clock::now() - create_start)
-                                     .count();
+        const double create_ms = build_create_ms;
         PipelineCreationStats::Report(
             device, *pipeline, "graphics", key.Hash(),
             pipeline_next != nullptr ? &feedback : nullptr,
