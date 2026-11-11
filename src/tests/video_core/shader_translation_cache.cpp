@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <regex>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/shader_translation_cache.h"
 
@@ -348,6 +352,95 @@ TEST_CASE("Translation cache keeps the mesh info of task and mesh stages",
         REQUIRE(MetaEqual(entry->meta, meta));
         REQUIRE(entry->meta.mesh.payload_words == 64);
         REQUIRE(entry->meta.mesh.vertex_lines.size() == 3);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Translation cache drops damaged mesh lists and files of an older format",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_cache_mesh_damage_test.bin");
+    const Digest config{0x51, 0x52};
+    FakeEnvironment env;
+    env.SetMeshStage(Shader::Stage::Mesh, {0x00fc4314, 0x00100000, 0x00401000});
+    const Digest stage_key = MakeStageKey(env, 0x77, 3, config);
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Mesh;
+    meta.mesh.max_vertices = 64;
+    meta.mesh.max_primitives = 126;
+    meta.mesh.topology = 4;
+    meta.mesh.vertex_lines = {0x51a7, 0x51a8, 0x51a9};
+    // A full second list: the record holds more words after the first list's count than any
+    // count the structure accepts, so only the capacity check stops an oversized count.
+    meta.mesh.primitive_lines.resize(meta.mesh.primitive_lines.capacity(), 0x51b1);
+    meta.info = SampleInfo();
+
+    const auto write_file = [&] {
+        std::filesystem::remove(path);
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Insert(stage_key, {}, meta));
+    };
+    const auto read_bytes = [&] {
+        std::ifstream file{path, std::ios::binary};
+        return std::vector<char>{std::istreambuf_iterator<char>{file}, {}};
+    };
+    const auto write_bytes = [&](const std::vector<char>& bytes) {
+        std::ofstream file{path, std::ios::binary | std::ios::trunc};
+        file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto found = [&] {
+        Store store;
+        store.Open(path, config);
+        return store.FindEntry(stage_key, env) != nullptr;
+    };
+    const auto offset_of = [](const std::vector<char>& bytes, std::span<const u32> words) {
+        const auto* begin = reinterpret_cast<const char*>(words.data());
+        const auto it = std::search(bytes.begin(), bytes.end(), begin, begin + words.size_bytes());
+        REQUIRE(it != bytes.end());
+        return static_cast<size_t>(it - bytes.begin());
+    };
+    // The first list in the file: its count, then its values.
+    const std::array<u32, 4> list{3, 0x51a7, 0x51a8, 0x51a9};
+    const std::array<u32, 1> record_magic{0x52435453};
+
+    write_file();
+    REQUIRE(found());
+
+    // A count over the structure's capacity.
+    std::vector<char> bytes = read_bytes();
+    const u32 oversized = static_cast<u32>(meta.mesh.vertex_lines.capacity()) + 1;
+    REQUIRE(bytes.size() - offset_of(bytes, list) >= sizeof(u32) * (oversized + 1));
+    std::memcpy(bytes.data() + offset_of(bytes, list), &oversized, sizeof(oversized));
+    write_bytes(bytes);
+    REQUIRE_FALSE(found());
+
+    // A record that ends inside the list.
+    write_file();
+    bytes = read_bytes();
+    const size_t record = offset_of(bytes, record_magic);
+    const size_t cut = offset_of(bytes, list) + 2 * sizeof(u32);
+    const u32 length = static_cast<u32>(cut - record - 2 * sizeof(u32));
+    std::memcpy(bytes.data() + record + sizeof(u32), &length, sizeof(length));
+    bytes.resize(cut);
+    write_bytes(bytes);
+    REQUIRE_FALSE(found());
+
+    // Files of the two formats before this one (the version follows the 8 byte file magic):
+    // their entries have no mesh info and are not read; the file starts over.
+    constexpr size_t VersionOffset = 8;
+    for (const u32 age : {1u, 2u}) {
+        write_file();
+        bytes = read_bytes();
+        u32 version{};
+        std::memcpy(&version, bytes.data() + VersionOffset, sizeof(version));
+        const u32 older = version - age;
+        std::memcpy(bytes.data() + VersionOffset, &older, sizeof(older));
+        write_bytes(bytes);
+        REQUIRE_FALSE(found());
+        bytes = read_bytes();
+        u32 rewritten{};
+        std::memcpy(&rewritten, bytes.data() + VersionOffset, sizeof(rewritten));
+        REQUIRE(rewritten == version);
     }
     std::filesystem::remove(path);
 }
