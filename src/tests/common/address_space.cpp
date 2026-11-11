@@ -74,9 +74,10 @@ void CheckAtRandom(u64 start, u64 limit, u64 unit) {
         return {address + skipped * unit, (1 + next() % std::min<u64>(units - skipped, 8)) * unit};
     }};
     for (int op = 0; op < 20000; ++op) {
-        if (const auto [address, size]{free_range()}; size != 0 && next() % 100 < 10) {
-            allocator.AllocateFixed(static_cast<Va>(address), static_cast<Va>(size));
-            live.emplace(address, size);
+        if (const auto [fixed_address, fixed_size]{free_range()};
+            fixed_size != 0 && next() % 100 < 10) {
+            allocator.AllocateFixed(static_cast<Va>(fixed_address), static_cast<Va>(fixed_size));
+            live.emplace(fixed_address, fixed_size);
         } else if (live.empty() || next() % 100 < 50) {
             const u64 size{(1 + next() % 8) * unit};
             const u64 address{allocator.Allocate(static_cast<Va>(size))};
