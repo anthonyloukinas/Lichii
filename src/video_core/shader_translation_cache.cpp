@@ -225,6 +225,8 @@ private:
 };
 
 constexpr size_t MaxElements = 1 << 20;
+// No module comes near this; a damaged record must not size an allocation of gigabytes.
+constexpr u32 MaxSpirvWords = 1 << 24;
 
 // static_vector's real capacity; small_vector's static_capacity is only its inline storage.
 template <typename T>
@@ -880,6 +882,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config) {
             auto stored = std::make_shared<StoredVariant>();
             ok = reader.Get(key) && reader.Get(stored->binding_out) &&
                  ReadInfo(record, stored->info) && reader.Get(stored->spirv_words) &&
+                 stored->spirv_words <= MaxSpirvWords &&
                  reader.GetBytes(stored->compressed_spirv) && record.empty();
             if (ok) {
                 variants.insert_or_assign(key, std::move(stored));
