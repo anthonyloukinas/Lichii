@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -68,6 +69,14 @@ public:
 
     void SetHeaderWord(size_t word, u32 value) {
         std::memcpy(reinterpret_cast<u8*>(&sph) + word * sizeof(u32), &value, sizeof(value));
+    }
+    void SetMeshStage(Shader::Stage mesh_stage, const std::array<u32, 3>& registers) {
+        stage = mesh_stage;
+        mesh_registers = registers;
+    }
+    void SetPrimitiveHeaderWord(size_t word, u32 value) {
+        std::memcpy(reinterpret_cast<u8*>(&mesh_primitive_header) + word * sizeof(u32), &value,
+                    sizeof(value));
     }
 
     std::map<u64, u32> cbufs;
@@ -265,6 +274,82 @@ TEST_CASE("Translation cache stage keys cover the environment", "[video_core][tr
     env.texture_bound = 2;
     env.SetHeaderWord(4, 0x10);
     REQUIRE_FALSE(MakeStageKey(env, 0xabc, 5, config) == key);
+
+    // Task and mesh programs: the mesh registers and the primitive output header decide the
+    // program's mesh info.
+    FakeEnvironment mesh;
+    mesh.SetMeshStage(Shader::Stage::Mesh, {0x00004314, 0x00100000, 0x00401000});
+    const Digest mesh_key = MakeStageKey(mesh, 0xabc, 3, config);
+    mesh.SetMeshStage(Shader::Stage::Mesh, {0x00004311, 0x00100000, 0x00401000});
+    REQUIRE_FALSE(MakeStageKey(mesh, 0xabc, 3, config) == mesh_key);
+    mesh.SetMeshStage(Shader::Stage::Mesh, {0x00004314, 0x00100000, 0x00801000});
+    REQUIRE_FALSE(MakeStageKey(mesh, 0xabc, 3, config) == mesh_key);
+    mesh.SetMeshStage(Shader::Stage::Mesh, {0x00004314, 0x00100000, 0x00401000});
+    REQUIRE(MakeStageKey(mesh, 0xabc, 3, config) == mesh_key);
+    mesh.SetPrimitiveHeaderWord(13, 0x1);
+    REQUIRE_FALSE(MakeStageKey(mesh, 0xabc, 3, config) == mesh_key);
+    mesh.SetPrimitiveHeaderWord(13, 0);
+    mesh.SetMeshStage(Shader::Stage::Task, {0x00004314, 0x00100000, 0x00401000});
+    REQUIRE_FALSE(MakeStageKey(mesh, 0xabc, 3, config) == mesh_key);
+}
+
+TEST_CASE("Translation cache keeps the mesh info of task and mesh stages",
+          "[video_core][translation_cache]") {
+    Shader::IR::Program program;
+    program.stage = Shader::Stage::Mesh;
+    program.workgroup_size = {32, 1, 1};
+    program.mesh.payload_words = 64;
+    program.mesh.max_vertices = 64;
+    program.mesh.max_primitives = 126;
+    program.mesh.topology = 4;
+    program.mesh.vertex_lines = {7, 8, 32};
+    program.mesh.primitive_lines = {33};
+    program.info = SampleInfo();
+    program.info.is_mesh = true;
+    const ProgramMeta meta = ProgramMeta::From(program);
+    const Shader::IR::Program rebuilt = meta.ToProgram();
+    REQUIRE(rebuilt.mesh.max_primitives == 126);
+    REQUIRE(rebuilt.mesh.topology == 4);
+    REQUIRE(std::ranges::equal(rebuilt.mesh.vertex_lines, program.mesh.vertex_lines));
+    REQUIRE(std::ranges::equal(rebuilt.mesh.primitive_lines, program.mesh.primitive_lines));
+    REQUIRE(MetaEqual(ProgramMeta::From(rebuilt), meta));
+
+    // The verify mode compares the stored metadata with a fresh translation: each mesh field
+    // that differs is noticed.
+    const auto differs = [&meta](auto&& change) {
+        ProgramMeta changed = meta;
+        change(changed.mesh);
+        return !MetaEqual(changed, meta);
+    };
+    REQUIRE(differs([](Shader::MeshInfo& mesh) { mesh.payload_words = 32; }));
+    REQUIRE(differs([](Shader::MeshInfo& mesh) { mesh.max_vertices = 63; }));
+    REQUIRE(differs([](Shader::MeshInfo& mesh) { mesh.max_primitives = 0; }));
+    REQUIRE(differs([](Shader::MeshInfo& mesh) { mesh.topology = 0; }));
+    REQUIRE(differs([](Shader::MeshInfo& mesh) { mesh.vertex_lines.pop_back(); }));
+    REQUIRE(differs([](Shader::MeshInfo& mesh) { mesh.primitive_lines.clear(); }));
+
+    // The mesh info survives the file.
+    const auto path = TempPath("lichii_translation_cache_mesh_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{0x41, 0x42};
+    FakeEnvironment env;
+    env.SetMeshStage(Shader::Stage::Mesh, {0x00fc4314, 0x00100000, 0x00401000});
+    const Digest stage_key = MakeStageKey(env, 0x99, 3, config);
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Insert(stage_key, {}, meta));
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.FindEntry(stage_key, env);
+        REQUIRE(entry);
+        REQUIRE(MetaEqual(entry->meta, meta));
+        REQUIRE(entry->meta.mesh.payload_words == 64);
+        REQUIRE(entry->meta.mesh.vertex_lines.size() == 3);
+    }
+    std::filesystem::remove(path);
 }
 
 TEST_CASE("Translation cache runtime info digest covers emitted state",

@@ -153,6 +153,9 @@ struct ProgramMeta {
     u32 local_memory_size{};
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
+    /// Task and mesh: MakeRuntimeInfo reads the mesh stage's topology and, for the fragment stage
+    /// behind it, its primitive lines.
+    Shader::MeshInfo mesh{};
     Shader::Info info;
 
     [[nodiscard]] static ProgramMeta From(const Shader::IR::Program& program);
@@ -180,7 +183,8 @@ struct Variant {
 /// Field-by-field equality of two infos (byte comparison would include struct padding).
 [[nodiscard]] bool InfoEqual(const Shader::Info& lhs, const Shader::Info& rhs);
 
-/// Equality of what an entry keeps of two programs, their infos compared field by field.
+/// Equality of what an entry keeps of two programs, their infos and mesh infos compared field by
+/// field.
 [[nodiscard]] bool MetaEqual(const ProgramMeta& lhs, const ProgramMeta& rhs);
 
 /// Serialization of the shader info, exposed for tests.

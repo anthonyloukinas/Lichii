@@ -42,7 +42,9 @@ namespace {
 // 9: RuntimeInfo gains noperspective_outputs / scaled_noperspective_inputs (upstream #820).
 // 11: stored SPIR-V changed: upstream #1051 saturates signed F32 to S32 F2I before the conversion
 //     (10 is taken by the #353 frag_color_components port).
-constexpr u32 FormatVersion = 11;
+// 13: entries keep the mesh info, task and mesh stages are cached; EDEN_NX2_MESH_FIRST is part
+//     of the configuration (12 is taken by the hedge vegetation branch).
+constexpr u32 FormatVersion = 13;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -144,6 +146,7 @@ constexpr size_t ProfileFields = 76;
 constexpr size_t HostFields = 23;
 constexpr size_t RuntimeInfoFields = 21;
 constexpr size_t ProgramFields = 13;
+constexpr size_t MeshInfoFields = 6;
 constexpr size_t BindingsFields = 7;
 
 class Writer {
@@ -291,6 +294,12 @@ void WriteMeta(std::vector<u8>& out, const ProgramMeta& meta) {
     writer.Put(meta.local_memory_size);
     writer.Put(meta.shared_memory_size);
     writer.Put(meta.is_geometry_passthrough);
+    writer.Put(meta.mesh.payload_words);
+    writer.Put(meta.mesh.max_vertices);
+    writer.Put(meta.mesh.max_primitives);
+    writer.Put(meta.mesh.topology);
+    writer.PutVector(meta.mesh.vertex_lines);
+    writer.PutVector(meta.mesh.primitive_lines);
     WriteInfo(out, meta.info);
 }
 
@@ -300,7 +309,18 @@ bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
            reader.Get(meta.output_topology) && reader.Get(meta.output_vertices) &&
            reader.Get(meta.invocations) && reader.Get(meta.local_memory_size) &&
            reader.Get(meta.shared_memory_size) && reader.Get(meta.is_geometry_passthrough) &&
+           reader.Get(meta.mesh.payload_words) && reader.Get(meta.mesh.max_vertices) &&
+           reader.Get(meta.mesh.max_primitives) && reader.Get(meta.mesh.topology) &&
+           reader.GetVector(meta.mesh.vertex_lines, CapacityOf(meta.mesh.vertex_lines)) &&
+           reader.GetVector(meta.mesh.primitive_lines, CapacityOf(meta.mesh.primitive_lines)) &&
            ReadInfo(in, meta.info);
+}
+
+bool MeshEqual(const Shader::MeshInfo& lhs, const Shader::MeshInfo& rhs) {
+    return lhs.payload_words == rhs.payload_words && lhs.max_vertices == rhs.max_vertices &&
+           lhs.max_primitives == rhs.max_primitives && lhs.topology == rhs.topology &&
+           std::ranges::equal(lhs.vertex_lines, rhs.vertex_lines) &&
+           std::ranges::equal(lhs.primitive_lines, rhs.primitive_lines);
 }
 
 Digest EntryId(const Digest& stage_key, std::span<const Query> queries) {
@@ -555,7 +575,8 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(Settings::values.disable_shader_loop_safety_checks.GetValue());
     hasher.Add(Settings::values.renderer_debug.GetValue());
     hasher.Add(Settings::values.fix_bloom_effects.GetValue());
-    for (const char* variable : {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR"}) {
+    for (const char* variable :
+         {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR", "EDEN_NX2_MESH_FIRST"}) {
         const char* value = std::getenv(variable);
         hasher.AddString(value ? value : "\x01unset");
     }
@@ -608,6 +629,7 @@ ProgramMeta ProgramMeta::From(const Shader::IR::Program& program) {
         .local_memory_size = program.local_memory_size,
         .shared_memory_size = program.shared_memory_size,
         .is_geometry_passthrough = program.is_geometry_passthrough,
+        .mesh = program.mesh,
         .info = program.info,
     };
 }
@@ -623,6 +645,7 @@ Shader::IR::Program ProgramMeta::ToProgram() const {
     program.local_memory_size = local_memory_size;
     program.shared_memory_size = shared_memory_size;
     program.is_geometry_passthrough = is_geometry_passthrough;
+    program.mesh = mesh;
     return program;
 }
 
@@ -744,7 +767,7 @@ bool MetaEqual(const ProgramMeta& lhs, const ProgramMeta& rhs) {
            lhs.local_memory_size == rhs.local_memory_size &&
            lhs.shared_memory_size == rhs.shared_memory_size &&
            lhs.is_geometry_passthrough == rhs.is_geometry_passthrough &&
-           InfoEqual(lhs.info, rhs.info);
+           MeshEqual(lhs.mesh, rhs.mesh) && InfoEqual(lhs.info, rhs.info);
 }
 
 bool LayoutIsCovered() {
@@ -753,6 +776,7 @@ bool LayoutIsCovered() {
            CountFields<Shader::HostTranslateInfo>() == HostFields &&
            CountFields<Shader::RuntimeInfo>() == RuntimeInfoFields &&
            CountFields<Shader::IR::Program>() == ProgramFields &&
+           CountFields<Shader::MeshInfo>() == MeshInfoFields &&
            CountFields<Shader::Backend::Bindings>() == BindingsFields;
 }
 
