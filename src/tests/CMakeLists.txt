@@ -45,6 +45,7 @@ add_executable(tests
     video_core/storage_buffer_pointer_tracking.cpp
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
+    video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
@@ -110,6 +111,8 @@ add_executable(tests
     video_core/ampere_matrix.cpp
     video_core/spirv_software_matrix.cpp
     video_core/spirv_builtin_capabilities.cpp
+    video_core/spirv_scalar_constants.cpp
+    video_core/ssa_fixed_variables.cpp
     video_core/virtual_range_cache.cpp
     video_core/page_filter.cpp
     video_core/pipeline_clean.cpp
