@@ -20,11 +20,11 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/shader_translation_cache.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
 namespace VideoCommon::TranslationCache {
+
+// Defined in translator_source_hash.cpp, which the build generates (GenerateTranslatorHash.cmake).
+extern const char g_translator_source_hash[];
+
 namespace {
 
 // Bump when the file layout or what a key covers changes.
@@ -228,32 +228,13 @@ size_t CapacityOf(const T& container) {
     return std::min<size_t>(container.max_size(), MaxElements);
 }
 
-// Identity of the running build: the commit and the executable's size and modification time,
-// so a rebuild with a changed translator never reads modules the old one wrote.
+// Identity of the translator: the hash of its sources taken at build time, and the compiler. Only a
+// build with a changed translator discards the modules an earlier build wrote.
 std::string BuildIdentity() {
-    std::string identity = fmt::format("{}|{}|{}", Common::g_scm_rev, Common::g_build_fullname,
-                                       Common::g_compiler_id);
-    std::filesystem::path exe;
-#ifdef _WIN32
-    wchar_t exe_path[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) != 0) {
-        exe = exe_path;
+    if (g_translator_source_hash[0] == '\0') {
+        return {};
     }
-#elif defined(__linux__)
-    exe = "/proc/self/exe";
-#endif
-    std::error_code ec;
-    if (!exe.empty()) {
-        const auto size = std::filesystem::file_size(exe, ec);
-        if (!ec) {
-            const auto time = std::filesystem::last_write_time(exe, ec);
-            if (!ec) {
-                return fmt::format("{}|{}|{}", identity, size,
-                                   time.time_since_epoch().count());
-            }
-        }
-    }
-    return {};
+    return fmt::format("{}|{}", g_translator_source_hash, Common::g_compiler_id);
 }
 
 void WriteQueries(Writer& writer, std::span<const Query> queries) {

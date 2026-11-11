@@ -487,6 +487,19 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
 
+# Identity of the shader translation cache: a hash of the translator's sources, refreshed on every
+# build, so a build that changes nothing there keeps the translations an earlier build stored.
+set(TRANSLATOR_HASH_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/translator_source_hash.cpp)
+set(TRANSLATOR_HASH_COMMAND ${CMAKE_COMMAND} -DSOURCE_ROOT=${CMAKE_SOURCE_DIR}
+    -DOUTPUT=${TRANSLATOR_HASH_SOURCE} -P ${CMAKE_SOURCE_DIR}/CMakeModules/GenerateTranslatorHash.cmake)
+execute_process(COMMAND ${TRANSLATOR_HASH_COMMAND} COMMAND_ERROR_IS_FATAL ANY)
+add_custom_target(translator_source_hash
+    COMMAND ${TRANSLATOR_HASH_COMMAND}
+    BYPRODUCTS ${TRANSLATOR_HASH_SOURCE}
+    VERBATIM)
+target_sources(video_core PRIVATE ${TRANSLATOR_HASH_SOURCE})
+add_dependencies(video_core translator_source_hash)
+
 target_link_libraries(video_core PRIVATE sirit::sirit)
 
 # Header-only stuff needed by all dependent targets
