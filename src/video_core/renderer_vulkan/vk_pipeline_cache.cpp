@@ -944,9 +944,7 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
 }
 
 bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const {
-    const Shader::Stage stage = env.ShaderStage();
-    if (stage == Shader::Stage::VertexA || stage == Shader::Stage::Task ||
-        stage == Shader::Stage::Mesh) {
+    if (env.ShaderStage() == Shader::Stage::VertexA) {
         return false;
     }
     return env.CanCacheTranslation();
