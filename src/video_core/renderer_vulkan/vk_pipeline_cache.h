@@ -185,7 +185,11 @@ private:
 
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
+
+    /// Counts a native draw skipped for its unbuilt `pipeline` for the 10 s log lines; `bounded`
+    /// also counts it for the "Bounded pipeline wait" line.
+    void CountNativeSkip(const GraphicsPipeline* pipeline, bool bounded);
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now.
@@ -252,6 +256,18 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
+    /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
+    /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
+    s64 native_wait_budget_us{8000};
+    s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
+    /// Native draws skipped for unbuilt pipelines and their distinct pipelines, since the last
+    /// "Bounded pipeline wait" line (GPU thread only).
+    u64 bounded_skipped_draws{};
+    std::unordered_set<const GraphicsPipeline*> bounded_skipped_pipelines;
+    /// Distinct pipelines behind the skips counted for the "Runtime pipelines" line, cleared when
+    /// that line starts a new window (native_skip_window changes).
+    std::unordered_set<const GraphicsPipeline*> runtime_skipped_pipelines;
+    u64 runtime_skip_window{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     VideoCommon::EvictedPointerSlots evicted_pointer_slots;

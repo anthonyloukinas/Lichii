@@ -203,6 +203,11 @@ public:
         return build->IsBuilt();
     }
 
+    /// Waits up to `timeout` for the build; true when built.
+    [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout) const {
+        return build->WaitFor(timeout);
+    }
+
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
     }
@@ -389,6 +394,17 @@ private:
     u64 last_descriptor_buffer_generation{};
 
     const bool worker_only_build;
+    /// Built at run time (on a pipeline worker or a waiting draw), not by the boot preload.
+    const bool runtime_build;
+    /// Build timing for the "Runtime graphics pipeline" line: written by the build, read once it
+    /// is complete.
+    double build_emit_ms{};
+    double build_create_ms{};
+    const char* build_where{""};
+    u8 stage_mask{};
+    std::atomic_bool draw_waited{};
+    std::atomic_bool timing_logged{};
+    void LogBuildTiming(double hold_ms);
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     std::optional<PipelineBuild> build;

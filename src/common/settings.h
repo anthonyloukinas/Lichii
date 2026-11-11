@@ -635,6 +635,24 @@ struct Values {
     SwitchableSetting<bool> preload_all_pipelines{linkage, false, "preload_all_pipelines",
                                                   Category::RendererAdvanced};
 
+    SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
+                                                           NativeAsyncDraws::Wait,
+                                                           "native_async_draws",
+                                                           Category::RendererAdvanced,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
+
+    SwitchableSetting<u32, true> native_pipeline_wait_ms{linkage,
+                                                         8,
+                                                         1,
+                                                         100,
+                                                         "native_pipeline_wait_ms",
+                                                         Category::RendererAdvanced,
+                                                         Specialization::Countable,
+                                                         true,
+                                                         true};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
