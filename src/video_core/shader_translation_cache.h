@@ -180,6 +180,9 @@ struct Variant {
 /// Field-by-field equality of two infos (byte comparison would include struct padding).
 [[nodiscard]] bool InfoEqual(const Shader::Info& lhs, const Shader::Info& rhs);
 
+/// Equality of what an entry keeps of two programs, their infos compared field by field.
+[[nodiscard]] bool MetaEqual(const ProgramMeta& lhs, const ProgramMeta& rhs);
+
 /// Serialization of the shader info, exposed for tests.
 void WriteInfo(std::vector<u8>& out, const Shader::Info& info);
 [[nodiscard]] bool ReadInfo(std::span<const u8>& in, Shader::Info& info);
