@@ -75,6 +75,9 @@ struct Runtime {
         return true;
     }
     void WaitSubmittedTick(u64) {}
+    void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
+        std::memset(buffer.bytes.data() + offset, static_cast<int>(value), size);
+    }
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
         return false;
     }
@@ -97,6 +100,10 @@ struct Runtime {
             });
             ++downloads;
         }
+    }
+    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
+                    bool) {
+        CopyBuffer(dst, &src, copies, true, true);
     }
     void CopyBuffer(Buffer& dst, Buffer* src, std::span<const VideoCommon::BufferCopy> copies, bool,
                     bool) {
