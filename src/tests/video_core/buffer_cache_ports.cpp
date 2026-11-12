@@ -793,3 +793,26 @@ TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buf
     REQUIRE(resolved != id);
     REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
 }
+
+TEST_CASE("Claimed CPU writes keep their bytes when an earlier one downloads their page",
+          "[buffer_ports]") {
+    Fixture f;
+    // The download branch of WriteMemory: Switch 2 titles upload inline instead.
+    const bool ampere = Tegra::g_nx2_ampere.exchange(false);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x12);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    std::memset(f.bytes + 0x10100, 0xaa, 0x10);
+    std::memset(f.bytes + 0x10800, 0xbb, 0x10);
+    const std::array<std::pair<DAddr, std::size_t>, 2> ranges{{{0x20100, 0x10}, {0x20800, 0x10}}};
+    f.cache->ClaimCpuWrites(ranges);
+    for (const auto& [address, size] : ranges) {
+        f.cache->WriteMemory(address, size);
+    }
+    Tegra::g_nx2_ampere.store(ampere);
+    REQUIRE(f.bytes[0x10000] == 0x12);
+    REQUIRE(f.bytes[0x10100] == 0xaa);
+    REQUIRE(f.bytes[0x10800] == 0xbb);
+    REQUIRE(f.bytes[0x1080f] == 0xbb);
+    REQUIRE(f.bytes[0x10810] == 0x12);
+}
