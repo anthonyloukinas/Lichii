@@ -320,12 +320,7 @@ bool IsTextureInstruction(const IR::Inst& inst) {
 // Per-pass caches
 
 static inline u32 ReadCbufCached(Environment& env, u32 index, u32 offset) {
-    const CbufWordKey k{index, offset};
-    if (auto it = env.cbuf_word_cache.find(k); it != env.cbuf_word_cache.end())
-        return it->second;
-    const u32 v = env.ReadCbufValue(index, offset);
-    env.cbuf_word_cache.emplace(k, v);
-    return v;
+    return env.ReadCbufWord(index, offset);
 }
 
 static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr& cbuf) {

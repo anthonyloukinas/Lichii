@@ -134,12 +134,19 @@ public:
     }
 
 private:
+    /// A word of the inner environment, read once for the whole translation: the values recorded
+    /// and the handles resolved here come from the same read.
+    [[nodiscard]] u32 InnerWord(u32 cbuf_index, u32 cbuf_offset);
+    [[nodiscard]] u32 InnerHandle(const Shader::ConstBufferAddr& addr);
+
     Shader::Environment& inner;
     std::vector<Query> queries;
+    Common::unordered_map<Shader::CbufWordKey, u32, Shader::CbufWordKeyHash> inner_words;
 };
 
 /// Asks the live environment the recorded queries in order; true when every answer matches.
 /// Stops at the first mismatch, so it never makes a query the translation would not make.
+/// Reads each constant buffer word once.
 [[nodiscard]] bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env);
 
 /// Key of a stage: its hash and the environment values the translator reads besides queries.

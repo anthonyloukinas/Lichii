@@ -21,6 +21,7 @@ class HandleEnvironment final : public Shader::Environment {
 public:
     bool integer_texture{};
     u32 format_reads{};
+    u32 cbuf_reads{};
     u32 expected_handle{0xabc};
     std::map<std::pair<u32, u32>, u32> cbuf_values{{{0, 0}, 0xabc}};
 
@@ -28,6 +29,7 @@ public:
     u32 ReadCbufValue(u32 index, u32 offset) override {
         const auto it = cbuf_values.find({index, offset});
         REQUIRE(it != cbuf_values.end());
+        ++cbuf_reads;
         return it->second;
     }
     Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
@@ -345,11 +347,15 @@ TEST_CASE("The texture pass asks about a static handle by its address",
     for (const Query& query : queries) {
         CHECK(query.kind != QueryKind::CbufValue);
     }
+    // However many queries the pass makes about the texture, its handle word is read once.
+    CHECK(queries.size() > 1);
+    CHECK(shader.env.cbuf_reads == 1);
 
     // The same texture under another handle is the same translation.
     shader.env.cbuf_values[{0, 0}] = 0xdef;
     shader.env.expected_handle = 0xdef;
     CHECK(ReplayQueries(queries, shader.env));
+    CHECK(shader.env.cbuf_reads == 2);
     shader.env.integer_texture = true;
     CHECK_FALSE(ReplayQueries(queries, shader.env));
 }

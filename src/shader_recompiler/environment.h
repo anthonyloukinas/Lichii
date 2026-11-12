@@ -71,6 +71,16 @@ struct ConstBufferAddr {
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
 };
 
+/// The texture handle the words at `addr` make. `read_word(index, offset)` gives a word.
+template <typename ReadWord>
+[[nodiscard]] u32 CombineTextureHandle(const ConstBufferAddr& addr, ReadWord&& read_word) {
+    const u32 primary{read_word(addr.index, addr.offset)};
+    const u32 secondary{addr.has_secondary
+                            ? read_word(addr.secondary_index, addr.secondary_offset)
+                            : primary};
+    return (primary << addr.shift_left) | (secondary << addr.secondary_shift_left);
+}
+
 // A query added here must also be recorded in VideoCommon::TranslationCache::RecordingEnvironment.
 class Environment {
 public:
@@ -113,14 +123,22 @@ public:
 
     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
 
+    /// ReadCbufValue, asked once per word between two clears of cbuf_word_cache (a texture pass).
+    [[nodiscard]] u32 ReadCbufWord(u32 cbuf_index, u32 cbuf_offset) {
+        const CbufWordKey key{cbuf_index, cbuf_offset};
+        if (const auto it = cbuf_word_cache.find(key); it != cbuf_word_cache.end()) {
+            return it->second;
+        }
+        const u32 value{ReadCbufValue(cbuf_index, cbuf_offset)};
+        cbuf_word_cache.emplace(key, value);
+        return value;
+    }
+
     /// The texture handle held at `addr` (not for a handle computed per draw).
     [[nodiscard]] virtual u32 ReadTextureHandle(const ConstBufferAddr& addr) {
-        const u32 secondary_index{addr.has_secondary ? addr.secondary_index : addr.index};
-        const u32 secondary_offset{addr.has_secondary ? addr.secondary_offset : addr.offset};
-        const u32 lhs{ReadCbufValue(addr.index, addr.offset) << addr.shift_left};
-        const u32 rhs{ReadCbufValue(secondary_index, secondary_offset)
-                      << addr.secondary_shift_left};
-        return lhs | rhs;
+        return CombineTextureHandle(addr, [this](u32 cbuf_index, u32 cbuf_offset) {
+            return ReadCbufWord(cbuf_index, cbuf_offset);
+        });
     }
 
     /// The texture queries for the handle held at `addr`. A translation that asks these depends

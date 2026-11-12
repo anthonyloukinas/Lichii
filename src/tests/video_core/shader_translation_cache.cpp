@@ -33,7 +33,9 @@ public:
     }
     u32 ReadCbufValue(u32 index, u32 offset) override {
         ++reads;
-        return cbufs[(u64{index} << 32) | offset];
+        u32& word = cbufs[(u64{index} << 32) | offset];
+        // A guest that writes the buffer during the translation: every read sees another value.
+        return drifting ? word++ : word;
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
         return array_handles.contains(handle) ? Shader::TextureType::ColorArray2D
@@ -88,6 +90,7 @@ public:
     u32 viewport = 1;
     u32 texture_bound = 2;
     u32 reads = 0;
+    bool drifting = false;
     std::set<std::tuple<u32, u32, u32>> table_pointers;
     u32 table_queries = 0;
     std::set<u32> array_handles{7};
@@ -388,6 +391,116 @@ TEST_CASE("Translation cache keeps a handle word that is read as a value",
         env.cbufs[(u64{300} << 32) | 0x30] = 9;
         REQUIRE_FALSE(ReplayQueries(queries, env));
     }
+}
+
+TEST_CASE("Translation cache reads a constant buffer word once", "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 word = (u64{1} << 32) | 0x30;
+    Shader::ConstBufferAddr addr{};
+    addr.index = 1;
+    addr.offset = 0x30;
+    env.cbufs[word] = 7;
+    {
+        // Queries about the texture, the word as a value, the texture again: one read. The value
+        // is recorded although the word had been read for the handle.
+        RecordingEnvironment recording{env};
+        (void)recording.ReadTextureTypeAt(addr);
+        (void)recording.ReadTexturePixelFormatAt(addr);
+        (void)recording.IsTexturePixelFormatIntegerAt(addr);
+        REQUIRE(recording.ReadCbufValue(1, 0x30) == 7);
+        (void)recording.ReadTextureTypeAt(addr);
+        REQUIRE(env.reads == 1);
+        const std::vector<Query> queries = recording.TakeQueries();
+        REQUIRE(queries.size() == 5);
+        REQUIRE(queries[3].kind == QueryKind::CbufValue);
+        REQUIRE(queries[3].answer == 7);
+        env.reads = 0;
+        REQUIRE(ReplayQueries(queries, env));
+        REQUIRE(env.reads == 1);
+    }
+    {
+        // The value first, then the handle.
+        env.reads = 0;
+        RecordingEnvironment recording{env};
+        REQUIRE(recording.ReadCbufValue(1, 0x30) == 7);
+        REQUIRE(recording.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+        REQUIRE(env.reads == 1);
+        REQUIRE(recording.TakeQueries().size() == 2);
+    }
+    {
+        // A word the guest writes meanwhile: every answer comes from the first read.
+        env.drifting = true;
+        RecordingEnvironment recording{env};
+        REQUIRE(recording.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+        REQUIRE(recording.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+        REQUIRE(recording.ReadCbufValue(1, 0x30) == 7);
+        const std::vector<Query> queries = recording.TakeQueries();
+        env.cbufs[word] = 7;
+        REQUIRE(ReplayQueries(queries, env));
+        env.drifting = false;
+        env.cbufs[word] = 7;
+    }
+    {
+        // Without the cache the handle's single word is read once as well, until the texture
+        // pass clears its words.
+        env.reads = 0;
+        REQUIRE(env.ReadTextureHandle(addr) == 7);
+        REQUIRE(env.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+        REQUIRE(env.reads == 1);
+        env.cbuf_word_cache.clear();
+        REQUIRE(env.ReadTextureHandle(addr) == 7);
+        REQUIRE(env.reads == 2);
+    }
+}
+
+TEST_CASE("Translation cache holds the widest handle address by address",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 first = (u64{255} << 32) | 0x10;
+    const u64 second = (u64{255} << 32) | 0x14;
+    Shader::ConstBufferAddr addr{};
+    addr.index = 255;
+    addr.offset = 0x10;
+    addr.shift_left = 31;
+    addr.has_secondary = true;
+    addr.secondary_index = 255;
+    addr.secondary_offset = 0x14;
+    env.cbufs[first] = 1;
+    env.cbufs[second] = 5;
+    for (const bool swapped : {false, true}) {
+        if (swapped) {
+            std::swap(addr.shift_left, addr.secondary_shift_left);
+        }
+        const u32 handle = swapped ? (1U | (5U << 31)) : ((1U << 31) | 5U);
+        env.array_handles = {handle};
+        env.cbuf_word_cache.clear();
+        REQUIRE(env.ReadTextureHandle(addr) == handle);
+        RecordingEnvironment recording{env};
+        REQUIRE(recording.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+        const std::vector<Query> queries = recording.TakeQueries();
+        REQUIRE(queries.size() == 1);
+        REQUIRE(queries[0].kind == QueryKind::TextureTypeAt);
+        REQUIRE(ReplayQueries(queries, env));
+        // The word shifted by 31 keeps its lowest bit only.
+        env.cbufs[swapped ? second : first] = 2;
+        REQUIRE_FALSE(ReplayQueries(queries, env));
+        env.cbufs[swapped ? second : first] = swapped ? 5 : 1;
+    }
+
+    // One buffer index further is recorded by value: one value per word, then the query.
+    Shader::ConstBufferAddr wide = addr;
+    wide.secondary_index = 256;
+    env.cbufs[(u64{256} << 32) | 0x14] = 5;
+    RecordingEnvironment recording{env};
+    (void)recording.ReadTextureTypeAt(wide);
+    (void)recording.ReadTextureTypeAt(wide);
+    const std::vector<Query> queries = recording.TakeQueries();
+    REQUIRE(queries.size() == 4);
+    REQUIRE(queries[0].kind == QueryKind::CbufValue);
+    REQUIRE(queries[1].kind == QueryKind::CbufValue);
+    REQUIRE(queries[2].kind == QueryKind::TextureType);
+    REQUIRE(queries[3].kind == QueryKind::TextureType);
+    REQUIRE(ReplayQueries(queries, env));
 }
 
 TEST_CASE("Translation cache stage keys cover the environment", "[video_core][translation_cache]") {

@@ -442,8 +442,24 @@ bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 off
     return answer;
 }
 
+u32 RecordingEnvironment::InnerWord(u32 cbuf_index, u32 cbuf_offset) {
+    const Shader::CbufWordKey key{cbuf_index, cbuf_offset};
+    if (const auto it = inner_words.find(key); it != inner_words.end()) {
+        return it->second;
+    }
+    const u32 value = inner.ReadCbufValue(cbuf_index, cbuf_offset);
+    inner_words.emplace(key, value);
+    return value;
+}
+
+u32 RecordingEnvironment::InnerHandle(const Shader::ConstBufferAddr& addr) {
+    return Shader::CombineTextureHandle(addr, [this](u32 cbuf_index, u32 cbuf_offset) {
+        return InnerWord(cbuf_index, cbuf_offset);
+    });
+}
+
 u32 RecordingEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    const u32 answer = inner.ReadCbufValue(cbuf_index, cbuf_offset);
+    const u32 answer = InnerWord(cbuf_index, cbuf_offset);
     queries.push_back({QueryKind::CbufValue, cbuf_index, cbuf_offset, answer});
     return answer;
 }
@@ -477,7 +493,7 @@ Shader::TextureType RecordingEnvironment::ReadTextureTypeAt(const Shader::ConstB
         // Recorded by value: the handle's words, then the query for that handle.
         return Shader::Environment::ReadTextureTypeAt(addr);
     }
-    const auto answer = inner.ReadTextureTypeAt(addr);
+    const auto answer = inner.ReadTextureType(InnerHandle(addr));
     query->answer = static_cast<u32>(answer);
     queries.push_back(*query);
     return answer;
@@ -489,7 +505,7 @@ Shader::TexturePixelFormat RecordingEnvironment::ReadTexturePixelFormatAt(
     if (!query) {
         return Shader::Environment::ReadTexturePixelFormatAt(addr);
     }
-    const auto answer = inner.ReadTexturePixelFormatAt(addr);
+    const auto answer = inner.ReadTexturePixelFormat(InnerHandle(addr));
     query->answer = static_cast<u32>(answer);
     queries.push_back(*query);
     return answer;
@@ -500,7 +516,7 @@ bool RecordingEnvironment::IsTexturePixelFormatIntegerAt(const Shader::ConstBuff
     if (!query) {
         return Shader::Environment::IsTexturePixelFormatIntegerAt(addr);
     }
-    const bool answer = inner.IsTexturePixelFormatIntegerAt(addr);
+    const bool answer = inner.IsTexturePixelFormatInteger(InnerHandle(addr));
     query->answer = answer ? 1U : 0U;
     queries.push_back(*query);
     return answer;
@@ -553,11 +569,22 @@ void RecordingEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
 }
 
 bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
+    // A word is read once, so a value and a handle taken from it agree.
+    Common::unordered_map<Shader::CbufWordKey, u32, Shader::CbufWordKeyHash> words;
+    const auto read_word = [&](u32 cbuf_index, u32 cbuf_offset) {
+        const Shader::CbufWordKey key{cbuf_index, cbuf_offset};
+        if (const auto it = words.find(key); it != words.end()) {
+            return it->second;
+        }
+        const u32 value = env.ReadCbufValue(cbuf_index, cbuf_offset);
+        words.emplace(key, value);
+        return value;
+    };
     for (const Query& query : queries) {
         u32 answer{};
         switch (query.kind) {
         case QueryKind::CbufValue:
-            answer = env.ReadCbufValue(query.a, query.b);
+            answer = read_word(query.a, query.b);
             break;
         case QueryKind::TextureType:
             answer = static_cast<u32>(env.ReadTextureType(query.a));
@@ -589,12 +616,13 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
             if (!addr) {
                 return false;
             }
+            const u32 handle = Shader::CombineTextureHandle(*addr, read_word);
             if (query.kind == QueryKind::TextureTypeAt) {
-                answer = static_cast<u32>(env.ReadTextureTypeAt(*addr));
+                answer = static_cast<u32>(env.ReadTextureType(handle));
             } else if (query.kind == QueryKind::TexturePixelFormatAt) {
-                answer = static_cast<u32>(env.ReadTexturePixelFormatAt(*addr));
+                answer = static_cast<u32>(env.ReadTexturePixelFormat(handle));
             } else {
-                answer = env.IsTexturePixelFormatIntegerAt(*addr) ? 1U : 0U;
+                answer = env.IsTexturePixelFormatInteger(handle) ? 1U : 0U;
             }
             break;
         }
