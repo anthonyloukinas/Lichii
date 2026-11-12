@@ -26,6 +26,8 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_draw_runs.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3314,9 +3316,55 @@ private:
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
-    u32 ProcessShadowRam(u32 method, u32 argument);
+    /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
+    /// (tracked in shadow_state when tracking), or the shadow copy when replaying. Defined here,
+    /// as the hot method paths call it for nearly every write.
+    u32 ProcessShadowRam(u32 method, u32 argument) {
+        const auto control = shadow_state.shadow_ram_control;
+        if (control == Regs::ShadowRamControl::Track ||
+            control == Regs::ShadowRamControl::TrackWithFilter) {
+            return shadow_state.reg_array[method] = argument;
+        }
+        if (control == Regs::ShadowRamControl::Replay) {
+            return shadow_state.reg_array[method];
+        }
+        return argument;
+    }
 
-    void ProcessDirtyRegisters(u32 method, u32 argument);
+    /// Stores a register's value and sets its dirty flags. Defined here for the same reason; the
+    /// diagnostics' hooks stay out of line.
+    void ProcessDirtyRegisters(u32 method, u32 argument) {
+        // The instances after the first are drawn together once their loop ends, and they must see
+        // the state they were begun with: NVN's draw macros reset the base instance (and its copy
+        // in c[0][0x644]) right after the loop, before the macro returns.
+        if (draw_manager.HasDeferredDraw() &&
+            !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+            draw_manager.DrawDeferred(*this, true);
+        }
+        if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
+            NoteDrawRunsWrite(method, argument);
+        }
+        if (VideoCommon::Nx2FastDraw::g_enabled && regs.reg_array[method] != argument &&
+            !IsFastDrawParameter(method)) [[unlikely]] {
+            NoteFastDrawRegister(method);
+        }
+        regs.reg_array[method] = argument;
+        for (const auto& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    }
+
+    /// EDEN_NX2_FAST_DRAW: a changed register that isn't a draw parameter (ProcessDirtyRegisters).
+    void NoteFastDrawRegister(u32 method);
+
+    /// CallMethodFast for a state register (not in execution_mask): a write of the value the
+    /// register holds changes nothing (EDEN_NX2_SKIP_SAME=0 keeps it).
+    void WriteStateRegister(u32 method, u32 method_argument) {
+        const u32 argument = ProcessShadowRam(method, method_argument);
+        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
+        }
+    }
 
     void ConsumeSinkImpl(Core::System& system) override;
 

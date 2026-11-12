@@ -335,16 +335,6 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
     return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
 }
 
-u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
-    // Keep track of the register value in shadow_state when requested.
-    auto const c = shadow_state.shadow_ram_control;
-    if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
-        return shadow_state.reg_array[method] = argument;
-    else if (c == Regs::ShadowRamControl::Replay)
-        return shadow_state.reg_array[method];
-    return argument;
-}
-
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
@@ -397,39 +387,24 @@ void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
     }
 }
 
-void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
-    // The instances after the first are drawn together once their loop ends, and they must see
-    // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
-    // c[0][0x644]) right after the loop, before the macro returns.
-    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
-        draw_manager.DrawDeferred(*this, true);
-    }
-    if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
-        NoteDrawRunsWrite(method, argument);
-    }
-    if (VideoCommon::Nx2FastDraw::g_enabled && regs.reg_array[method] != argument &&
-        !IsFastDrawParameter(method)) [[unlikely]] {
-        switch (method) {
-        case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
-        case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
-        case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
-        case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
-        case MAXWELL3D_REG_INDEX(index_buffer.format):
-            VideoCommon::Nx2FastDraw::NoteIndexBuffer(method);
-            break;
-        default:
-            if (IsFastDrawVertexBuffer(method)) {
-                VideoCommon::Nx2FastDraw::NoteVertexBuffer(method);
-            } else if (IsFastDrawVertexInput(method)) {
-                VideoCommon::Nx2FastDraw::NoteVertexInput(method);
-            } else {
-                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
-            }
+void Maxwell3D::NoteFastDrawRegister(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
+    case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
+    case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
+    case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
+    case MAXWELL3D_REG_INDEX(index_buffer.format):
+        VideoCommon::Nx2FastDraw::NoteIndexBuffer(method);
+        break;
+    default:
+        if (IsFastDrawVertexBuffer(method)) {
+            VideoCommon::Nx2FastDraw::NoteVertexBuffer(method);
+        } else if (IsFastDrawVertexInput(method)) {
+            VideoCommon::Nx2FastDraw::NoteVertexInput(method);
+        } else {
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
     }
-    regs.reg_array[method] = argument;
-    for (auto const& table : dirty.tables)
-        dirty.flags[table[method]] = true;
 }
 
 void Maxwell3D::NoteDrawRunsWrite(u32 method, u32 argument) {
@@ -677,6 +652,13 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 }
 
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    // A state register (not in execution_mask): CallMethodFast's state write, here without the
+    // calls to it (#1095). Such a register is not SET_SHADOW_RAM_CONTROL either. The verify
+    // switch takes the longer path below.
+    if (fast_maxwell3d && executing_macro == 0 && method < MacroRegistersStart &&
+        !execution_mask[method] && !VideoCommon::Nx2Perf::Verify()) {
+        return WriteStateRegister(method, method_argument);
+    }
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
         method == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
         return CallMethodSlow(system, method, method_argument, is_last_call);
@@ -708,13 +690,10 @@ bool IsStoreOnlyExecutable(u32 method) {
 // no write history, trace or profile, not a macro call or SET_SHADOW_RAM_CONTROL. The hot
 // executable methods go straight to their handler.
 void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_call) {
-    const u32 argument = ProcessShadowRam(method, method_argument);
     if (!execution_mask[method]) {
-        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
-            ProcessDirtyRegisters(method, argument);
-        }
-        return;
+        return WriteStateRegister(method, method_argument);
     }
+    const u32 argument = ProcessShadowRam(method, method_argument);
     ProcessDirtyRegisters(method, argument);
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method - cb_data < 16) {
