@@ -446,8 +446,10 @@ private:
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Front side, in its own 128-byte block (x86 prefetchers pull 64-byte lines in pairs): the
+    // back writes back_engine on every engine switch, and next to these fields that made the
+    // front miss the cache on almost every ring write (found by SerkiGohan).
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 last_memory_write_position{};
@@ -465,8 +467,8 @@ private:
     u32 publishes{};
     void ReportBatched();
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Back side, in its own block.
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
