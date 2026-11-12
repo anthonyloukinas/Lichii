@@ -253,8 +253,11 @@ TEST_CASE("Translation cache round-trips the shader info", "[video_core][transla
     // each element's handle.
     Shader::Info table = SampleInfo();
     table.texture_descriptors[0].is_descriptor_array = true;
-    table.handle_programs[0] = {static_cast<u32>(Shader::HandleOp::Index)};
     REQUIRE_FALSE(InfoEqual(table, info));
+    Shader::Info indexed = SampleInfo();
+    indexed.handle_programs[0] = {static_cast<u32>(Shader::HandleOp::Index)};
+    REQUIRE_FALSE(InfoEqual(indexed, info));
+    table.handle_programs[0] = indexed.handle_programs[0];
     for (const u32 count : {64U, 1U}) {
         table.texture_descriptors[0].count = count;
         std::vector<u8> table_bytes;
