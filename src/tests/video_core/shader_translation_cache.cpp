@@ -196,6 +196,18 @@ TEST_CASE("Translation cache covers every field of the shader structures",
     REQUIRE(LayoutIsCovered());
 }
 
+TEST_CASE("Translation cache configuration covers the handle table host fields",
+          "[video_core][translation_cache]") {
+    const Shader::Profile profile{};
+    Shader::HostTranslateInfo host{};
+    const Digest config = MakeConfigDigest(profile, host, 0);
+    host.support_handle_table_arrays = true;
+    REQUIRE_FALSE(MakeConfigDigest(profile, host, 0) == config);
+    host = {};
+    host.max_per_stage_descriptor_samplers = 16;
+    REQUIRE_FALSE(MakeConfigDigest(profile, host, 0) == config);
+}
+
 TEST_CASE("Translation cache round-trips the shader info", "[video_core][translation_cache]") {
     const Shader::Info info = SampleInfo();
     std::vector<u8> bytes;
@@ -236,6 +248,25 @@ TEST_CASE("Translation cache round-trips the shader info", "[video_core][transla
     REQUIRE(ReadInfo(many_in, many_read));
     REQUIRE(many_read.texture_descriptors.size() == 21);
     REQUIRE(many_read.texture_descriptors[20].cbuf_offset == 0x100 + 19 * 8);
+
+    // A handle table: an array descriptor (also one cut to one element) and a program computing
+    // each element's handle.
+    Shader::Info table = SampleInfo();
+    table.texture_descriptors[0].is_descriptor_array = true;
+    table.handle_programs[0] = {static_cast<u32>(Shader::HandleOp::Index)};
+    REQUIRE_FALSE(InfoEqual(table, info));
+    for (const u32 count : {64U, 1U}) {
+        table.texture_descriptors[0].count = count;
+        std::vector<u8> table_bytes;
+        WriteInfo(table_bytes, table);
+        std::span<const u8> table_in{table_bytes};
+        Shader::Info table_read{};
+        REQUIRE(ReadInfo(table_in, table_read));
+        REQUIRE(InfoEqual(table_read, table));
+        REQUIRE(table_read.texture_descriptors[0].is_descriptor_array);
+        REQUIRE(table_read.texture_descriptors[0].count == count);
+        REQUIRE(table_read.handle_programs == table.handle_programs);
+    }
 
     // Truncated input is rejected rather than read past its end.
     std::span<const u8> cut{bytes.data(), bytes.size() - 3};

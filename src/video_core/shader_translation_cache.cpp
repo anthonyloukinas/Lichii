@@ -46,7 +46,9 @@ namespace {
 //     of the configuration (12 is taken by the hedge vegetation branch).
 // 14: texture queries are recorded by the address of the handle instead of its value, so an
 //     entry is found again in a session that gives the same texture another handle.
-constexpr u32 FormatVersion = 14;
+// 15: TextureDescriptor gained is_descriptor_array and handle programs HandleOp::Index (upstream
+//     #1485); the configuration covers the sampler limit and handle table array support.
+constexpr u32 FormatVersion = 15;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -145,7 +147,7 @@ constexpr size_t InfoFields = 88;
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
 constexpr size_t ProfileFields = 76;
 
-constexpr size_t HostFields = 23;
+constexpr size_t HostFields = 25;
 constexpr size_t RuntimeInfoFields = 21;
 constexpr size_t ProgramFields = 13;
 constexpr size_t MeshInfoFields = 6;
@@ -671,6 +673,7 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(host_info.max_per_stage_descriptor_sampled_images);
     hasher.Add(host_info.max_per_stage_resources);
     hasher.Add(host_info.max_per_stage_descriptor_storage_buffers);
+    hasher.Add(host_info.max_per_stage_descriptor_samplers);
     hasher.Add(host_info.max_descriptor_set_samplers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers_dynamic);
@@ -690,6 +693,7 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(host_info.support_conditional_barrier);
     hasher.Add(host_info.single_lane_geometry_subgroups);
     hasher.Add(host_info.support_byte_addressed_r16);
+    hasher.Add(host_info.support_handle_table_arrays);
     // Settings and environment variables the recompiler reads directly.
     const auto& resolution = Settings::values.resolution_info;
     hasher.Add(resolution.up_scale);

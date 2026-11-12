@@ -1955,21 +1955,88 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             layer_source_program = &programs[index];
         }
     }
+    // A stage whose entry matched has only its metadata: translates it again.
+    const auto retranslate = [&](size_t index) {
+        Shader::Environment& env{*stage_envs[index]};
+        const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+        from_cache[index] = false;
+        if (translation_cache_verify && cached_entries[index] &&
+            !TC::MetaEqual(cached_entries[index]->meta, TC::ProgramMeta::From(programs[index]))) {
+            ++translation_cache_mismatches;
+            LOG_ERROR(Render_Vulkan,
+                      "Translation cache: the stored program data of stage {} of shader "
+                      "{:016x} differs from a fresh translation",
+                      index, key.unique_hashes[index]);
+        }
+    };
+    // Whether the pipeline limit cut a stage's texture arrays. The cut depends on the other
+    // stages, which the modules of the translation cache are not keyed on, so such a pipeline
+    // neither uses nor stores them.
+    bool arrays_capped{};
     {
         // Fit the set before the bindings are counted: cutting arrays can merge descriptors, so
         // both their element counts and their binding counts can change.
         std::array<Shader::IR::Program*, Maxwell::MaxShaderProgram> stages{};
+        std::array<size_t, Maxwell::MaxShaderProgram> stage_indices{};
         size_t num_stages{};
+        bool any_arrays{};
+        bool any_from_cache{};
         for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
              index < Maxwell::MaxShaderProgram; ++index) {
             const bool is_emulated_stage = layer_source_program != nullptr &&
                                            index == static_cast<u32>(Maxwell::ShaderType::Geometry);
             if (key.unique_hashes[index] != 0 || is_emulated_stage) {
+                stage_indices[num_stages] = index;
                 stages[num_stages++] = &programs[index];
+                any_arrays |= std::ranges::any_of(
+                    programs[index].info.texture_descriptors,
+                    [](const auto& desc) { return desc.count > 1 || desc.is_descriptor_array; });
+                any_from_cache |= from_cache[index];
             }
         }
-        Shader::Optimization::LimitPipelineSampledTextureArrays(
-            std::span{stages.data(), num_stages}, host_info);
+        const std::span stage_span{stages.data(), num_stages};
+        if (any_arrays && any_from_cache) {
+            // The limit also changes the IR of the stages, which a stage restored from the
+            // cache lacks: try it on their metadata first, and translate those stages again
+            // if it cuts anything.
+            std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> trial;
+            std::array<Shader::IR::Program*, Maxwell::MaxShaderProgram> trial_stages{};
+            for (size_t stage = 0; stage < num_stages; ++stage) {
+                trial[stage].info = stages[stage]->info;
+                trial[stage].stage = stages[stage]->stage;
+                trial_stages[stage] = &trial[stage];
+            }
+            Shader::Optimization::LimitPipelineSampledTextureArrays(
+                std::span{trial_stages.data(), num_stages}, host_info);
+            for (size_t stage = 0; stage < num_stages; ++stage) {
+                if (trial[stage].info.texture_descriptors !=
+                    stages[stage]->info.texture_descriptors) {
+                    arrays_capped = true;
+                }
+            }
+            if (arrays_capped) {
+                for (size_t stage = 0; stage < num_stages; ++stage) {
+                    const size_t index{stage_indices[stage]};
+                    if (from_cache[index]) {
+                        const auto stage_begin = Clock::now();
+                        retranslate(index);
+                        stage_time[index] += Clock::now() - stage_begin;
+                    }
+                }
+            }
+        }
+        if (any_arrays) {
+            std::array<Shader::TextureDescriptors, Maxwell::MaxShaderProgram> before;
+            for (size_t stage = 0; stage < num_stages; ++stage) {
+                before[stage] = stages[stage]->info.texture_descriptors;
+            }
+            Shader::Optimization::LimitPipelineSampledTextureArrays(stage_span, host_info);
+            for (size_t stage = 0; stage < num_stages; ++stage) {
+                arrays_capped |= before[stage] != stages[stage]->info.texture_descriptors;
+            }
+        }
     }
     // A tessellation pipeline the driver would refuse is skipped like a missing mesh pipeline:
     // the draw is dropped (see the pipeline check in the rasterizer) instead of failing the build.
@@ -2043,8 +2110,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         // Modules of a layer-emulating pipeline depend on the generated geometry stage.
         const std::shared_ptr<const TC::Entry> entry =
-            is_emulated_stage || layer_source_program != nullptr ? nullptr
-                                                                 : cached_entries[index];
+            is_emulated_stage || layer_source_program != nullptr || arrays_capped
+                ? nullptr
+                : cached_entries[index];
         TC::Digest variant_key{};
         std::optional<TC::Variant> variant;
         if (entry) {
@@ -2056,20 +2124,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (!variant || translation_cache_verify) {
             if (from_cache[index]) {
                 // The stage's entry matched but no module for this runtime info: translate.
-                Shader::Environment& env{*stage_envs[index]};
-                const u32 cfg_offset{
-                    static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-                program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
-                from_cache[index] = false;
-                if (translation_cache_verify && cached_entries[index] &&
-                    !TC::MetaEqual(cached_entries[index]->meta, TC::ProgramMeta::From(program))) {
-                    ++translation_cache_mismatches;
-                    LOG_ERROR(Render_Vulkan,
-                              "Translation cache: the stored program data of stage {} of shader "
-                              "{:016x} differs from a fresh translation",
-                              index, key.unique_hashes[index]);
-                }
+                retranslate(index);
             }
             ConvertLegacyToGeneric(program, runtime_info);
             code = EmitSPIRV(profile, runtime_info, program, binding);
