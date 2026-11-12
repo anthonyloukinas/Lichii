@@ -76,6 +76,11 @@ enum class QueryKind : u8 {
     CbufStorageBufferPointer,
     ReplaceConstBuffer,
     CbufIndirectStorageBufferPointer,
+    // The texture queries by the address of the handle (a: offset, b: secondary offset,
+    // c: the indices and shifts). The handle's words are not recorded as values.
+    TextureTypeAt,
+    TexturePixelFormatAt,
+    TexturePixelFormatIntegerAt,
 };
 
 struct Query {
@@ -84,6 +89,7 @@ struct Query {
     u32 b{};
     u32 answer{};
     u32 c{}; ///< Third argument (CbufIndirectStorageBufferPointer: the offset into the holder).
+             ///< Texture queries by address: the buffer indices and shifts.
 
     bool operator==(const Query&) const = default;
 };
@@ -107,6 +113,11 @@ public:
     Shader::TextureType ReadTextureType(u32 raw_handle) override;
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) override;
     bool IsTexturePixelFormatInteger(u32 raw_handle) override;
+    u32 ReadTextureHandle(const Shader::ConstBufferAddr& addr) override;
+    Shader::TextureType ReadTextureTypeAt(const Shader::ConstBufferAddr& addr) override;
+    Shader::TexturePixelFormat ReadTexturePixelFormatAt(
+        const Shader::ConstBufferAddr& addr) override;
+    bool IsTexturePixelFormatIntegerAt(const Shader::ConstBufferAddr& addr) override;
     u32 ReadViewportTransformState() override;
     u32 TextureBoundBuffer() const override;
     u32 LocalMemorySize() const override;

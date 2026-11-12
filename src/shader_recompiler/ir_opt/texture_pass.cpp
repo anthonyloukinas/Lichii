@@ -351,17 +351,17 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
 // ImageQueryDimensions case, which has none).
 static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return TextureType::Color2D;
-    return env.ReadTextureType(GetTextureHandleCached(env, cbuf));
+    return env.ReadTextureTypeAt(cbuf);
 }
 static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
                                                                 const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
-    return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
+    return env.ReadTexturePixelFormatAt(cbuf);
 }
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return false;
-    return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
+    return env.IsTexturePixelFormatIntegerAt(cbuf);
 }
 
 

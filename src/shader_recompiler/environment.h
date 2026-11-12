@@ -113,6 +113,30 @@ public:
 
     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
 
+    /// The texture handle held at `addr` (not for a handle computed per draw).
+    [[nodiscard]] virtual u32 ReadTextureHandle(const ConstBufferAddr& addr) {
+        const u32 secondary_index{addr.has_secondary ? addr.secondary_index : addr.index};
+        const u32 secondary_offset{addr.has_secondary ? addr.secondary_offset : addr.offset};
+        const u32 lhs{ReadCbufValue(addr.index, addr.offset) << addr.shift_left};
+        const u32 rhs{ReadCbufValue(secondary_index, secondary_offset)
+                      << addr.secondary_shift_left};
+        return lhs | rhs;
+    }
+
+    /// The texture queries for the handle held at `addr`. A translation that asks these depends
+    /// on their answers and not on the handle's value, which changes from session to session.
+    [[nodiscard]] virtual TextureType ReadTextureTypeAt(const ConstBufferAddr& addr) {
+        return ReadTextureType(ReadTextureHandle(addr));
+    }
+
+    [[nodiscard]] virtual TexturePixelFormat ReadTexturePixelFormatAt(const ConstBufferAddr& addr) {
+        return ReadTexturePixelFormat(ReadTextureHandle(addr));
+    }
+
+    [[nodiscard]] virtual bool IsTexturePixelFormatIntegerAt(const ConstBufferAddr& addr) {
+        return IsTexturePixelFormatInteger(ReadTextureHandle(addr));
+    }
+
     [[nodiscard]] virtual u32 ReadViewportTransformState() = 0;
 
     [[nodiscard]] virtual u32 TextureBoundBuffer() const = 0;

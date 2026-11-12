@@ -44,7 +44,9 @@ namespace {
 //     (10 is taken by the #353 frag_color_components port).
 // 13: entries keep the mesh info, task and mesh stages are cached; EDEN_NX2_MESH_FIRST is part
 //     of the configuration (12 is taken by the hedge vegetation branch).
-constexpr u32 FormatVersion = 13;
+// 14: texture queries are recorded by the address of the handle instead of its value, so an
+//     entry is found again in a session that gives the same texture another handle.
+constexpr u32 FormatVersion = 14;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -339,6 +341,44 @@ Digest EntryId(const Digest& stage_key, std::span<const Query> queries) {
     return hasher.Finish();
 }
 
+// Query::c of the texture queries by address: the two buffer indices, the two shifts and
+// whether there is a secondary word. Empty for an address the fields do not hold.
+constexpr u32 HandleIndexBits = 8;
+constexpr u32 HandleShiftBits = 5;
+
+std::optional<Query> MakeHandleQuery(QueryKind kind, const Shader::ConstBufferAddr& addr) {
+    const u32 secondary_index{addr.has_secondary ? addr.secondary_index : 0};
+    const u32 secondary_offset{addr.has_secondary ? addr.secondary_offset : 0};
+    if ((addr.index | secondary_index) >> HandleIndexBits != 0 ||
+        (addr.shift_left | addr.secondary_shift_left) >> HandleShiftBits != 0) {
+        return std::nullopt;
+    }
+    u32 packed{addr.index};
+    packed |= secondary_index << HandleIndexBits;
+    packed |= addr.shift_left << (2 * HandleIndexBits);
+    packed |= addr.secondary_shift_left << (2 * HandleIndexBits + HandleShiftBits);
+    packed |= (addr.has_secondary ? 1U : 0U) << (2 * HandleIndexBits + 2 * HandleShiftBits);
+    return Query{kind, addr.offset, secondary_offset, 0, packed};
+}
+
+std::optional<Shader::ConstBufferAddr> HandleAddrOf(const Query& query) {
+    constexpr u32 index_mask{(1U << HandleIndexBits) - 1};
+    constexpr u32 shift_mask{(1U << HandleShiftBits) - 1};
+    constexpr u32 used_bits{2 * HandleIndexBits + 2 * HandleShiftBits + 1};
+    if (query.c >> used_bits != 0) {
+        return std::nullopt;
+    }
+    Shader::ConstBufferAddr addr{};
+    addr.index = query.c & index_mask;
+    addr.offset = query.a;
+    addr.shift_left = (query.c >> (2 * HandleIndexBits)) & shift_mask;
+    addr.secondary_index = (query.c >> HandleIndexBits) & index_mask;
+    addr.secondary_offset = query.b;
+    addr.secondary_shift_left = (query.c >> (2 * HandleIndexBits + HandleShiftBits)) & shift_mask;
+    addr.has_secondary = ((query.c >> (2 * HandleIndexBits + 2 * HandleShiftBits)) & 1) != 0;
+    return addr;
+}
+
 } // Anonymous namespace
 
 void Hasher::AddBytes(const void* data, size_t size) {
@@ -426,6 +466,46 @@ bool RecordingEnvironment::IsTexturePixelFormatInteger(u32 raw_handle) {
     return answer;
 }
 
+u32 RecordingEnvironment::ReadTextureHandle(const Shader::ConstBufferAddr& addr) {
+    // The caller gets the value, so its words are recorded as values (ReadCbufValue).
+    return Shader::Environment::ReadTextureHandle(addr);
+}
+
+Shader::TextureType RecordingEnvironment::ReadTextureTypeAt(const Shader::ConstBufferAddr& addr) {
+    auto query = MakeHandleQuery(QueryKind::TextureTypeAt, addr);
+    if (!query) {
+        // Recorded by value: the handle's words, then the query for that handle.
+        return Shader::Environment::ReadTextureTypeAt(addr);
+    }
+    const auto answer = inner.ReadTextureTypeAt(addr);
+    query->answer = static_cast<u32>(answer);
+    queries.push_back(*query);
+    return answer;
+}
+
+Shader::TexturePixelFormat RecordingEnvironment::ReadTexturePixelFormatAt(
+    const Shader::ConstBufferAddr& addr) {
+    auto query = MakeHandleQuery(QueryKind::TexturePixelFormatAt, addr);
+    if (!query) {
+        return Shader::Environment::ReadTexturePixelFormatAt(addr);
+    }
+    const auto answer = inner.ReadTexturePixelFormatAt(addr);
+    query->answer = static_cast<u32>(answer);
+    queries.push_back(*query);
+    return answer;
+}
+
+bool RecordingEnvironment::IsTexturePixelFormatIntegerAt(const Shader::ConstBufferAddr& addr) {
+    auto query = MakeHandleQuery(QueryKind::TexturePixelFormatIntegerAt, addr);
+    if (!query) {
+        return Shader::Environment::IsTexturePixelFormatIntegerAt(addr);
+    }
+    const bool answer = inner.IsTexturePixelFormatIntegerAt(addr);
+    query->answer = answer ? 1U : 0U;
+    queries.push_back(*query);
+    return answer;
+}
+
 u32 RecordingEnvironment::ReadViewportTransformState() {
     const u32 answer = inner.ReadViewportTransformState();
     queries.push_back({QueryKind::ViewportTransformState, 0, 0, answer});
@@ -500,6 +580,22 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
         case QueryKind::ReplaceConstBuffer: {
             const auto value = env.GetReplaceConstBuffer(query.a, query.b);
             answer = value ? static_cast<u32>(*value) : ~0U;
+            break;
+        }
+        case QueryKind::TextureTypeAt:
+        case QueryKind::TexturePixelFormatAt:
+        case QueryKind::TexturePixelFormatIntegerAt: {
+            const auto addr = HandleAddrOf(query);
+            if (!addr) {
+                return false;
+            }
+            if (query.kind == QueryKind::TextureTypeAt) {
+                answer = static_cast<u32>(env.ReadTextureTypeAt(*addr));
+            } else if (query.kind == QueryKind::TexturePixelFormatAt) {
+                answer = static_cast<u32>(env.ReadTexturePixelFormatAt(*addr));
+            } else {
+                answer = env.IsTexturePixelFormatIntegerAt(*addr) ? 1U : 0U;
+            }
             break;
         }
         default:

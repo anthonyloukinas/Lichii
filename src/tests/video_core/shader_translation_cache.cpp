@@ -36,13 +36,14 @@ public:
         return cbufs[(u64{index} << 32) | offset];
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
-        return handle == 7 ? Shader::TextureType::ColorArray2D : Shader::TextureType::Color2D;
+        return array_handles.contains(handle) ? Shader::TextureType::ColorArray2D
+                                              : Shader::TextureType::Color2D;
     }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
         return Shader::TexturePixelFormat{};
     }
-    bool IsTexturePixelFormatInteger(u32) override {
-        return false;
+    bool IsTexturePixelFormatInteger(u32 handle) override {
+        return integer_handles.contains(handle);
     }
     u32 ReadViewportTransformState() override {
         return viewport;
@@ -89,6 +90,8 @@ public:
     u32 reads = 0;
     std::set<std::tuple<u32, u32, u32>> table_pointers;
     u32 table_queries = 0;
+    std::set<u32> array_handles{7};
+    std::set<u32> integer_handles;
 };
 
 // What a translation does with its environment, for the record/replay tests: the second read
@@ -263,6 +266,128 @@ TEST_CASE("Translation cache replays the queries a translation made",
 
     env.viewport = 0;
     REQUIRE_FALSE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Translation cache finds a texture again under another handle",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 word = (u64{2} << 32) | 0x30;
+    Shader::ConstBufferAddr addr{};
+    addr.index = 2;
+    addr.offset = 0x30;
+    env.cbufs[word] = 7;
+    RecordingEnvironment recording{env};
+    REQUIRE(recording.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+    (void)recording.ReadTexturePixelFormatAt(addr);
+    REQUIRE_FALSE(recording.IsTexturePixelFormatIntegerAt(addr));
+    const std::vector<Query> queries = recording.TakeQueries();
+    // The handle's words are not recorded as values.
+    REQUIRE(queries.size() == 3);
+    REQUIRE(queries[0].kind == QueryKind::TextureTypeAt);
+    REQUIRE(queries[1].kind == QueryKind::TexturePixelFormatAt);
+    REQUIRE(queries[2].kind == QueryKind::TexturePixelFormatIntegerAt);
+    REQUIRE(ReplayQueries(queries, env));
+
+    // Another session gives a texture of the same kind another handle.
+    env.array_handles.insert(0x1234);
+    env.cbufs[word] = 0x1234;
+    REQUIRE(ReplayQueries(queries, env));
+
+    // A texture of another type, then one with an integer format, at the same address.
+    env.cbufs[word] = 8;
+    REQUIRE_FALSE(ReplayQueries(queries, env));
+    env.cbufs[word] = 0x1234;
+    env.integer_handles.insert(0x1234);
+    REQUIRE_FALSE(ReplayQueries(queries, env));
+    env.integer_handles.clear();
+
+    // The bits of c no address uses are not ignored.
+    std::vector<Query> damaged = queries;
+    damaged[0].c |= 1U << 31;
+    REQUIRE_FALSE(ReplayQueries(damaged, env));
+}
+
+TEST_CASE("Translation cache combines the two words of a texture handle",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 low = (u64{2} << 32) | 0x30;
+    const u64 high = (u64{3} << 32) | 0x8;
+    Shader::ConstBufferAddr addr{};
+    addr.index = 2;
+    addr.offset = 0x30;
+    addr.has_secondary = true;
+    addr.secondary_index = 3;
+    addr.secondary_offset = 0x8;
+    addr.secondary_shift_left = 20;
+    env.cbufs[low] = 5;
+    env.cbufs[high] = 3;
+    env.array_handles = {5U | (3U << 20)};
+    RecordingEnvironment recording{env};
+    REQUIRE(recording.ReadTextureTypeAt(addr) == Shader::TextureType::ColorArray2D);
+    const std::vector<Query> queries = recording.TakeQueries();
+    REQUIRE(queries.size() == 1);
+    REQUIRE(ReplayQueries(queries, env));
+
+    // Both words change and the texture is of the same type: found.
+    env.cbufs[low] = 6;
+    env.cbufs[high] = 1;
+    env.array_handles = {6U | (1U << 20)};
+    REQUIRE(ReplayQueries(queries, env));
+    // The secondary word alone decides the texture.
+    env.cbufs[high] = 2;
+    REQUIRE_FALSE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Translation cache keeps a handle word that is read as a value",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 word = (u64{1} << 32) | 0x30;
+    Shader::ConstBufferAddr addr{};
+    addr.index = 1;
+    addr.offset = 0x30;
+    env.cbufs[word] = 7;
+    env.array_handles = {7, 9};
+
+    // The word is also a constant of the translation (a mask): another handle is another
+    // translation.
+    {
+        RecordingEnvironment recording{env};
+        (void)recording.ReadCbufValue(1, 0x30);
+        (void)recording.ReadTextureTypeAt(addr);
+        const std::vector<Query> queries = recording.TakeQueries();
+        REQUIRE(queries.size() == 2);
+        REQUIRE(ReplayQueries(queries, env));
+        env.cbufs[word] = 9;
+        REQUIRE_FALSE(ReplayQueries(queries, env));
+        env.cbufs[word] = 7;
+    }
+    // The translation asked for the handle itself.
+    {
+        RecordingEnvironment recording{env};
+        REQUIRE(recording.ReadTextureHandle(addr) == 7);
+        const std::vector<Query> queries = recording.TakeQueries();
+        REQUIRE_FALSE(queries.empty());
+        REQUIRE(std::ranges::all_of(
+            queries, [](const Query& query) { return query.kind == QueryKind::CbufValue; }));
+        REQUIRE(ReplayQueries(queries, env));
+        env.cbufs[word] = 9;
+        REQUIRE_FALSE(ReplayQueries(queries, env));
+        env.cbufs[word] = 7;
+    }
+    // An address the query does not hold is recorded by value.
+    {
+        Shader::ConstBufferAddr wide = addr;
+        wide.index = 300;
+        env.cbufs[(u64{300} << 32) | 0x30] = 7;
+        RecordingEnvironment recording{env};
+        REQUIRE(recording.ReadTextureTypeAt(wide) == Shader::TextureType::ColorArray2D);
+        const std::vector<Query> queries = recording.TakeQueries();
+        REQUIRE(queries.back().kind == QueryKind::TextureType);
+        REQUIRE(queries.front().kind == QueryKind::CbufValue);
+        REQUIRE(ReplayQueries(queries, env));
+        env.cbufs[(u64{300} << 32) | 0x30] = 9;
+        REQUIRE_FALSE(ReplayQueries(queries, env));
+    }
 }
 
 TEST_CASE("Translation cache stage keys cover the environment", "[video_core][translation_cache]") {

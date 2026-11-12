@@ -10,6 +10,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/shader_handle_program.h"
+#include "video_core/shader_translation_cache.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -328,4 +329,27 @@ TEST_CASE("A texture handle word that holds a storage buffer address is not a ha
     desc.cbuf_index = 0;
     desc.handle_program = 0; // computed for each draw: a real handle
     CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+}
+
+TEST_CASE("The texture pass asks about a static handle by its address",
+          "[video_core][texture_handles]") {
+    using namespace VideoCommon::TranslationCache;
+    HandleProgram shader;
+    shader.Sample(shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}}));
+    RecordingEnvironment recording{shader.env};
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    Shader::Optimization::TexturePass(recording, shader.program, host);
+    const std::vector<Query> queries{recording.TakeQueries()};
+    REQUIRE_FALSE(queries.empty());
+    for (const Query& query : queries) {
+        CHECK(query.kind != QueryKind::CbufValue);
+    }
+
+    // The same texture under another handle is the same translation.
+    shader.env.cbuf_values[{0, 0}] = 0xdef;
+    shader.env.expected_handle = 0xdef;
+    CHECK(ReplayQueries(queries, shader.env));
+    shader.env.integer_texture = true;
+    CHECK_FALSE(ReplayQueries(queries, shader.env));
 }
