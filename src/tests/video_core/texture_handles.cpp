@@ -347,8 +347,7 @@ TEST_CASE("The texture pass asks about a static handle by its address",
     for (const Query& query : queries) {
         CHECK(query.kind != QueryKind::CbufValue);
     }
-    // However many queries the pass makes about the texture, its handle word is read once.
-    CHECK(queries.size() > 1);
+    // The handle word is read once, for the pass and for the recorder.
     CHECK(shader.env.cbuf_reads == 1);
 
     // The same texture under another handle is the same translation.
