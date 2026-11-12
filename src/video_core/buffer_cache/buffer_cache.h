@@ -734,10 +734,12 @@ bool BufferCache<P>::RebindIndexBuffer() {
 
 template <class P>
 bool BufferCache<P>::RebindVertexBuffers() {
+    // BufferOperations leaves has_deleted_buffers clear, and a buffer that replaces one overlap
+    // keeps the buffer count: the deletion counter tells.
     const size_t buffers = slot_buffers.size();
-    channel_state->has_deleted_buffers = false;
+    const u64 deletions = buffer_deletions;
     BufferOperations([&]() { UpdateVertexBuffers(); });
-    if (channel_state->has_deleted_buffers || slot_buffers.size() != buffers) {
+    if (buffer_deletions != deletions || slot_buffers.size() != buffers) {
         return false;
     }
     BindHostVertexBuffers();
@@ -747,7 +749,7 @@ bool BufferCache<P>::RebindVertexBuffers() {
 template <class P>
 bool BufferCache<P>::UpdateGraphicsStageBuffers() {
     const size_t buffers = slot_buffers.size();
-    channel_state->has_deleted_buffers = false;
+    const u64 deletions = buffer_deletions;
     graphics_segments.clear();
     BufferOperations([&]() {
         for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
@@ -757,7 +759,7 @@ bool BufferCache<P>::UpdateGraphicsStageBuffers() {
         }
         RefreshMultiRangeSegments(graphics_segments);
     });
-    return !channel_state->has_deleted_buffers && slot_buffers.size() == buffers;
+    return buffer_deletions == deletions && slot_buffers.size() == buffers;
 }
 
 template <class P>

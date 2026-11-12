@@ -252,6 +252,12 @@ struct BufferCacheTestAccess {
     static void UpdateUniforms(Cache& cache, size_t stage) {
         cache.UpdateUniformBuffers(stage);
     }
+    static size_t Buffers(Cache& cache) {
+        return cache.slot_buffers.size();
+    }
+    static bool UpdateStageBuffers(Cache& cache) {
+        return cache.UpdateGraphicsStageBuffers();
+    }
 };
 
 } // namespace VideoCommon
@@ -799,6 +805,39 @@ TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buf
     REQUIRE(resolved != VideoCommon::NULL_BUFFER_ID);
     REQUIRE(resolved != id);
     REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
+}
+
+TEST_CASE("A delta draw's buffer update reports a buffer that replaced one overlap",
+          "[buffer_ports]") {
+    struct ChannelFixture : Fixture {
+        ChannelFixture() {
+            state.memory_manager = &*memory;
+            state.payload.emplace(system, *memory, state);
+            cache->CreateChannel(state);
+        }
+        ~ChannelFixture() {
+            cache.reset();
+        }
+        Tegra::Control::ChannelState state{0};
+    } f;
+    f.cache->BindToChannel(0);
+    auto& channel = Access::Channel(*f.cache, 0);
+    const auto old_id = Access::Add(*f.cache, 0x10000, 0x10000);
+    // The range ends in the next 64 KiB: its buffer takes in the old one, one created and one
+    // deleted.
+    channel.uniform_buffers[0][0] = {.device_addr = 0x1ff00, .size = 0x200};
+    channel.enabled_uniform_buffer_masks[0] = 1;
+    const size_t buffers = Access::Buffers(*f.cache);
+    REQUIRE(!Access::UpdateStageBuffers(*f.cache));
+    REQUIRE(Access::Buffers(*f.cache) == buffers);
+    const auto resolved = channel.uniform_buffers[0][0].buffer_id;
+    REQUIRE(resolved);
+    REQUIRE(resolved != VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(resolved != old_id);
+    REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x1ff00, 0x200));
+
+    // Nothing is created or deleted the next time: the delta draw stands.
+    REQUIRE(Access::UpdateStageBuffers(*f.cache));
 }
 
 TEST_CASE("Claimed CPU writes keep their bytes when an earlier one downloads their page",
