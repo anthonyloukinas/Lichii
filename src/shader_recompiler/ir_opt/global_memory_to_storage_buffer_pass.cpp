@@ -521,6 +521,31 @@ std::optional<StorageBufferAddr> CbufWord(const IR::Inst* inst) {
     return StorageBufferAddr{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
 }
 
+/// The instructions the analyses below look at, in program order, from one walk: the pass runs
+/// before dead code elimination, the instruction lists are long, and each walk over them misses
+/// the cache on every instruction.
+struct WalkedInsts {
+    std::vector<std::pair<IR::Inst*, IR::Block*>> phis;
+    /// Phis and 32-bit additions
+    std::vector<IR::Inst*> sums;
+    std::vector<std::pair<IR::Inst*, IR::Block*>> globals;
+
+    explicit WalkedInsts(IR::Program& program) {
+        for (IR::Block* const block : program.post_order_blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::Phi) {
+                    phis.emplace_back(&inst, block);
+                    sums.push_back(&inst);
+                } else if (inst.GetOpcode() == IR::Opcode::IAdd32) {
+                    sums.push_back(&inst);
+                } else if (IsGlobalMemory(inst)) {
+                    globals.emplace_back(&inst, block);
+                }
+            }
+        }
+    }
+};
+
 struct TrackingConditions {
     using Predicate = std::pair<IR::Value, bool>;
 
@@ -537,13 +562,9 @@ struct TrackingConditions {
     using BitKey = std::tuple<const IR::Inst*, u32, const IR::Inst*, int>;
     mutable std::map<BitKey, std::optional<Predicate>> bit_cache;
 
-    explicit TrackingConditions(IR::Program& program) {
-        for (IR::Block* block : program.post_order_blocks) {
-            for (IR::Inst& inst : block->Instructions()) {
-                if (inst.GetOpcode() == IR::Opcode::Phi) {
-                    owners.emplace(&inst, block);
-                }
-            }
+    explicit TrackingConditions(IR::Program& program, const WalkedInsts& walked) {
+        for (const auto& phi : walked.phis) {
+            owners.emplace(phi.first, phi.second);
         }
         std::vector<Scope> active;
         std::vector<IR::Block*> loop_stack;
@@ -862,23 +883,21 @@ bool SumWords(const IR::Value& value, const IR::Inst* loop, WordSum& sum) {
 /// Finds the constant buffer words that step strided iterators (CUTLASS-style kernel parameters):
 /// words added to a loop-carried value on its back edge, and words summed with two or more other
 /// words into an offset table. A base pointer is neither.
-StorageBufferSet CollectIteratorWords(IR::Program& program) {
+StorageBufferSet CollectIteratorWords(const WalkedInsts& walked) {
     StorageBufferSet result;
-    for (IR::Block* const block : program.post_order_blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            if (inst.GetOpcode() == IR::Opcode::Phi) {
-                for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
-                    WordSum sum;
-                    SumWords(inst.Arg(arg), &inst, sum);
-                    if (sum.reaches_loop) {
-                        result.insert(sum.words.begin(), sum.words.end());
-                    }
-                }
-            } else if (inst.GetOpcode() == IR::Opcode::IAdd32) {
+    for (IR::Inst* const inst : walked.sums) {
+        if (inst->GetOpcode() == IR::Opcode::Phi) {
+            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
                 WordSum sum;
-                if (SumWords(IR::Value{&inst}, nullptr, sum) && sum.words.size() >= 3) {
+                SumWords(inst->Arg(arg), inst, sum);
+                if (sum.reaches_loop) {
                     result.insert(sum.words.begin(), sum.words.end());
                 }
+            }
+        } else {
+            WordSum sum;
+            if (SumWords(IR::Value{inst}, nullptr, sum) && sum.words.size() >= 3) {
+                result.insert(sum.words.begin(), sum.words.end());
             }
         }
     }
@@ -938,12 +957,8 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
             }
         }
     };
-    for (IR::Block* block : program.post_order_blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            if (inst.GetOpcode() == IR::Opcode::Phi) {
-                visit(visit, &inst);
-            }
-        }
+    for (const auto& phi : walked.phis) {
+        visit(visit, phi.first);
     }
     return result;
 }
@@ -977,71 +992,70 @@ bool ReadsCbufWord(const IR::Value& condition, StorageBufferAddr word) {
 /// address apart from an immediate offset, or a 64-bit sum whose high half adds the pointer's high
 /// word and the carry out of its low word. An atomic has no global fallback, so such a pointer is a
 /// buffer even while it is unmapped. A 32-bit scalar added to a pointer carries nothing.
-StorageBufferSet CollectAtomicPointers(IR::Program& program) {
+StorageBufferSet CollectAtomicPointers(const WalkedInsts& walked) {
     const auto word = [](const IR::U32& value) {
         return value.IsImmediate() ? std::nullopt : CbufWord(value.InstRecursive());
     };
     StorageBufferSet result;
-    for (IR::Block* const block : program.post_order_blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            if (!IsGlobalMemoryWrite(inst) || inst.Type() == IR::Type::Void) {
-                continue;
-            }
-            const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
-            if (!addr) {
-                continue;
-            }
-            const std::optional<StorageBufferAddr> low{word(addr->value)};
-            if (low && Common::IsAligned(low->offset, 8) &&
-                word(addr->high) ==
-                    StorageBufferAddr{.index = low->index, .offset = low->offset + 4}) {
-                result.insert(*low);
-                continue;
-            }
-            StorageBufferSet high_words;
-            small_vector<IR::Value, 2> carries;
-            std::vector<IR::Value> pending{addr->high};
-            std::unordered_set<const IR::Inst*> visited;
-            while (!pending.empty()) {
-                const IR::Value term{pending.back()};
-                pending.pop_back();
-                if (term.IsImmediate() || !visited.insert(term.InstRecursive()).second) {
-                    continue;
-                }
-                const IR::Inst* const term_inst{term.InstRecursive()};
-                if (const auto high_word{CbufWord(term_inst)}) {
-                    high_words.insert(*high_word);
-                    continue;
-                }
-                switch (term_inst->GetOpcode()) {
-                case IR::Opcode::IAdd32:
-                case IR::Opcode::Phi:
-                    for (size_t arg = 0; arg < term_inst->NumArgs(); ++arg) {
-                        pending.push_back(term_inst->Arg(arg));
-                    }
-                    break;
-                case IR::Opcode::SelectU32:
-                    if (term_inst->Arg(1).IsImmediate() && term_inst->Arg(2).IsImmediate()) {
-                        carries.push_back(term_inst->Arg(0));
-                    }
-                    break;
-                default:
-                    break;
-                }
-            }
-            if (carries.empty()) {
-                continue;
-            }
-            ForEachSummedWord(addr->value, [&](StorageBufferAddr pointer, u32) {
-                if (Common::IsAligned(pointer.offset, 8) &&
-                    high_words.contains({.index = pointer.index, .offset = pointer.offset + 4}) &&
-                    std::ranges::any_of(carries, [&](const IR::Value& carry) {
-                        return ReadsCbufWord(carry, pointer);
-                    })) {
-                    result.insert(pointer);
-                }
-            });
+    for (const auto& global : walked.globals) {
+        IR::Inst& inst{*global.first};
+        if (!IsGlobalMemoryWrite(inst) || inst.Type() == IR::Type::Void) {
+            continue;
         }
+        const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
+        if (!addr) {
+            continue;
+        }
+        const std::optional<StorageBufferAddr> low{word(addr->value)};
+        if (low && Common::IsAligned(low->offset, 8) &&
+            word(addr->high) ==
+                StorageBufferAddr{.index = low->index, .offset = low->offset + 4}) {
+            result.insert(*low);
+            continue;
+        }
+        StorageBufferSet high_words;
+        small_vector<IR::Value, 2> carries;
+        std::vector<IR::Value> pending{addr->high};
+        std::unordered_set<const IR::Inst*> visited;
+        while (!pending.empty()) {
+            const IR::Value term{pending.back()};
+            pending.pop_back();
+            if (term.IsImmediate() || !visited.insert(term.InstRecursive()).second) {
+                continue;
+            }
+            const IR::Inst* const term_inst{term.InstRecursive()};
+            if (const auto high_word{CbufWord(term_inst)}) {
+                high_words.insert(*high_word);
+                continue;
+            }
+            switch (term_inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::Phi:
+                for (size_t arg = 0; arg < term_inst->NumArgs(); ++arg) {
+                    pending.push_back(term_inst->Arg(arg));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+                if (term_inst->Arg(1).IsImmediate() && term_inst->Arg(2).IsImmediate()) {
+                    carries.push_back(term_inst->Arg(0));
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        if (carries.empty()) {
+            continue;
+        }
+        ForEachSummedWord(addr->value, [&](StorageBufferAddr pointer, u32) {
+            if (Common::IsAligned(pointer.offset, 8) &&
+                high_words.contains({.index = pointer.index, .offset = pointer.offset + 4}) &&
+                std::ranges::any_of(carries, [&](const IR::Value& carry) {
+                    return ReadsCbufWord(carry, pointer);
+                })) {
+                result.insert(pointer);
+            }
+        });
     }
     return result;
 }
@@ -2526,22 +2540,18 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         return;
     }
     const size_t max_ssbos{StorageBufferLimit(host_info)};
-    TrackingConditions conditions{program};
+    const WalkedInsts walked{program};
+    TrackingConditions conditions{program, walked};
     StorageInfo info;
     // Without 64-bit integers the backend cannot route global accesses among bound buffers.
     info.bind_competing_loaded = host_info.support_int64;
-    info.iterator_words = CollectIteratorWords(program);
-    info.atomic_pointers = CollectAtomicPointers(program);
+    info.iterator_words = CollectIteratorWords(walked);
+    info.atomic_pointers = CollectAtomicPointers(walked);
     const auto collect = [&] {
-        for (IR::Block* const block : program.post_order_blocks) {
-            for (IR::Inst& inst : block->Instructions()) {
-                if (!IsGlobalMemory(inst)) {
-                    continue;
-                }
-                conditions.current = block;
-                const bool bound{CollectStorageBuffers(*block, inst, info, env, conditions)};
-                info.untracked_writes |= !bound && IsGlobalMemoryWrite(inst);
-            }
+        for (const auto& [inst, block] : walked.globals) {
+            conditions.current = block;
+            const bool bound{CollectStorageBuffers(*block, *inst, info, env, conditions)};
+            info.untracked_writes |= !bound && IsGlobalMemoryWrite(*inst);
         }
     };
     collect();
